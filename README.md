@@ -38,5 +38,14 @@ Useful flags:
 - `--service-id 0x1234` or `--service-index N` to pick which service to start  
 - `--i2s-slave` if you want the Pi to drive BCLK/LRCLK instead  
 - `--spi-speed` (default 1 MHz)  
+- `--scan` or `--force-scan` to run a full Band III scan and save results to `full_scan.txt`
+
+Full scan and station cache:
+- Run a full scan explicitly:  
+  ```bash
+  python3 raspi_dab/dab_radio.py --scan --xtal 19200000 --ctun 0x07 --audio-out analog
+  ```
+- Results are cached in `full_scan.txt` (same folder as the script). On next run, the script loads this file and skips scanning.  
+- If tuning fails or the file looks corrupted after a crash, simply delete `full_scan.txt` and rerun with `--scan` (or `--force-scan`) to rebuild it.
 
 If you want to stream audio through the Pi, configure an I2S input overlay (e.g., `dtoverlay=i2s-slave`) and route DCLK/DFS/DOUT to that interface, then capture/play with `arecord`/`aplay` at 48 kHz, 16-bit.
