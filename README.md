@@ -41,11 +41,15 @@ Useful flags:
 - `--scan` or `--force-scan` to run a full Band III scan and save results to `full_scan.txt`
 
 Full scan and station cache:
-- Run a full scan explicitly:  
+- From this folder (`raspi_dab/DAB_RADIO`), a typical full scan and analog out bring-up looks like:
   ```bash
-  python3 raspi_dab/dab_radio.py --scan --xtal 19200000 --ctun 0x07 --audio-out analog
+  python3 dab_radio.py --scan --xtal 19200000 --ctun 0x07 --audio-out analog
   ```
 - Results are cached in `full_scan.txt` (same folder as the script). On next run, the script loads this file and skips scanning.  
-- If tuning fails or the file looks corrupted after a crash, simply delete `full_scan.txt` and rerun with `--scan` (or `--force-scan`) to rebuild it.
+- If the app crashes or tuning starts failing unexpectedly, delete `full_scan.txt` and rerun with `--scan` (or `--force-scan`) to rebuild it.
+
+Interactive controls (after the menu appears):
+- Enter a station number or part of its name to retune and start it.
+- `+` / `-` to change analog volume, `o` to toggle analog/I2S out, `r` to rescan, `q` to leave audio playing and quit the CLI.
 
 If you want to stream audio through the Pi, configure an I2S input overlay (e.g., `dtoverlay=i2s-slave`) and route DCLK/DFS/DOUT to that interface, then capture/play with `arecord`/`aplay` at 48 kHz, 16-bit.
