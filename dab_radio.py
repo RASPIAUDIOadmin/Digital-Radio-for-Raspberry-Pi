@@ -740,12 +740,18 @@ def main() -> None:
                 if status is None:
                     print("Failed to lock to target frequency; service start aborted.")
                     return
-            # Check ACQ/VALID again just before starting service
+            # Check ACQ/VALID + minimal metrics again just before starting service
+            status = radio.dab_digrad_status()
             if not status.get("valid", 0) or not status.get("acq", 0):
-                status = radio.dab_digrad_status()
-                if not status.get("valid", 0) or not status.get("acq", 0):
-                    print("Channel not valid/acquired; service start aborted.")
-                    return
+                print("Channel not valid/acquired; service start aborted.")
+                return
+            # Optional soft thresholds to avoid weak/false locks
+            if status.get("fic_quality", 0) == 0 or status.get("snr", 0) == 0:
+                print(
+                    f"Weak lock (SNR={status.get('snr',0)} FICQ={status.get('fic_quality',0)}); "
+                    "service start aborted."
+                )
+                return
             # Stop previous service if any
             nonlocal current_service
             if current_service:
