@@ -624,7 +624,11 @@ def main() -> None:
             label = f"idx {idx}"
             freq_khz = band_freqs[idx] if idx < len(band_freqs) else None
             print(f"Tuning DAB channel index {idx} ({label}) freq={freq_khz} kHz ...")
-            radio.dab_tune(idx, antcap=args.antcap)
+            try:
+                radio.dab_tune(idx, antcap=args.antcap)
+            except RuntimeError as err:
+                print(f"DAB_TUNE_FREQ failed: {err}")
+                return None
             lock_ms = lock_ms_override if lock_ms_override is not None else args.lock_ms
             deadline = time.time() + (lock_ms / 1000.0)
             next_status_print = time.time()
