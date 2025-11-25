@@ -620,12 +620,13 @@ def main() -> None:
         # Map freq_khz to new freq_index for all services
         freq_map = {freq: idx for idx, freq in enumerate(band_freqs)}
 
-        def tune_and_wait(idx: int) -> Optional[Dict[str, int]]:
+        def tune_and_wait(idx: int, lock_ms_override: Optional[int] = None) -> Optional[Dict[str, int]]:
             label = f"idx {idx}"
             freq_khz = band_freqs[idx] if idx < len(band_freqs) else None
             print(f"Tuning DAB channel index {idx} ({label}) freq={freq_khz} kHz ...")
             radio.dab_tune(idx, antcap=args.antcap)
-            deadline = time.time() + (args.lock_ms / 1000.0)
+            lock_ms = lock_ms_override if lock_ms_override is not None else args.lock_ms
+            deadline = time.time() + (lock_ms / 1000.0)
             next_status_print = time.time()
             while time.time() < deadline:
                 status = radio.dab_digrad_status()
@@ -700,13 +701,13 @@ def main() -> None:
             nonlocal freq_index
             target_idx = int(service.get("freq_index", freq_index))
             if target_idx != freq_index:
-                status = tune_and_wait(target_idx)
+                status = tune_and_wait(target_idx, lock_ms_override=max(args.lock_ms, 8000))
                 if status is None:
                     print("Failed to lock to target frequency; service start aborted.")
                     return
                 freq_index = target_idx
             else:
-                status = tune_and_wait(target_idx)
+                status = tune_and_wait(target_idx, lock_ms_override=max(args.lock_ms, 8000))
                 if status is None:
                     print("Failed to lock to target frequency; service start aborted.")
                     return
@@ -729,7 +730,11 @@ def main() -> None:
                 f"Starting service '{service['label']}' SID=0x{service['service_id']:08X} "
                 f"COMP=0x{service['component_id']:04X}"
             )
-            radio.start_digital_service(int(service["service_id"]), int(service["component_id"]))
+            try:
+                radio.start_digital_service(int(service["service_id"]), int(service["component_id"]))
+            except RuntimeError as err:
+                print(f"START_DIGITAL_SERVICE failed: {err}")
+                return
             current_service = service
             if args.audio_out == "analog":
                 print("Analog audio active on SI468x DAC outputs. (+/- to change volume, q to quit)")
