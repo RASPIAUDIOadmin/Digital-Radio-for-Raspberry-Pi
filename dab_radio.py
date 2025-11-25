@@ -566,6 +566,26 @@ def main() -> None:
         int_pin=args.int_pin,
     )
 
+    # Helper to recover the radio after a command error
+    def recover_radio(reason: str) -> bool:
+        print(f"[RECOVER] Reinitializing radio after error: {reason}")
+        try:
+            radio.reset()
+            radio.power_up(xtal_freq=args.xtal, ctun=args.ctun)
+            radio.load_patch_and_firmware(patch_path, firmware_path)
+            radio.configure_audio(
+                mode=args.audio_out,
+                master=args.i2s_master,
+                sample_rate=args.sample_rate,
+                sample_size=args.sample_size,
+            )
+            radio.configure_dab_frontend()
+            radio.set_dab_freq_list(band_freqs)
+            return True
+        except Exception as exc:  # pragma: no cover
+            print(f"[RECOVER] Failed to reinitialize radio: {exc}")
+            return False
+
     try:
         print("Resetting SI468x...")
         radio.reset()
@@ -624,11 +644,16 @@ def main() -> None:
             label = f"idx {idx}"
             freq_khz = band_freqs[idx] if idx < len(band_freqs) else None
             print(f"Tuning DAB channel index {idx} ({label}) freq={freq_khz} kHz ...")
-            try:
-                radio.dab_tune(idx, antcap=args.antcap)
-            except RuntimeError as err:
-                print(f"DAB_TUNE_FREQ failed: {err}")
-                return None
+            for attempt in range(2):
+                try:
+                    radio.dab_tune(idx, antcap=args.antcap)
+                    break
+                except RuntimeError as err:
+                    print(f"DAB_TUNE_FREQ failed: {err}")
+                    if not recover_radio("tune failure"):
+                        return None
+                    if attempt == 1:
+                        return None
             lock_ms = lock_ms_override if lock_ms_override is not None else args.lock_ms
             deadline = time.time() + (lock_ms / 1000.0)
             next_status_print = time.time()
@@ -734,11 +759,16 @@ def main() -> None:
                 f"Starting service '{service['label']}' SID=0x{service['service_id']:08X} "
                 f"COMP=0x{service['component_id']:04X}"
             )
-            try:
-                radio.start_digital_service(int(service["service_id"]), int(service["component_id"]))
-            except RuntimeError as err:
-                print(f"START_DIGITAL_SERVICE failed: {err}")
-                return
+            for attempt in range(2):
+                try:
+                    radio.start_digital_service(int(service["service_id"]), int(service["component_id"]))
+                    break
+                except RuntimeError as err:
+                    print(f"START_DIGITAL_SERVICE failed: {err}")
+                    if not recover_radio("start service failure"):
+                        return
+                    if attempt == 1:
+                        return
             current_service = service
             if args.audio_out == "analog":
                 print("Analog audio active on SI468x DAC outputs. (+/- to change volume, q to quit)")
