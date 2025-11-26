@@ -243,11 +243,14 @@ class Si468xDabRadio:
         sample_size: int = 16,
     ) -> None:
         """
-        mode: "analog" enables DAC only, "i2s" enables I2S (DAC remains on by default).
+        mode: "analog" enables DAC only, "i2s" enables I2S (DAC off to avoid overriding I2S).
         """
-        pin_cfg = 0x8001  # DACOUTEN + keep defaults
-        if mode == "i2s":
-            pin_cfg |= 0x0002  # I2SOUTEN
+        # PROP 0x0800 PIN_CONFIG_ENABLE: bit1=I2SOUTEN, bit0=DACOUTEN
+        pin_cfg = 0x8000  # keep defaults, INTB enabled
+        if mode == "analog":
+            pin_cfg |= 0x0001  # DAC only
+        elif mode == "i2s":
+            pin_cfg |= 0x0002  # I2S only (leave DAC disabled to honor I2S path)
         self.set_property(PROP_PIN_CONFIG_ENABLE, pin_cfg)
 
         if mode == "i2s":
