@@ -45,6 +45,7 @@ constexpr uint16_t PROP_DIGITAL_IO_OUTPUT_SELECT = 0x0200;
 constexpr uint16_t PROP_DIGITAL_IO_OUTPUT_SAMPLE_RATE = 0x0201;
 constexpr uint16_t PROP_DIGITAL_IO_OUTPUT_FORMAT = 0x0202;
 constexpr uint16_t PROP_AUDIO_ANALOG_VOLUME = 0x0300;
+constexpr uint16_t PROP_AUDIO_MUTE = 0x0301;
 constexpr uint16_t PROP_DAB_TUNE_FE_VARM = 0x1710;
 constexpr uint16_t PROP_DAB_TUNE_FE_VARB = 0x1711;
 constexpr uint16_t PROP_DAB_TUNE_FE_CFG = 0x1712;
@@ -95,6 +96,7 @@ class Si468xRadio {
   bool getAudioServices(std::vector<DabService>& out);
   bool startDigitalService(uint32_t serviceId, uint32_t componentId);
   bool stopDigitalService(uint32_t serviceId, uint32_t componentId);
+  bool setProperty(uint16_t propId, uint16_t value);
 
  private:
   SPISettings settings_{1'000'000, MSBFIRST, SPI_MODE0};
@@ -116,7 +118,6 @@ class Si468xRadio {
   bool sendLoadInit();
   bool boot();
   bool hostLoadFile(const char* path);
-  bool setProperty(uint16_t propId, uint16_t value);
   bool getServiceListPayload(std::vector<uint8_t>& payload);
   bool readServiceListSegment(uint16_t offset, uint8_t length, std::vector<uint8_t>& out);
 };
@@ -549,6 +550,7 @@ static bool reinitRadio() {
                 g_useI2S ? "I2S" : "DAC", SAMPLE_RATE, SAMPLE_SIZE_BITS);
   radio.configureDabFrontend();
   radio.setVolume(g_volume);
+  radio.setProperty(PROP_AUDIO_MUTE, 0);  // unmute defensively
   radio.setDabFreqList(g_freqList);
   return true;
 }
@@ -729,6 +731,7 @@ static void printMenu() {
   Serial.println("  o          : basculer DAC/I2S et reconfigurer");
   Serial.println("  r          : refaire un scan complet");
   Serial.println("  m          : afficher mode audio courant");
+  Serial.println("  u          : forcer unmute (AUDIO_MUTE=0)");
   Serial.println("  h          : afficher ce menu");
 }
 
@@ -762,9 +765,15 @@ static void logEventStatus(bool ack) {
                 ev, aud);
 }
 
-static bool waitAudioReady(uint32_t timeoutMs = 4000) {
+static bool waitAudioReady(uint32_t timeoutMs = 4000, bool kickAudio = false) {
   uint32_t deadline = millis() + timeoutMs;
   uint8_t failCount = 0;
+  if (kickAudio) {
+    uint8_t ev = 0, aud = 0;
+    // One-time clear-audio to unmute/start the audio path if latched
+    radio.dabGetEventStatus(true, true, ev, aud);
+    Serial.printf("Kick audio: ev=0x%02X aud=0x%02X\n", ev, aud);
+  }
   while (millis() < deadline) {
     uint8_t ev = 0, aud = 0;
     if (!radio.dabGetEventStatus(true, false, ev, aud)) {
@@ -816,11 +825,21 @@ static bool startServiceByIndex(int idx) {
     radio.stopDigitalService(prev.serviceId, prev.componentId);
   }
   radio.startDigitalService(svc.serviceId, svc.componentId);
+  radio.setProperty(PROP_AUDIO_MUTE, 0);  // defensive unmute
   delay(50);
   logStatus(radio.dabDigradStatus(), "Post-start status:");
   logEventStatus(false);  // just show audio/mute flags without clearing audio
-  if (!waitAudioReady()) {
-    Serial.println("Audio not ready (mute/blkloss?) after start.");
+  if (!waitAudioReady(6000, true)) {
+    Serial.println("Audio not ready (mute/blkloss?) after start. Retente start...");
+    radio.stopDigitalService(svc.serviceId, svc.componentId);
+    uint8_t ev = 0, aud = 0;
+    radio.dabGetEventStatus(true, true, ev, aud);
+    delay(50);
+    radio.startDigitalService(svc.serviceId, svc.componentId);
+    radio.setProperty(PROP_AUDIO_MUTE, 0);
+    if (!waitAudioReady(6000, true)) {
+      Serial.println("Audio toujours muet apres restart.");
+    }
   }
   g_currentService = idx;
   return true;
@@ -860,6 +879,22 @@ static void handleSerial() {
   }
   if (cmd == "m") {
     Serial.printf("Audio mode courant: %s\n", g_useI2S ? "I2S" : "DAC");
+    return;
+  }
+  if (cmd == "o") {
+    g_useI2S = !g_useI2S;
+    Serial.printf("Bascule audio vers %s...\n", g_useI2S ? "I2S" : "DAC");
+    if (!radio.configureAudio(g_useI2S, I2S_MASTER, SAMPLE_RATE, SAMPLE_SIZE_BITS)) {
+      Serial.println("Echec configureAudio");
+    } else {
+      Serial.printf("Audio mode: %s (sample %u Hz, %u bits)\n",
+                    g_useI2S ? "I2S" : "DAC", SAMPLE_RATE, SAMPLE_SIZE_BITS);
+    }
+    return;
+  }
+  if (cmd == "u") {
+    radio.setProperty(PROP_AUDIO_MUTE, 0);
+    Serial.println("AUDIO_MUTE=0 envoye.");
     return;
   }
   if (cmd == "o") {
