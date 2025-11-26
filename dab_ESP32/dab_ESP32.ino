@@ -519,6 +519,7 @@ int g_currentService = -1;
 uint8_t g_volume = 40;
 std::vector<uint32_t> g_freqList;
 bool g_useI2S = USE_I2S;
+std::vector<uint16_t> g_antcapList = {0x00, 0x20, 0x40, 0x60};
 
 static void ensureFreqList() {
   if (!g_freqList.empty()) {
@@ -588,6 +589,19 @@ static bool waitForLock(uint32_t lockMs, uint32_t statusIntervalMs, DigiStatus& 
   return false;
 }
 
+static bool tuneWithAntcap(uint8_t freqIndex, DigiStatus& statusOut, uint16_t& usedAntcap) {
+  for (uint16_t ant : g_antcapList) {
+    if (!radio.dabTune(freqIndex, ant)) {
+      continue;
+    }
+    if (waitForLock(8000, 400, statusOut)) {
+      usedAntcap = ant;
+      return true;
+    }
+  }
+  return false;
+}
+
 static std::vector<DabService> fullScan() {
   std::vector<DabService> all;
   g_freqList.clear();
@@ -600,12 +614,9 @@ static std::vector<DabService> fullScan() {
   Serial.println("Starting full DAB scan...");
   for (uint8_t idx = 0; idx < DAB_BAND_SIZE; ++idx) {
     Serial.printf("Tuning %s (%lu kHz)...\n", DAB_BAND_III[idx].label, DAB_BAND_III[idx].freqKHz);
-    if (!radio.dabTune(idx)) {
-      Serial.println("  tune command failed");
-      continue;
-    }
     DigiStatus status;
-    if (!waitForLock(5000, 400, status)) {
+    uint16_t usedAntcap = 0;
+    if (!tuneWithAntcap(idx, status, usedAntcap)) {
       Serial.println("  no lock");
       continue;
     }
@@ -807,18 +818,16 @@ static bool startServiceByIndex(int idx) {
   Serial.printf("Selection: [%d] %s (freqIdx=%u freq=%lu kHz, audio=%s)\n", idx, svc.label.c_str(), svc.freqIndex,
                 static_cast<unsigned long>(svc.freqKHz), g_useI2S ? "I2S" : "DAC");
   ensureFreqList();
-  if (!radio.dabTune(svc.freqIndex)) {
+  DigiStatus st;
+  uint16_t usedAntcap = 0;
+  if (!tuneWithAntcap(svc.freqIndex, st, usedAntcap)) {
     Serial.println("DAB_TUNE_FREQ a echoue, tentative de reinit radio...");
-    if (!reinitRadio() || !radio.dabTune(svc.freqIndex)) {
+    if (!reinitRadio() || !tuneWithAntcap(svc.freqIndex, st, usedAntcap)) {
       Serial.println("Echec DAB_TUNE_FREQ");
       return false;
     }
   }
-  DigiStatus st;
-  if (!waitForLock(8000, 400, st)) {
-    Serial.println("Pas de lock sur la frequence cible.");
-    return false;
-  }
+  Serial.printf("ANTCAP utilise: 0x%02X\n", usedAntcap & 0xFF);
   logStatus(st, "Lock:");
   if (g_currentService >= 0) {
     const auto& prev = g_services[static_cast<size_t>(g_currentService)];
