@@ -1,0 +1,26 @@
+Example Flash Layout for Accommodating Sector Boundaries and Future Updates
+
+Component Name			Start Address		Max Size
+----------------		---------------		---------------
+Customer Specific Items		0x00000000 		8 kB
+-Content Description
+-Versioning
+-Etc
+
+FullPatch Mode 1 		0x00002000 		8 kB
+FullPatch Mode 2 		0x00004000 		8 kB
+Firmware Image Mode 1 		0x00006000 		560 kB
+Firmware Image Mode 2 		0x00092000 		560 kB
+Firmware image Mode 3		0x0011E000		560 kB
+
+
+
+
+
+example from SDK for v1.9.12 release
+-----------------------------------
+#define addr_PATCH_016  0x00002000
+#define addr_PATCH_016  0x00004000
+#define addr_HD         0x00006000
+#define addr_DAB        0x00092000
+#define addr_AMHD	0x0011E000
