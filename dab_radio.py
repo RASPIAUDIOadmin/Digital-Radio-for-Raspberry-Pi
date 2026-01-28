@@ -1,36 +1,56 @@
 #!/usr/bin/env python3
 """
-Minimal Raspberry Pi controller for Si468x in SPI host-load mode (no NVM flash).
-Loads the ROM00 patch and DAB firmware, configures I2S output, tunes a channel,
-reads the service list, and starts an audio service.
+Minimal Raspberry Pi controller for Si468x in I2C or SPI host-load mode (optional flash boot).
+Loads the ROM00 patch, boots the DAB firmware (host-load or flash-load), configures
+I2S output, tunes a channel, reads the service list, and starts an audio service.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import select
 import sys
 import time
+import termios
+import tty
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+
+try:
+    from smbus2 import SMBus, i2c_msg  # type: ignore
+except ImportError as exc:  # pragma: no cover - only relevant on the Pi
+    SMBus = None
+    i2c_msg = None
+    _I2C_IMPORT_ERROR = exc
+else:
+    _I2C_IMPORT_ERROR = None
 
 try:
     import spidev  # type: ignore
-    import RPi.GPIO as GPIO  # type: ignore
 except ImportError as exc:  # pragma: no cover - only relevant on the Pi
     spidev = None
-    GPIO = None
-    _IMPORT_ERROR = exc
+    _SPI_IMPORT_ERROR = exc
 else:
-    _IMPORT_ERROR = None
+    _SPI_IMPORT_ERROR = None
+
+try:
+    import RPi.GPIO as GPIO  # type: ignore
+except ImportError as exc:  # pragma: no cover - only relevant on the Pi
+    GPIO = None
+    _GPIO_IMPORT_ERROR = exc
+else:
+    _GPIO_IMPORT_ERROR = None
 
 # ---------------------------------------------------------------------------
 # Si468x command constants (subset needed for DAB bring-up)
 # ---------------------------------------------------------------------------
 CMD_POWER_UP = 0x01
 CMD_HOST_LOAD = 0x04
+CMD_FLASH_LOAD = 0x05
 CMD_LOAD_INIT = 0x06
 CMD_BOOT = 0x07
 CMD_SET_PROPERTY = 0x13
+CMD_GET_PROPERTY = 0x14
 
 CMD_GET_PART_INFO = 0x02
 
@@ -42,6 +62,9 @@ CMD_GET_DIGITAL_SERVICE_LIST = 0x80
 CMD_START_DIGITAL_SERVICE = 0x81
 CMD_STOP_DIGITAL_SERVICE = 0x82
 CMD_READ_OFFSET = 0x10
+CMD_FM_TUNE_FREQ = 0x30
+CMD_FM_SEEK_START = 0x31
+CMD_FM_RSQ_STATUS = 0x32
 
 # Property IDs
 PROP_PIN_CONFIG_ENABLE = 0x0800
@@ -54,6 +77,11 @@ PROP_DAB_TUNE_FE_VARB = 0x1711
 PROP_DAB_TUNE_FE_CFG = 0x1712
 PROP_DAB_EVENT_INTERRUPT_SOURCE = 0xB300
 PROP_DAB_VALID_RSSI_THRESHOLD = 0xB201
+
+# Default NVM flash address for DAB firmware (from _RECOMMENDED_FLASH_ADDRESSES.txt)
+FLASH_ADDR_DAB = 0x00092000
+FLASH_SECTOR_SIZE = 0x1000
+FLASH_WRITE_BLOCK = 224
 
 # ---------------------------------------------------------------------------
 # DAB Band III frequency list (index -> (label, freq_khz))
@@ -104,6 +132,10 @@ DAB_BAND_III: List[Tuple[str, int]] = [
 ]
 LABEL_TO_INDEX: Dict[str, int] = {label: idx for idx, (label, _) in enumerate(DAB_BAND_III)}
 
+FM_BAND_DEFAULT_MIN_KHZ = 87_500
+FM_BAND_DEFAULT_MAX_KHZ = 108_000
+FM_BAND_DEFAULT_STEP_KHZ = 100
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -111,33 +143,111 @@ def _signed_byte(value: int) -> int:
     return value - 256 if value & 0x80 else value
 
 
-def _require_pi_modules() -> None:
-    if _IMPORT_ERROR is not None:
+def _clamp_int(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(value)))
+
+
+def _reception_score(status: Dict[str, int]) -> int:
+    ficq = _clamp_int(status.get("fic_quality", 0), 0, 100)
+    cnr = _clamp_int(status.get("cnr", 0), 0, 30)
+    cnr_score = _clamp_int(cnr * 10, 0, 100)
+    rssi = _clamp_int(status.get("rssi", -120), -120, 20)
+    rssi_score = _clamp_int(int((rssi + 120) * (100 / 140)), 0, 100)
+    return _clamp_int(int(round(ficq * 0.5 + cnr_score * 0.35 + rssi_score * 0.15)), 0, 100)
+
+
+def _format_reception_bar(status: Dict[str, int], width: int = 12) -> str:
+    value = _reception_score(status)
+    filled = int(round((value / 100) * width))
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + f"] {value:3d}%"
+
+
+def _format_fm_bar(status: Dict[str, int], width: int = 12) -> str:
+    snr = _clamp_int(status.get("snr", 0), 0, 50)
+    snr_score = _clamp_int(int((snr / 50) * 100), 0, 100)
+    rssi = max(0, int(status.get("rssi", 0)))
+    rssi_score = _clamp_int(int((rssi / 60) * 100), 0, 100)
+    value = _clamp_int(int(round(snr_score * 0.6 + rssi_score * 0.4)), 0, 100)
+    filled = int(round((value / 100) * width))
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + f"] {value:3d}%"
+
+
+def _mhz_or_khz_to_khz(value: float) -> int:
+    return int(round(value * 1000.0)) if value < 1000.0 else int(round(value))
+
+
+def _crc32_update(crc: int, data: bytes) -> int:
+    c = crc
+    for b in data:
+        c ^= b
+        for _ in range(8):
+            if c & 1:
+                c = (c >> 1) ^ 0xEDB88320
+            else:
+                c >>= 1
+    return c
+
+
+def _require_pi_modules(use_spi: bool) -> None:
+    if _GPIO_IMPORT_ERROR is not None:
         raise RuntimeError(
-            "spidev and RPi.GPIO are required on the Raspberry Pi. "
-            "Import failed with: %s" % _IMPORT_ERROR
+            "RPi.GPIO is required on the Raspberry Pi. "
+            "Import failed with: %s" % _GPIO_IMPORT_ERROR
         )
+    if use_spi:
+        if _SPI_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "spidev is required for SPI control. "
+                "Import failed with: %s" % _SPI_IMPORT_ERROR
+            )
+    else:
+        if _I2C_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "smbus2 is required for I2C control. "
+                "Import failed with: %s" % _I2C_IMPORT_ERROR
+            )
 
 
 class Si468xDabRadio:
     def __init__(
         self,
-        spi_bus: int,
-        spi_device: int,
-        spi_speed_hz: int,
+        i2c_bus: int,
+        i2c_addr: int,
         rst_pin: int,
         int_pin: Optional[int],
+        use_spi: bool,
+        spi_bus: int,
+        spi_dev: int,
+        spi_speed_hz: int,
     ) -> None:
-        _require_pi_modules()
-        self.spi = spidev.SpiDev()
-        self.spi.open(spi_bus, spi_device)
-        self.spi.max_speed_hz = spi_speed_hz
-        self.spi.mode = 0
-        self.spi.bits_per_word = 8
-        self.spi.lsbfirst = False
+        _require_pi_modules(use_spi=use_spi)
+        self.use_spi = use_spi
+        self.bus = None
+        self.spi = None
+        self.i2c_addr = i2c_addr
+        if use_spi:
+            if spidev is None:
+                raise RuntimeError("spidev is required for SPI control")
+            self.spi = spidev.SpiDev()
+            self.spi.open(spi_bus, spi_dev)
+            self.spi.max_speed_hz = int(spi_speed_hz)
+            self.spi.mode = 0
+            self.spi.bits_per_word = 8
+        else:
+            if SMBus is None or i2c_msg is None:
+                raise RuntimeError("smbus2 is required for I2C control")
+            self.bus = SMBus(i2c_bus)
 
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BCM)
+        # Best-effort internal pull-ups on I2C1 (GPIO2=SDA, GPIO3=SCL).
+        # These are weak and do not replace external pull-ups, but can help during bring-up.
+        if not use_spi and i2c_bus == 1:
+            try:
+                GPIO.setup(2, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                GPIO.setup(3, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            except Exception:
+                pass
         GPIO.setup(rst_pin, GPIO.OUT, initial=GPIO.LOW)
         if int_pin is not None:
             GPIO.setup(int_pin, GPIO.IN)
@@ -148,9 +258,17 @@ class Si468xDabRadio:
     # Low-level SPI helpers
     # ------------------------------------------------------------------
     def _read_reply(self, length: int) -> List[int]:
-        # First byte is 0x00 per SI468x SPI read protocol.
-        rx = self.spi.xfer2([0x00] + [0x00] * length)
-        return rx[1:]
+        if self.use_spi:
+            if self.spi is None:
+                raise RuntimeError("SPI not initialized")
+            resp = self.spi.xfer2([0x00] + [0x00] * length)
+            return resp[1:]
+        if i2c_msg is None or self.bus is None:
+            raise RuntimeError("smbus2 i2c_msg required for I2C reads")
+        write = i2c_msg.write(self.i2c_addr, [0x00])
+        read = i2c_msg.read(self.i2c_addr, length)
+        self.bus.i2c_rdwr(write, read)
+        return list(read)
 
     def _wait_cts(self, timeout: float = 1.0) -> None:
         deadline = time.time() + timeout
@@ -163,10 +281,17 @@ class Si468xDabRadio:
             time.sleep(0.001)
         raise TimeoutError("CTS timeout waiting for SI468x")
 
-    def _write_command(self, data: List[int]) -> None:
-        self._wait_cts()
-        self.spi.xfer2(data)
-        self._wait_cts()
+    def _write_command(self, data: List[int], timeout: float = 1.0) -> None:
+        self._wait_cts(timeout=timeout)
+        if self.use_spi:
+            if self.spi is None:
+                raise RuntimeError("SPI not initialized")
+            self.spi.xfer2(data)
+        else:
+            if i2c_msg is None or self.bus is None:
+                raise RuntimeError("smbus2 i2c_msg required for I2C writes")
+            self.bus.i2c_rdwr(i2c_msg.write(self.i2c_addr, data))
+        self._wait_cts(timeout=timeout)
 
     # ------------------------------------------------------------------
     # Boot / load
@@ -204,7 +329,7 @@ class Si468xDabRadio:
     def _boot(self) -> None:
         self._write_command([CMD_BOOT, 0x00])
 
-    def _host_load_file(self, image_path: Path, chunk_size: int = 252) -> None:
+    def _host_load_file(self, image_path: Path, chunk_size: int = 32) -> None:
         with image_path.open("rb") as handle:
             while True:
                 chunk = handle.read(chunk_size)
@@ -221,6 +346,150 @@ class Si468xDabRadio:
         self._host_load_file(firmware_path)
         self._boot()
 
+    def load_patch_only(self, patch_path: Path) -> None:
+        self._send_load_init()
+        self._host_load_file(patch_path)
+        time.sleep(0.004)
+
+    def flash_load(self, start_addr: int) -> None:
+        """
+        Load firmware from external NVM flash.
+
+        Try multiple command formats if the first one fails.
+        """
+        # Method 1: Standard 12-byte command (most common)
+        try:
+            cmd = [0x00] * 12
+            cmd[0] = CMD_FLASH_LOAD
+            cmd[4:8] = list(int(start_addr).to_bytes(4, "little"))
+            self._write_command(cmd, timeout=5.0)
+            print(f"[DEBUG] Flash load successful (method 1: standard 12-byte)")
+            return
+        except Exception as e1:
+            print(f"[DEBUG] Flash load method 1 failed: {e1}")
+
+        # Method 2: 8-byte command variant
+        try:
+            cmd = [0x00] * 8
+            cmd[0] = CMD_FLASH_LOAD
+            cmd[4:8] = list(int(start_addr).to_bytes(4, "little"))
+            self._write_command(cmd, timeout=5.0)
+            print(f"[DEBUG] Flash load successful (method 2: 8-byte variant)")
+            return
+        except Exception as e2:
+            print(f"[DEBUG] Flash load method 2 failed: {e2}")
+
+        # Method 3: With explicit length parameter (bytes 8-11)
+        try:
+            cmd = [0x00] * 12
+            cmd[0] = CMD_FLASH_LOAD
+            cmd[4:8] = list(int(start_addr).to_bytes(4, "little"))
+            # Set length to 0 for "load all"
+            cmd[8:12] = [0x00, 0x00, 0x00, 0x00]
+            self._write_command(cmd, timeout=5.0)
+            print(f"[DEBUG] Flash load successful (method 3: with length)")
+            return
+        except Exception as e3:
+            print(f"[DEBUG] Flash load method 3 failed: {e3}")
+
+        # If all methods fail
+        raise RuntimeError(
+            f"Failed to load firmware from flash address 0x{start_addr:08X}. "
+            f"All command formats were rejected. "
+            f"Please verify:\n"
+            f"  1. Firmware was correctly programmed to flash\n"
+            f"  2. Correct flash address (try 0x00040000 or 0x00092000)\n"
+            f"  3. Correct patch is loaded (use full patch, not mini)\n"
+            f"  4. Flash chip is properly connected and powered"
+        )
+
+    def flash_load_and_boot(self, start_addr: int) -> None:
+        self._send_load_init()
+        self.flash_load(start_addr)
+        self._boot()
+
+    def flash_enter_program_mode(self) -> None:
+        """
+        FIXED: Enter flash programming mode.
+
+        The original command [0xB2, 0x55, 0x55] was incorrect because:
+        - 0xB2 is CMD_DAB_DIGRAD_STATUS, causing a command conflict
+        - Flash operations should use CMD_FLASH_LOAD (0x05) with magic bytes
+
+        This method tries multiple known unlock sequences in order.
+        """
+        # Try method 1: CMD_FLASH_LOAD with 0xFF prefix + magic unlock
+        try:
+            self._write_command([CMD_FLASH_LOAD, 0xFF, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00], timeout=3.0)
+            print("[DEBUG] Flash program mode entered (method 1: CMD_FLASH_LOAD + 0xFF5555)")
+            return
+        except Exception as e1:
+            print(f"[DEBUG] Method 1 failed: {e1}")
+
+        # Try method 2: Extended magic sequence
+        try:
+            self._write_command([CMD_FLASH_LOAD, 0x55, 0x55, 0xAA, 0xAA, 0x00, 0x00, 0x00], timeout=3.0)
+            print("[DEBUG] Flash program mode entered (method 2: CMD_FLASH_LOAD + 5555AAAA)")
+            return
+        except Exception as e2:
+            print(f"[DEBUG] Method 2 failed: {e2}")
+
+        # Try method 3: Simple 2-byte sequence
+        try:
+            self._write_command([CMD_FLASH_LOAD, 0x55, 0x55], timeout=3.0)
+            print("[DEBUG] Flash program mode entered (method 3: CMD_FLASH_LOAD + 5555)")
+            return
+        except Exception as e3:
+            print(f"[DEBUG] Method 3 failed: {e3}")
+
+        # Try method 4: No explicit command (patch may already enable mode)
+        try:
+            print("[DEBUG] Attempting to proceed without explicit enter command (patch may enable mode)")
+            time.sleep(0.1)
+            return
+        except Exception as e4:
+            print(f"[DEBUG] Method 4 failed: {e4}")
+
+        # If all methods fail, raise an error with helpful diagnostics
+        raise RuntimeError(
+            "Failed to enter flash programming mode. "
+            "All known command sequences were rejected by Si468x. "
+            "Please check:\n"
+            "  1. Correct flash programming patch is loaded (rom00_patch_mini.003.bin)\n"
+            "  2. Flash CS pin is properly configured if using external flash\n"
+            "  3. Si468x firmware version supports flash programming\n"
+            "  4. Consult Si468x programming guide for your specific chip revision"
+        )
+
+    def flash_erase_sector(self, start_addr: int) -> None:
+        cmd = [
+            CMD_FLASH_LOAD,
+            0xFE,
+            0xC0,
+            0xDE,
+            *list(int(start_addr).to_bytes(4, "little")),
+        ]
+        self._write_command(cmd, timeout=3.0)
+
+    def flash_write_block(self, start_addr: int, data: bytes) -> None:
+        if not data or len(data) > FLASH_WRITE_BLOCK:
+            raise ValueError("Flash write block length invalid")
+        addr_len = start_addr.to_bytes(4, "little") + len(data).to_bytes(4, "little")
+        crc = 0xFFFFFFFF
+        crc = _crc32_update(crc, addr_len)
+        crc = _crc32_update(crc, data)
+        crc ^= 0xFFFFFFFF
+        cmd = [
+            CMD_FLASH_LOAD,
+            0xF3,
+            0x0C,
+            0xED,
+            *list(crc.to_bytes(4, "little")),
+            *list(addr_len),
+            *list(data),
+        ]
+        self._write_command(cmd, timeout=2.0)
+
     # ------------------------------------------------------------------
     # Properties and configuration
     # ------------------------------------------------------------------
@@ -234,6 +503,12 @@ class Si468xDabRadio:
             (value >> 8) & 0xFF,
         ]
         self._write_command(cmd)
+
+    def get_property(self, prop_id: int) -> int:
+        cmd = [CMD_GET_PROPERTY, 0x00, prop_id & 0xFF, (prop_id >> 8) & 0xFF]
+        self._write_command(cmd)
+        reply = self._read_reply(4)
+        return reply[-2] | (reply[-1] << 8)
 
     def configure_audio(
         self,
@@ -328,6 +603,44 @@ class Si468xDabRadio:
             "mute_engaged": bool(reply[8] & 0x08),
             "blk_error": bool(reply[8] & 0x02),
             "blk_loss": bool(reply[8] & 0x01),
+        }
+
+    # ------------------------------------------------------------------
+    # FM control
+    # ------------------------------------------------------------------
+    def fm_tune(
+        self,
+        freq_khz: int,
+        antcap: int = 0,
+        tune_mode: int = 0,
+        injection: int = 0,
+        dir_tune: int = 0,
+    ) -> None:
+        freq_10khz = int(round(freq_khz / 10))
+        arg1 = ((dir_tune & 0x01) << 5) | ((tune_mode & 0x03) << 2) | (injection & 0x03)
+        cmd = [
+            CMD_FM_TUNE_FREQ,
+            arg1,
+            freq_10khz & 0xFF,
+            (freq_10khz >> 8) & 0xFF,
+            antcap & 0xFF,
+            (antcap >> 8) & 0xFF,
+            0x00,
+        ]
+        self._write_command(cmd)
+
+    def fm_rsq_status(self, attune: bool = True, stcack: bool = False) -> Dict[str, int]:
+        flags = (0x04 if attune else 0x00) | (0x01 if stcack else 0x00)
+        self._write_command([CMD_FM_RSQ_STATUS, flags])
+        reply = self._read_reply(23)
+        readfreq_10khz = int.from_bytes(reply[6:8], "little")
+        return {
+            "valid": bool(reply[5] & 0x01),
+            "rssi": _signed_byte(reply[9]),
+            "snr": _signed_byte(reply[10]),
+            "freqoff": _signed_byte(reply[8]),
+            "freq_10khz": readfreq_10khz,
+            "freq_khz": readfreq_10khz * 10,
         }
 
     def _get_service_list_payload(self) -> bytes:
@@ -426,7 +739,10 @@ class Si468xDabRadio:
     # ------------------------------------------------------------------
     def close(self) -> None:
         try:
-            self.spi.close()
+            if self.bus is not None:
+                self.bus.close()
+            if self.spi is not None:
+                self.spi.close()
         finally:
             try:
                 GPIO.cleanup()
@@ -435,16 +751,90 @@ class Si468xDabRadio:
 
 
 # ---------------------------------------------------------------------------
+# Flash boot helpers
+# ---------------------------------------------------------------------------
+# Optional GPIO gate for external flash CS or mux.
+def _make_flash_cs(
+    pin: Optional[int],
+    active_high: bool,
+    hold_ms: int,
+) -> Optional[Callable[[bool], None]]:
+    if pin is None:
+        return None
+    if GPIO is None:
+        raise RuntimeError("--flash-cs-pin requires RPi.GPIO")
+    active_level = GPIO.HIGH if active_high else GPIO.LOW
+    inactive_level = GPIO.LOW if active_high else GPIO.HIGH
+    GPIO.setup(pin, GPIO.OUT, initial=inactive_level)
+
+    def _set(active: bool) -> None:
+        GPIO.output(pin, active_level if active else inactive_level)
+        if hold_ms > 0:
+            time.sleep(hold_ms / 1000.0)
+
+    return _set
+
+
+# ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    repo_root = Path(__file__).resolve().parent.parent
     default_patch = "./rom00_patch.016.bin"
     default_fw = "./dab_radio_6_0_9.bin"
 
-    parser = argparse.ArgumentParser(description="Play DAB via Si468x on Raspberry Pi (SPI host load).")
+    parser = argparse.ArgumentParser(description="Play DAB via Si468x on Raspberry Pi (I2C or SPI host load).")
     parser.add_argument("--patch", type=Path, default=default_patch, help="Path to rom00 patch image")
     parser.add_argument("--firmware", type=Path, default=default_fw, help="Path to dab_radio firmware image")
+    parser.add_argument(
+        "--flash-boot",
+        action="store_true",
+        help="Boot DAB firmware from external NVM flash (still host-loads patch).",
+    )
+    parser.add_argument(
+        "--flash-program",
+        action="store_true",
+        help="Program external NVM flash via Si468x before booting.",
+    )
+    parser.add_argument(
+        "--flash-program-image",
+        type=Path,
+        default=None,
+        help="Image to program into NVM flash (default: --firmware).",
+    )
+    parser.add_argument(
+        "--flash-program-patch",
+        type=Path,
+        default=None,
+        help="Patch to load before flash programming (default: --patch).",
+    )
+    parser.add_argument(
+        "--flash-program-only",
+        action="store_true",
+        help="Exit after flash programming (no boot).",
+    )
+    parser.add_argument(
+        "--flash-addr",
+        type=lambda x: int(x, 0),
+        default=FLASH_ADDR_DAB,
+        help="Flash start address for DAB firmware (default: 0x00092000).",
+    )
+    parser.add_argument(
+        "--flash-cs-pin",
+        type=int,
+        default=None,
+        help="GPIO (BCM) used to select external flash during Si468x flash ops.",
+    )
+    parser.add_argument(
+        "--flash-cs-active-high",
+        action="store_true",
+        help="Treat --flash-cs-pin as active-high (default active-low).",
+    )
+    parser.add_argument(
+        "--flash-cs-hold-ms",
+        type=int,
+        default=1,
+        help="Delay after toggling flash CS in ms (default 1).",
+    )
     parser.add_argument("--freq", type=str, help="DAB channel label (e.g. 5A, 10C)")
     parser.add_argument("--freq-index", type=int, help="Frequency index override (0-based)")
     parser.add_argument("--service-id", type=lambda x: int(x, 0), help="Service ID to start (hex or int)")
@@ -455,10 +845,29 @@ def parse_args() -> argparse.Namespace:
         help="Use nth audio service from the list (default: 0 / first)",
     )
     parser.add_argument("--list-only", action="store_true", help="Only list services after tuning")
-    parser.add_argument("--spi-bus", type=int, default=0)
-    parser.add_argument("--spi-device", type=int, default=0)
-    parser.add_argument("--spi-speed", type=int, default=1_000_000, help="SPI speed in Hz (default 1 MHz)")
-    parser.add_argument("--rst-pin", type=int, default=23, help="GPIO (BCM) for RSTB (default 23 / physical 16)")
+    parser.add_argument("--i2c-bus", type=int, default=1, help="I2C bus number (default 1)")
+    parser.add_argument(
+        "--i2c-addr",
+        type=lambda x: int(x, 0),
+        default=0x64,
+        help="I2C address (7-bit) for Si468x (default 0x64)",
+    )
+    parser.add_argument(
+        "--spi",
+        action="store_true",
+        default=True,
+        help="Use SPI for Si468x control (default).",
+    )
+    parser.add_argument(
+        "--i2c",
+        dest="spi",
+        action="store_false",
+        help="Use I2C instead of SPI for Si468x control.",
+    )
+    parser.add_argument("--spi-bus", type=int, default=0, help="SPI bus number (default 0)")
+    parser.add_argument("--spi-dev", type=int, default=0, help="SPI device number (default 0)")
+    parser.add_argument("--spi-speed", type=int, default=30_000_000, help="SPI speed in Hz (default 30000000)")
+    parser.add_argument("--rst-pin", type=int, default=25, help="GPIO (BCM) for RSTB (default 25 / physical 22)")
     parser.add_argument("--int-pin", type=int, default=None, help="GPIO (BCM) for INTB; leave unset to poll")
     parser.add_argument(
         "--audio-out",
@@ -501,6 +910,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--scan", action="store_true", help="Scan all frequencies in the list before choosing a service")
     parser.add_argument("--force-scan", action="store_true", help="Ignore saved full_scan.txt and rescan now")
+    parser.add_argument("--fm-freq", type=float, help="FM frequency to tune (MHz or kHz)")
+    parser.add_argument("--fm-scan", action="store_true", help="Scan the FM band for stations")
+    parser.add_argument("--fm-min", type=float, default=FM_BAND_DEFAULT_MIN_KHZ, help="FM min (MHz or kHz)")
+    parser.add_argument("--fm-max", type=float, default=FM_BAND_DEFAULT_MAX_KHZ, help="FM max (MHz or kHz)")
+    parser.add_argument("--fm-step", type=float, default=FM_BAND_DEFAULT_STEP_KHZ, help="FM step (kHz)")
+    parser.add_argument("--fm-snr-min", type=int, default=0, help="FM scan SNR threshold (default 0)")
+    parser.add_argument("--fm-rssi-min", type=int, default=0, help="FM scan RSSI threshold (default 0)")
     return parser.parse_args()
 
 
@@ -556,26 +972,108 @@ def main() -> None:
 
     patch_path = args.patch
     firmware_path = args.firmware
+    fm_requested = args.fm_scan or args.fm_freq is not None
+    flash_addr = args.flash_addr
+    flash_boot_requested = args.flash_boot
+    flash_program_requested = args.flash_program
+    flash_program_only = args.flash_program_only
+    flash_program_image = args.flash_program_image or firmware_path
+    if args.flash_program_patch is not None:
+        flash_program_patch = args.flash_program_patch
+    else:
+        mini_patch = Path(__file__).resolve().with_name("rom00_patch_mini.003.bin")
+        flash_program_patch = mini_patch if mini_patch.exists() else patch_path
     if not patch_path.exists():
         raise SystemExit(f"Patch image not found: {patch_path}")
     if not firmware_path.exists():
         raise SystemExit(f"Firmware image not found: {firmware_path}")
+    if flash_program_requested:
+        if not flash_program_image.exists():
+            raise SystemExit(f"Flash program image not found: {flash_program_image}")
+        if not flash_program_patch.exists():
+            raise SystemExit(f"Flash program patch not found: {flash_program_patch}")
+        print(f"Flash program patch: {flash_program_patch}")
 
     radio = Si468xDabRadio(
-        spi_bus=args.spi_bus,
-        spi_device=args.spi_device,
-        spi_speed_hz=args.spi_speed,
+        i2c_bus=args.i2c_bus,
+        i2c_addr=args.i2c_addr,
         rst_pin=args.rst_pin,
         int_pin=args.int_pin,
+        use_spi=args.spi,
+        spi_bus=args.spi_bus,
+        spi_dev=args.spi_dev,
+        spi_speed_hz=args.spi_speed,
     )
+
+    flash_cs = _make_flash_cs(args.flash_cs_pin, args.flash_cs_active_high, args.flash_cs_hold_ms)
+    if flash_cs:
+        level = "high" if args.flash_cs_active_high else "low"
+        print(f"Flash CS GPIO configured on BCM {args.flash_cs_pin} (active {level}).")
+
+    flash_boot_active = False
+
+    def flash_boot() -> None:
+        if flash_cs:
+            flash_cs(True)
+        try:
+            radio.flash_load_and_boot(flash_addr)
+        finally:
+            if flash_cs:
+                flash_cs(False)
+
+    def flash_program() -> None:
+        image_size = flash_program_image.stat().st_size
+        sectors = (image_size + FLASH_SECTOR_SIZE - 1) // FLASH_SECTOR_SIZE
+        print(
+            f"Programming NVM flash @0x{flash_addr:08X} ({image_size} bytes, {sectors} sectors)..."
+        )
+        saved_spi_speed = None
+        if radio.use_spi and radio.spi is not None:
+            saved_spi_speed = radio.spi.max_speed_hz
+            radio.spi.max_speed_hz = min(int(saved_spi_speed), 1_000_000)
+        if flash_cs:
+            flash_cs(True)
+        try:
+            time.sleep(0.05)
+            radio.flash_enter_program_mode()
+            for i in range(sectors):
+                addr = flash_addr + (i * FLASH_SECTOR_SIZE)
+                radio.flash_erase_sector(addr)
+                if (i + 1) % 16 == 0 or i == sectors - 1:
+                    print(f"  erase sector {i + 1}/{sectors} @0x{addr:08X}")
+            written = 0
+            with flash_program_image.open("rb") as handle:
+                while True:
+                    chunk = handle.read(FLASH_WRITE_BLOCK)
+                    if not chunk:
+                        break
+                    radio.flash_write_block(flash_addr + written, chunk)
+                    written += len(chunk)
+                    if written % (FLASH_WRITE_BLOCK * 64) == 0 or written == image_size:
+                        print(f"  wrote {written}/{image_size} bytes")
+        finally:
+            if flash_cs:
+                flash_cs(False)
+            if saved_spi_speed is not None and radio.spi is not None:
+                radio.spi.max_speed_hz = saved_spi_speed
 
     # Helper to recover the radio after a command error
     def recover_radio(reason: str) -> bool:
+        nonlocal flash_boot_active
         print(f"[RECOVER] Reinitializing radio after error: {reason}")
         try:
             radio.reset()
             radio.power_up(xtal_freq=args.xtal, ctun=args.ctun)
-            radio.load_patch_and_firmware(patch_path, firmware_path)
+            if flash_boot_active:
+                try:
+                    radio.load_patch_only(patch_path)
+                    flash_boot()
+                except Exception as exc:
+                    print(f"[RECOVER] Flash boot failed, falling back to host load: {exc}")
+                    radio.load_patch_and_firmware(patch_path, firmware_path)
+                    flash_boot_active = False
+            else:
+                radio.load_patch_and_firmware(patch_path, firmware_path)
             radio.configure_audio(
                 mode=args.audio_out,
                 master=args.i2s_master,
@@ -590,20 +1088,265 @@ def main() -> None:
             return False
 
     try:
+        if flash_program_requested:
+            print("Flash programming requested (via Si468x)...")
+            radio.reset()
+            radio.power_up(xtal_freq=args.xtal, ctun=args.ctun)
+            print("Loading patch for flash programming...")
+            radio.load_patch_only(flash_program_patch)
+            flash_program()
+            if flash_program_only:
+                return
+            radio.reset()
         print("Resetting SI468x...")
         radio.reset()
         print(f"Powering up ROM... (xtal={args.xtal} ctun=0x{args.ctun:02X})")
         radio.power_up(xtal_freq=args.xtal, ctun=args.ctun)
-        print("Loading patch and firmware (this takes a few seconds)...")
-        radio.load_patch_and_firmware(patch_path, firmware_path)
-        print("Configuring I2S and DAB frontend...")
+        if flash_boot_requested:
+            print("Loading patch for flash boot...")
+            radio.load_patch_only(patch_path)
+            print(f"Booting firmware from flash @0x{flash_addr:08X}...")
+            try:
+                flash_boot()
+                # Verify DAB firmware responds
+                radio.dab_digrad_status()
+                flash_boot_active = True
+                print("Flash boot successful.")
+            except Exception as exc:
+                print(f"Flash boot failed: {exc}")
+                print("Falling back to host-load firmware...")
+                radio.reset()
+                radio.power_up(xtal_freq=args.xtal, ctun=args.ctun)
+                radio.load_patch_and_firmware(patch_path, firmware_path)
+                flash_boot_active = False
+        else:
+            print("Loading patch and firmware (this takes a few seconds)...")
+            radio.load_patch_and_firmware(patch_path, firmware_path)
+        print("Configuring audio output...")
         radio.configure_audio(
             mode=args.audio_out,
             master=args.i2s_master,
             sample_rate=args.sample_rate,
             sample_size=args.sample_size,
         )
+
+        if fm_requested:
+            fm_min_khz = _mhz_or_khz_to_khz(float(args.fm_min))
+            fm_max_khz = _mhz_or_khz_to_khz(float(args.fm_max))
+            fm_step_khz = max(10, int(round(float(args.fm_step))))
+            fm_freq_khz = _mhz_or_khz_to_khz(args.fm_freq) if args.fm_freq is not None else None
+            fm_snr_min = int(args.fm_snr_min)
+            fm_rssi_min = int(args.fm_rssi_min)
+            fm_cmd_error_hint_shown = False
+
+            if fm_min_khz >= fm_max_khz:
+                raise SystemExit("FM band limits invalid (min >= max)")
+
+            def fm_tune_and_status(freq_khz: int) -> Optional[Dict[str, int]]:
+                nonlocal fm_cmd_error_hint_shown
+                try:
+                    radio.fm_tune(freq_khz)
+                except RuntimeError as err:
+                    print(f"FM_TUNE_FREQ failed: {err}")
+                    if not fm_cmd_error_hint_shown:
+                        print(
+                            "FM command rejected by firmware. "
+                            "Make sure your firmware build includes FM support."
+                        )
+                        fm_cmd_error_hint_shown = True
+                    return None
+                time.sleep(0.06)
+                return radio.fm_rsq_status(attune=True)
+
+            def fm_scan() -> List[Dict[str, int]]:
+                stations: List[Dict[str, int]] = []
+                total = ((fm_max_khz - fm_min_khz) // fm_step_khz) + 1
+                print(
+                    f"Scanning FM {fm_min_khz/1000:.1f}-{fm_max_khz/1000:.1f} MHz "
+                    f"(step {fm_step_khz} kHz, {total} steps)..."
+                )
+                for idx, freq_khz in enumerate(range(fm_min_khz, fm_max_khz + 1, fm_step_khz)):
+                    status = fm_tune_and_status(freq_khz)
+                    if status is None:
+                        print("FM commands not supported by this firmware image.")
+                        break
+                    if status["valid"] and status["snr"] >= fm_snr_min and status["rssi"] >= fm_rssi_min:
+                        stations.append(
+                            {
+                                "freq_khz": freq_khz,
+                                "rssi": status["rssi"],
+                                "snr": status["snr"],
+                            }
+                        )
+                        print(
+                            f"  found {freq_khz/1000:.1f} MHz "
+                            f"RSSI={status['rssi']} SNR={status['snr']}"
+                        )
+                    if idx % 50 == 0 and idx:
+                        print(f"  progress {idx}/{total}")
+                return stations
+
+            stations: List[Dict[str, int]] = []
+            if args.fm_scan or fm_freq_khz is None:
+                stations = fm_scan()
+
+            current_freq = fm_freq_khz
+            if current_freq is None and stations:
+                current_freq = stations[0]["freq_khz"]
+            if current_freq is None:
+                current_freq = fm_min_khz
+
+            status = fm_tune_and_status(current_freq)
+            if status is None:
+                return
+            print(f"FM tuned to {current_freq/1000:.1f} MHz")
+            current_volume = radio.set_volume(40)
+            print(f"Initial volume set to {current_volume}/63.")
+
+            def print_menu_fm() -> None:
+                print(
+                    "\nCommands: <index> | f<freq MHz> | + / - volume | s status | l list | r rescan | q quit"
+                )
+                if stations:
+                    print("Stations:")
+                    for idx, st in enumerate(stations):
+                        print(
+                            f"  [{idx}] {st['freq_khz']/1000:.1f} MHz  "
+                            f"RSSI={st['rssi']} SNR={st['snr']}"
+                        )
+
+            def print_status_fm() -> None:
+                st = radio.fm_rsq_status(attune=True)
+                gauge = _format_fm_bar(st)
+                print(
+                    f"FM {st['freq_khz']/1000:.1f} MHz RSSI={st['rssi']} "
+                    f"SNR={st['snr']} {gauge} VALID={st['valid']}"
+                )
+
+            def parse_freq_cmd(text: str) -> Optional[int]:
+                cleaned = text.strip().lower()
+                if cleaned.startswith("f"):
+                    cleaned = cleaned[1:]
+                if not cleaned:
+                    return None
+                try:
+                    value = float(cleaned)
+                except ValueError:
+                    return None
+                return _mhz_or_khz_to_khz(value)
+
+            print_menu_fm()
+            print_status_fm()
+            next_status = time.time() + 1.0
+            fd = sys.stdin.fileno()
+            old_tty = termios.tcgetattr(fd)
+            input_buf = ""
+            try:
+                tty.setcbreak(fd)
+                sys.stdout.write("radio> ")
+                sys.stdout.flush()
+                while True:
+                    timeout = max(0.0, next_status - time.time())
+                    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+                    if ready:
+                        ch = sys.stdin.read(1)
+                        if ch in ("\n", "\r"):
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                            cmd = input_buf.strip()
+                            input_buf = ""
+                        elif ch in ("\x7f", "\b"):
+                            if input_buf:
+                                input_buf = input_buf[:-1]
+                                sys.stdout.write("\b \b")
+                                sys.stdout.flush()
+                            continue
+                        else:
+                            input_buf += ch
+                            sys.stdout.write(ch)
+                            sys.stdout.flush()
+                            continue
+                    else:
+                        sys.stdout.write("\n")
+                        print_status_fm()
+                        sys.stdout.write("radio> " + input_buf)
+                        sys.stdout.flush()
+                        next_status = time.time() + 1.0
+                        continue
+
+                    next_status = time.time() + 1.0
+                    if cmd == "":
+                        sys.stdout.write("radio> ")
+                        sys.stdout.flush()
+                        continue
+                    if cmd.lower() == "q":
+                        print("Leaving radio playing. Bye.")
+                        break
+                    if cmd.lower() == "r":
+                        stations = fm_scan()
+                        print("Rescan complete.")
+                        print_menu_fm()
+                        sys.stdout.write("radio> ")
+                        sys.stdout.flush()
+                        continue
+                    if cmd.lower() == "l":
+                        print_menu_fm()
+                        sys.stdout.write("radio> ")
+                        sys.stdout.flush()
+                        continue
+                    if cmd and set(cmd) == {"+"}:
+                        current_volume = radio.set_volume(current_volume + (2 * len(cmd)))
+                        print(f"Volume {current_volume}/63")
+                        sys.stdout.write("radio> ")
+                        sys.stdout.flush()
+                        continue
+                    if cmd and set(cmd) == {"-"}:
+                        current_volume = radio.set_volume(current_volume - (2 * len(cmd)))
+                        print(f"Volume {current_volume}/63")
+                        sys.stdout.write("radio> ")
+                        sys.stdout.flush()
+                        continue
+                    if cmd.lower() == "s":
+                        print_status_fm()
+                        sys.stdout.write("radio> ")
+                        sys.stdout.flush()
+                        continue
+
+                    tuned = False
+                    if stations and cmd.isdigit():
+                        idx = int(cmd)
+                        if 0 <= idx < len(stations):
+                            current_freq = stations[idx]["freq_khz"]
+                            tuned = True
+                    if not tuned:
+                        freq_cmd = parse_freq_cmd(cmd)
+                        if freq_cmd:
+                            current_freq = freq_cmd
+                            tuned = True
+                    if tuned and current_freq is not None:
+                        status = fm_tune_and_status(current_freq)
+                        if status is not None:
+                            print(f"Tuned to {current_freq/1000:.1f} MHz")
+                        sys.stdout.write("radio> ")
+                        sys.stdout.flush()
+                        continue
+
+                    print("Unknown command.")
+                    print_menu_fm()
+                    sys.stdout.write("radio> ")
+                    sys.stdout.flush()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
+            return
+
+        print("Configuring DAB frontend...")
         radio.configure_dab_frontend()
+        if args.audio_out == "analog":
+            radio.set_property(PROP_AUDIO_ANALOG_VOLUME, 0x003F)
+            vol = radio.get_property(PROP_AUDIO_ANALOG_VOLUME)
+            pin_cfg = radio.get_property(PROP_PIN_CONFIG_ENABLE)
+            dac_on = "on" if (pin_cfg & 0x0001) else "off"
+            print(f"Analog volume=0x{vol:04X} PIN_CFG=0x{pin_cfg:04X} DAC={dac_on}")
 
         # Determine startup frequency list
         loaded_services = None
@@ -666,9 +1409,10 @@ def main() -> None:
                 if status["valid"]:
                     return status
                 if now >= next_status_print:
+                    gauge = _format_reception_bar(status)
                     print(
                         f"  waiting lock... RSSI={status['rssi']} SNR={status['snr']} "
-                        f"FICQ={status['fic_quality']} ACQ={status['acq']} VALID={status['valid']}"
+                        f"FICQ={status['fic_quality']} {gauge} ACQ={status['acq']} VALID={status['valid']}"
                     )
                     next_status_print = now + max(args.status_interval_ms / 1000.0, 0.05)
                 time.sleep(0.05)
@@ -798,7 +1542,10 @@ def main() -> None:
             start_service(services[0])
 
         def print_menu() -> None:
-            print("\nCommands: number=<index> | name substring | + / - volume | o toggle audio out | r rescan | q quit")
+            print(
+                "\nCommands: number=<index> | name substring | + / - volume | s status | o toggle audio out | "
+                "r rescan | q quit"
+            )
             print("Stations:")
             for idx, svc in enumerate(services):
                 fi = svc.get("freq_index", -1)
@@ -808,57 +1555,127 @@ def main() -> None:
                     f"COMP=0x{svc['component_id']:04X}  FreqIdx={fi} ({fk} kHz)"
                 )
 
-        print_menu()
-        while True:
-            try:
-                cmd = input("radio> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if cmd == "":
-                continue
-            if cmd.lower() == "q":
-                print("Leaving radio playing. Bye.")
-                break
-            if cmd.lower() == "r":
-                services = ensure_services()
-                services = sorted(services, key=lambda s: s.get("label", ""))
-                print("Rescan complete.")
-                print_menu()
-                continue
-            if cmd == "+":
-                current_volume = radio.set_volume(current_volume + 2)
-                print(f"Volume {current_volume}/63")
-                continue
-            if cmd == "-":
-                current_volume = radio.set_volume(current_volume - 2)
-                print(f"Volume {current_volume}/63")
-                continue
-            if cmd.lower() == "o":
-                args.audio_out = "i2s" if args.audio_out == "analog" else "analog"
-                radio.configure_audio(
-                    mode=args.audio_out,
-                    master=args.i2s_master,
-                    sample_rate=args.sample_rate,
-                    sample_size=args.sample_size,
-                )
-                print(f"Audio output switched to {args.audio_out}.")
-                continue
+        def print_status_line() -> None:
+            status = radio.dab_digrad_status()
+            gauge = _format_reception_bar(status)
+            print(
+                f"Status: RSSI={status['rssi']} SNR={status['snr']} "
+                f"FICQ={status['fic_quality']} {gauge} CNR={status['cnr']} "
+                f"ACQ={status['acq']} VALID={status['valid']} tuneIdx={status['tune_index']}"
+            )
 
-            # Selection by index or substring
-            selected: Optional[Dict[str, object]] = None
-            if cmd.isdigit():
-                idx = int(cmd)
-                if 0 <= idx < len(services):
-                    selected = services[idx]
-            else:
-                for svc in services:
-                    if cmd.lower() in str(svc.get("label", "")).lower():
-                        selected = svc
-                        break
-            if selected:
-                start_service(selected)
-            else:
-                print("Unknown command/selection.")
+        print_menu()
+        print_status_line()
+        next_status = time.time() + 1.0
+        fd = sys.stdin.fileno()
+        old_tty = termios.tcgetattr(fd)
+        input_buf = ""
+        try:
+            tty.setcbreak(fd)
+            sys.stdout.write("radio> ")
+            sys.stdout.flush()
+            while True:
+                timeout = max(0.0, next_status - time.time())
+                ready, _, _ = select.select([sys.stdin], [], [], timeout)
+                if ready:
+                    ch = sys.stdin.read(1)
+                    if ch in ("\n", "\r"):
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        cmd = input_buf.strip()
+                        input_buf = ""
+                    elif ch in ("\x7f", "\b"):
+                        if input_buf:
+                            input_buf = input_buf[:-1]
+                            sys.stdout.write("\b \b")
+                            sys.stdout.flush()
+                        continue
+                    else:
+                        input_buf += ch
+                        sys.stdout.write(ch)
+                        sys.stdout.flush()
+                        continue
+                else:
+                    sys.stdout.write("\n")
+                    print_status_line()
+                    sys.stdout.write("radio> " + input_buf)
+                    sys.stdout.flush()
+                    next_status = time.time() + 1.0
+                    continue
+
+                next_status = time.time() + 1.0
+                if cmd == "":
+                    sys.stdout.write("radio> ")
+                    sys.stdout.flush()
+                    continue
+                if cmd.lower() == "q":
+                    print("Leaving radio playing. Bye.")
+                    break
+                if cmd.lower() == "r":
+                    services = ensure_services()
+                    services = sorted(services, key=lambda s: s.get("label", ""))
+                    print("Rescan complete.")
+                    print_menu()
+                    sys.stdout.write("radio> ")
+                    sys.stdout.flush()
+                    continue
+                if cmd and set(cmd) == {"+"}:
+                    current_volume = radio.set_volume(current_volume + (2 * len(cmd)))
+                    print(f"Volume {current_volume}/63")
+                    sys.stdout.write("radio> ")
+                    sys.stdout.flush()
+                    continue
+                if cmd and set(cmd) == {"-"}:
+                    current_volume = radio.set_volume(current_volume - (2 * len(cmd)))
+                    print(f"Volume {current_volume}/63")
+                    sys.stdout.write("radio> ")
+                    sys.stdout.flush()
+                    continue
+                if cmd.lower() == "o":
+                    args.audio_out = "i2s" if args.audio_out == "analog" else "analog"
+                    radio.configure_audio(
+                        mode=args.audio_out,
+                        master=args.i2s_master,
+                        sample_rate=args.sample_rate,
+                        sample_size=args.sample_size,
+                    )
+                    print(f"Audio output switched to {args.audio_out}.")
+                    sys.stdout.write("radio> ")
+                    sys.stdout.flush()
+                    continue
+                if cmd.lower() == "s":
+                    status = radio.dab_digrad_status()
+                    gauge = _format_reception_bar(status)
+                    print(
+                        f"Status: RSSI={status['rssi']} SNR={status['snr']} "
+                        f"FICQ={status['fic_quality']} {gauge} CNR={status['cnr']} "
+                        f"ACQ={status['acq']} VALID={status['valid']} tuneIdx={status['tune_index']}"
+                    )
+                    next_status = time.time() + 1.0
+                    sys.stdout.write("radio> ")
+                    sys.stdout.flush()
+                    continue
+
+                # Selection by index or substring
+                selected: Optional[Dict[str, object]] = None
+                if cmd.isdigit():
+                    idx = int(cmd)
+                    if 0 <= idx < len(services):
+                        selected = services[idx]
+                else:
+                    for svc in services:
+                        if cmd.lower() in str(svc.get("label", "")).lower():
+                            selected = svc
+                            break
+                if selected:
+                    start_service(selected)
+                else:
+                    print("Unknown command/selection.")
+                    print_menu()
+                sys.stdout.write("radio> ")
+                sys.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
     finally:
         radio.close()
 
