@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Raspiaudio Radio Control</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero panel reveal">
+        <div class="hero-copy">
+          <p class="eyebrow">Raspiaudio Local Control</p>
+          <h1>Raspiaudio Digital Radio for Raspberry Pi</h1>
+          <p class="hero-text">
+            <a class="hero-link" href="https://github.com/RASPIAUDIOadmin/DAB_RADIO" target="_blank" rel="noopener">
+              View the project on GitHub
+            </a>
+          </p>
+          <div class="hero-actions">
+            <button id="bootButton" class="btn btn-primary">Boot radio</button>
+            <button id="scanButton" class="btn btn-secondary">Scan stations</button>
+            <button id="refreshButton" class="btn btn-ghost">Refresh</button>
+          </div>
+        </div>
+        <div class="hero-live">
+          <div id="statusBadge" class="status-badge status-idle">Idle</div>
+          <div class="signal-ring">
+            <span id="signalScore">0</span>
+            <small>%</small>
+          </div>
+          <div class="hero-now">
+            <span class="meta-label">Now playing</span>
+            <strong id="currentStation">No station</strong>
+            <span id="currentMode">DAB</span>
+          </div>
+        </div>
+      </header>
+
+      <main class="dashboard">
+        <section class="panel reveal delay-1">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Source mode</p>
+              <h2>Choose the receiver</h2>
+            </div>
+            <span id="firmwareLabel" class="count-pill">SPI host-load</span>
+          </div>
+          <div id="modeGrid" class="mode-grid">
+            <button class="mode-card" data-mode="dab">
+              <span>DAB</span>
+              <small>Digital Audio Broadcasting</small>
+            </button>
+            <button class="mode-card" data-mode="fm">
+              <span>FM</span>
+              <small>Analog FM reception</small>
+            </button>
+            <button class="mode-card" data-mode="hd">
+              <span>HD Radio</span>
+              <small>Digital FM hybrid mode</small>
+            </button>
+            <button class="mode-card" data-mode="am">
+              <span>AM</span>
+              <small>Analog AM reception</small>
+            </button>
+            <button class="mode-card" data-mode="am_hd">
+              <span>AM HD</span>
+              <small>Digital AM hybrid mode</small>
+            </button>
+          </div>
+        </section>
+
+        <section class="panel reveal delay-1">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Live status</p>
+              <h2>Signal and output</h2>
+            </div>
+            <strong id="volumeLabel">0 / 63</strong>
+          </div>
+          <div class="stats-grid">
+            <article class="stat-card">
+              <span class="meta-label">RSSI</span>
+              <strong id="rssiValue">-</strong>
+            </article>
+            <article class="stat-card">
+              <span class="meta-label">SNR</span>
+              <strong id="snrValue">-</strong>
+            </article>
+            <article class="stat-card">
+              <span class="meta-label">FIC Quality</span>
+              <strong id="ficqValue">-</strong>
+            </article>
+            <article class="stat-card">
+              <span class="meta-label">CNR</span>
+              <strong id="cnrValue">-</strong>
+            </article>
+          </div>
+          <div class="volume-strip">
+            <button id="volumeDownButton" class="btn btn-ghost">-</button>
+            <input id="volumeSlider" type="range" min="0" max="63" step="1" value="0" />
+            <button id="volumeUpButton" class="btn btn-ghost">+</button>
+          </div>
+          <div class="toggle-row">
+            <button id="ampButton" class="btn btn-ghost">Amplifier off</button>
+            <button id="recordButton" class="btn btn-accent">Start recording</button>
+          </div>
+          <div class="status-line">
+            <span id="bootState">Backend is not initialized.</span>
+            <span id="audioOutLabel">Audio out: both</span>
+          </div>
+          <div id="errorLine" class="error-line"></div>
+        </section>
+
+        <section class="panel reveal delay-2">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Favorites</p>
+              <h2>Quick presets</h2>
+            </div>
+            <span id="favoriteCount" class="count-pill">0</span>
+          </div>
+          <div id="favoriteList" class="favorite-list"></div>
+        </section>
+
+        <section class="panel station-panel reveal delay-2">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Stations</p>
+              <h2>Browse and tune</h2>
+            </div>
+            <span id="stationCount" class="count-pill">0</span>
+          </div>
+          <div class="station-toolbar">
+            <input id="stationSearch" type="search" placeholder="Filter by station or frequency..." />
+            <span id="scanMeta" class="toolbar-note">No scan yet</span>
+          </div>
+          <div id="stationList" class="station-list"></div>
+        </section>
+
+        <section class="panel recordings-panel reveal delay-3">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Recordings</p>
+              <h2>Saved audio files</h2>
+            </div>
+            <span id="recordingCount" class="count-pill">0</span>
+          </div>
+          <div id="recordingList" class="recording-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <template id="stationTemplate">
+      <article class="station-item">
+        <button class="station-main" type="button">
+          <span class="station-name"></span>
+          <span class="station-meta"></span>
+        </button>
+        <button class="station-favorite" type="button" aria-label="Toggle favorite">Save</button>
+      </article>
+    </template>
+
+    <template id="favoriteTemplate">
+      <button class="favorite-chip" type="button">
+        <span class="favorite-label"></span>
+        <small class="favorite-mode"></small>
+      </button>
+    </template>
+
+    <template id="recordingTemplate">
+      <article class="recording-item">
+        <div class="recording-head">
+          <div>
+            <strong class="recording-station"></strong>
+            <span class="recording-meta"></span>
+          </div>
+          <a class="recording-link" target="_blank" rel="noopener">Open</a>
+        </div>
+        <audio class="recording-player" controls preload="none"></audio>
+      </article>
+    </template>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

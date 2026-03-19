@@ -15,32 +15,70 @@ The script can **host-load** the firmware (RAM) or **boot from external SPI flas
 
 | File | Description |
 |------|-------------|
-| `dab_radio.py` | Original script (SPI only) |
-| `dab_radio_fixed.py` | Fixed flash programming (SPI, CMD_FLASH_LOAD 0x05) |
-| `dab_radio_i2c_fixed.py` | **Recommended** — robust I2C + SPI support, all bug fixes |
+| `legacy/dab_radio.py` | Original script (SPI only) |
+| `legacy/dab_radio_i2c_fixed.py` | Legacy robust I2C + SPI helper |
+| `legacy/dab_radio_i2c_safe2.py` | Low-level Si468x helper reused by the current backend |
+| `radio.py` | Easy CLI for the local backend |
+| `raspiaudio_radio/` | Shared SPI backend + browser UI |
 
-Use **`dab_radio_i2c_fixed.py`** for both SPI and I2C operation.
+Firmware images now live in `firmwares/`.
+Legacy standalone Python scripts now live in `legacy/`.
+
+The new `radio.py` path matches the current shield bring-up:
+- **SPI only**
+- **Host-load only**
+- **DAB / FM / HD Radio / AM / AM HD**
+- **Analog + I2S audio out**
+- **Amplifier enable on GPIO17**
+- **Favorites + browser UI + local recording list**
 
 ---
 
 ## Quick start
 
+### New local CLI + web UI (recommended for daily use)
+
+Start the backend on the Raspberry Pi:
+
+```bash
+python radio.py serve --host 0.0.0.0 --port 8686
+```
+
+Then from another shell on the Pi:
+
+```bash
+python radio.py boot --mode dab
+python radio.py scan --mode fm
+python radio.py stations --mode fm
+python radio.py play 0
+python radio.py volume +2
+python radio.py amp off
+python radio.py record start
+python radio.py recordings
+```
+
+Open the browser UI on:
+
+```text
+http://<raspberry-pi-ip>:8686/
+```
+
 ### SPI mode (default)
 
 ```bash
-python dab_radio_i2c_fixed.py
+python legacy/dab_radio_i2c_fixed.py
 ```
 
 Default behavior:
 - **SPI control** is used by default.
-- Loads `rom00_patch.016.bin` then `dab_radio_6_0_9.bin` from the **same folder**.
+- Loads `firmwares/rom00_patch.016.bin` then `firmwares/dab_radio_6_0_9.bin`.
 - Tunes DAB channel **5A** (index 0), reads the service list, and starts audio.
 - Uses **analog audio** by default (I2S optional).
 
 ### I2C mode
 
 ```bash
-python dab_radio_i2c_fixed.py --i2c --i2c-bus 1 --i2c-addr 0x64
+python legacy/dab_radio_i2c_fixed.py --i2c --i2c-bus 1 --i2c-addr 0x64
 ```
 
 Before running, verify the chip is visible:
@@ -80,8 +118,15 @@ Connect the Pi to the **Si468x control SPI** (SSBSI/SDIO/SCLK).
 - **SPI MISO**: Pi pin 21
 - **SPI SCLK**: Pi pin 23
 - **SPI CE0**: Pi pin 24 (SSBSI)
+- **AMP ENABLE**: Pi pin 11 (BCM 17) — set HIGH to enable the onboard amplifier
 
 Enable SPI in `raspi-config`.
+
+For the new `radio.py` backend the expected defaults are:
+- `RSTB = BCM25`
+- `AMP_EN = BCM17`
+- `SPI bus/device = 0/0`
+- `Host-load firmware from local files`
 
 ### Control interface (I2C)
 Connect I2C only if your board is configured for I2C control (SMODE = I2C).
@@ -92,7 +137,7 @@ Connect I2C only if your board is configured for I2C control (SMODE = I2C).
 
 **External pull-ups (4.7kΩ to 3.3V) are recommended** on SDA and SCL.
 
-> **WARNING**: Do NOT use `GPIO.setup()` on GPIO 2 or 3 (I2C SDA/SCL). These pins are managed by the Linux I2C kernel driver. Any RPi.GPIO operation on them (setup, cleanup, bit-banging) will corrupt the I2C bus and make the chip disappear from `i2cdetect` until reboot. The `dab_radio_i2c_fixed.py` script handles this correctly.
+> **WARNING**: Do NOT use `GPIO.setup()` on GPIO 2 or 3 (I2C SDA/SCL). These pins are managed by the Linux I2C kernel driver. Any RPi.GPIO operation on them (setup, cleanup, bit-banging) will corrupt the I2C bus and make the chip disappear from `i2cdetect` until reboot. The legacy helper under `legacy/dab_radio_i2c_fixed.py` handles this correctly.
 
 ### External SPI flash (NVSPI)
 This is **not** the same bus as the control SPI.
@@ -104,8 +149,15 @@ Do **not** connect the Pi as another SPI master on those lines unless you isolat
 
 ## Audio output
 
-### Analog (default)
-Uses the Si468x internal DAC.
+### Analog + I2S (recommended for the new web UI)
+The local backend now defaults to `both`, so the shield keeps analog audio while also exposing I2S for recording/capture.
+
+```
+--audio-out both
+```
+
+### Analog only
+Uses the Si468x internal DAC only.
 
 ```
 --audio-out analog
@@ -132,36 +184,36 @@ If you want the Pi to be I2S master:
 
 ## Common commands
 
-All examples below use `dab_radio_i2c_fixed.py`. Add `--i2c --i2c-bus 1 --i2c-addr 0x64` for I2C mode.
+All examples below use `legacy/dab_radio_i2c_fixed.py`. Add `--i2c --i2c-bus 1 --i2c-addr 0x64` for I2C mode.
 
 ### DAB/DAB+ (host-load)
 ```bash
-python dab_radio_i2c_fixed.py --freq 10C
+python legacy/dab_radio_i2c_fixed.py --freq 10C
 ```
 
 ### Full DAB scan
 ```bash
-python dab_radio_i2c_fixed.py --scan
+python legacy/dab_radio_i2c_fixed.py --scan
 ```
 
 ### List services only
 ```bash
-python dab_radio_i2c_fixed.py --list-only
+python legacy/dab_radio_i2c_fixed.py --list-only
 ```
 
 ### FM tune
 ```bash
-python dab_radio_i2c_fixed.py --fm-freq 99.5
+python legacy/dab_radio_i2c_fixed.py --fm-freq 99.5
 ```
 
 ### FM scan
 ```bash
-python dab_radio_i2c_fixed.py --fm-scan
+python legacy/dab_radio_i2c_fixed.py --fm-scan
 ```
 
 ### I2C example (DAB on channel 5A)
 ```bash
-python dab_radio_i2c_fixed.py --i2c --i2c-bus 1 --i2c-addr 0x64 --freq 5A
+python legacy/dab_radio_i2c_fixed.py --i2c --i2c-bus 1 --i2c-addr 0x64 --freq 5A
 ```
 
 ---
@@ -172,7 +224,7 @@ Flash programming uses `CMD_FLASH_LOAD` (0x05) with the magic header bytes `0xFE
 
 ### 1) Program flash (via Si468x)
 ```bash
-python dab_radio_i2c_fixed.py \
+python legacy/dab_radio_i2c_fixed.py \
   --flash-program --flash-program-only \
   --flash-program-image dab_radio_6_0_9.bin \
   --flash-program-patch rom00_patch_mini.003.bin \
@@ -182,15 +234,15 @@ python dab_radio_i2c_fixed.py \
 ### 2) Boot from flash
 Use the **full patch** for boot:
 ```bash
-python dab_radio_i2c_fixed.py \
+python legacy/dab_radio_i2c_fixed.py \
   --flash-boot \
   --flash-addr 0x00092000 \
-  --patch rom00_patch.016.bin
+  --patch firmwares/rom00_patch.016.bin
 ```
 
 ### 3) Program + boot in one run
 ```bash
-python dab_radio_i2c_fixed.py \
+python legacy/dab_radio_i2c_fixed.py \
   --flash-program \
   --flash-program-image dab_radio_6_0_9.bin \
   --flash-program-patch rom00_patch_mini.003.bin \
@@ -222,12 +274,12 @@ python dab_radio_i2c_fixed.py \
    - `GPIO.setup()` on GPIO 2/3 (I2C SDA/SCL) corrupts the bus — chip disappears from `i2cdetect` until reboot.
    - `GPIO.cleanup()` without args resets ALL pins including I2C — must only cleanup specific pins (e.g. the reset pin).
    - Bit-banging GPIO 2/3 for "bus recovery" destroys the kernel I2C driver state.
-   - All three issues are fixed in `dab_radio_i2c_fixed.py`.
+   - All three issues are fixed in `legacy/dab_radio_i2c_fixed.py`.
 
 5) **I2C NACKs during POWER_UP**
    - After the POWER_UP command, the Si468x goes offline while the crystal oscillator starts.
    - All I2C transactions return NACK (errno 110) for several hundred milliseconds.
-   - `dab_radio_i2c_fixed.py` handles this with NACK-tolerant CTS polling and extended timeouts.
+   - `legacy/dab_radio_i2c_fixed.py` handles this with NACK-tolerant CTS polling and extended timeouts.
 
 ---
 
@@ -252,7 +304,7 @@ If the chip disappears from `i2cdetect -y 1` after a failed run:
 ```bash
 sudo reboot
 ```
-This is caused by GPIO 2/3 corruption. Use `dab_radio_i2c_fixed.py` which avoids this issue.
+This is caused by GPIO 2/3 corruption. Use `legacy/dab_radio_i2c_fixed.py` which avoids this issue.
 
 ### Manual reset via pinctrl
 ```bash
@@ -286,7 +338,7 @@ The I2C protocol for Si468x follows the reference C code from the SDK (`si468x_b
 2. **Read reply**: Send `RD_REPLY` (0x00) as a write, then a separate read transaction (500µs gap between)
 3. **CTS polling**: Read status byte repeatedly until bit 7 (CTS) is set, with 1ms interval
 
-Key timing in `dab_radio_i2c_fixed.py`:
+Key timing in `legacy/dab_radio_i2c_fixed.py`:
 - Reset pulse: 100ms low, then 1s wait for I2C slave to come up
 - POWER_UP: Send command, wait 500ms for crystal, then poll CTS with 5s timeout
 - Inter-transaction gap: 500µs between write and read
@@ -296,5 +348,5 @@ Key timing in `dab_radio_i2c_fixed.py`:
 ## Summary
 
 This project lets you listen to **broadcast radio without internet** on a Raspberry Pi.
-Use **`dab_radio_i2c_fixed.py`** for both SPI and I2C operation.
+Use **`legacy/dab_radio_i2c_fixed.py`** for SPI/I2C experiments.
 Host-load mode is reliable and tested (71 DAB services). Flash boot requires a flash-bootable firmware image from Skyworks/Silicon Labs.

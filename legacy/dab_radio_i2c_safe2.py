@@ -11,8 +11,12 @@ import json
 import select
 import sys
 import time
-import termios
-import tty
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - only relevant off Linux
+    termios = None
+    tty = None
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -65,6 +69,11 @@ CMD_READ_OFFSET = 0x10
 CMD_FM_TUNE_FREQ = 0x30
 CMD_FM_SEEK_START = 0x31
 CMD_FM_RSQ_STATUS = 0x32
+CMD_AM_TUNE_FREQ = 0x40
+CMD_AM_SEEK_START = 0x41
+CMD_AM_RSQ_STATUS = 0x42
+CMD_HD_DIGRAD_STATUS = 0x92
+CMD_HD_GET_EVENT_STATUS = 0x93
 
 # Property IDs
 PROP_PIN_CONFIG_ENABLE = 0x0800
@@ -72,6 +81,17 @@ PROP_DIGITAL_IO_OUTPUT_SELECT = 0x0200
 PROP_DIGITAL_IO_OUTPUT_SAMPLE_RATE = 0x0201
 PROP_DIGITAL_IO_OUTPUT_FORMAT = 0x0202
 PROP_AUDIO_ANALOG_VOLUME = 0x0300
+PROP_AUDIO_MUTE = 0x0301
+PROP_FM_SEEK_BAND_BOTTOM = 0x3100
+PROP_FM_SEEK_BAND_TOP = 0x3101
+PROP_FM_SEEK_FREQUENCY_SPACING = 0x3102
+PROP_FM_VALID_RSSI_THRESHOLD = 0x3202
+PROP_FM_VALID_SNR_THRESHOLD = 0x3204
+PROP_FM_VALID_SNR_TIME = 0x3205
+PROP_FM_VALID_HDLEVEL_THRESHOLD = 0x3206
+PROP_FM_TUNE_FE_VARM = 0x1710
+PROP_FM_TUNE_FE_VARB = 0x1711
+PROP_FM_TUNE_FE_CFG = 0x1712
 PROP_DAB_TUNE_FE_VARM = 0x1710
 PROP_DAB_TUNE_FE_VARB = 0x1711
 PROP_DAB_TUNE_FE_CFG = 0x1712
@@ -651,17 +671,21 @@ class Si468xDabRadio:
         sample_size: int = 16,
     ) -> None:
         """
-        mode: "analog" enables DAC only, "i2s" enables I2S (DAC off to avoid overriding I2S).
+        mode: "analog" enables DAC only, "i2s" enables I2S only, "both" enables DAC + I2S.
         """
         # PROP 0x0800 PIN_CONFIG_ENABLE: bit1=I2SOUTEN, bit0=DACOUTEN
         pin_cfg = 0x8000  # keep defaults, INTB enabled
         if mode == "analog":
             pin_cfg |= 0x0001  # DAC only
         elif mode == "i2s":
-            pin_cfg |= 0x0002  # I2S only (leave DAC disabled to honor I2S path)
+            pin_cfg |= 0x0002  # I2S only
+        elif mode == "both":
+            pin_cfg |= 0x0003  # DAC + I2S
+        else:
+            raise ValueError(f"Unsupported audio mode: {mode}")
         self.set_property(PROP_PIN_CONFIG_ENABLE, pin_cfg)
 
-        if mode == "i2s":
+        if mode in {"i2s", "both"}:
             output_select = 0x8000 if master else 0x0000
             self.set_property(PROP_DIGITAL_IO_OUTPUT_SELECT, output_select)
             self.set_property(PROP_DIGITAL_IO_OUTPUT_SAMPLE_RATE, sample_rate)
@@ -676,6 +700,18 @@ class Si468xDabRadio:
         # Interrupts: RECFG, RECFGWRN, SRVLIST
         self.set_property(PROP_DAB_EVENT_INTERRUPT_SOURCE, 0x00C1)
         self.set_property(PROP_DAB_VALID_RSSI_THRESHOLD, 6)
+
+    def configure_fmhd_frontend(self) -> None:
+        self.set_property(PROP_FM_TUNE_FE_VARM, 0xFD12)
+        self.set_property(PROP_FM_TUNE_FE_VARB, 0x009B)
+        self.set_property(PROP_FM_TUNE_FE_CFG, 0x0000)
+        self.set_property(PROP_FM_SEEK_BAND_BOTTOM, 8750)
+        self.set_property(PROP_FM_SEEK_BAND_TOP, 10800)
+        self.set_property(PROP_FM_SEEK_FREQUENCY_SPACING, 10)
+        self.set_property(PROP_FM_VALID_RSSI_THRESHOLD, 20)
+        self.set_property(PROP_FM_VALID_SNR_THRESHOLD, 10)
+        self.set_property(PROP_FM_VALID_SNR_TIME, 127)
+        self.set_property(PROP_FM_VALID_HDLEVEL_THRESHOLD, 20)
 
     def set_volume(self, level: int) -> int:
         """Set analog volume 0-63; returns clamped level."""
@@ -769,11 +805,76 @@ class Si468xDabRadio:
         readfreq_10khz = int.from_bytes(reply[6:8], "little")
         return {
             "valid": bool(reply[5] & 0x01),
-            "rssi": _signed_byte(reply[9]),
-            "snr": _signed_byte(reply[10]),
+            "afc_rail": bool(reply[5] & 0x02),
+            "hd_detected": bool(reply[5] & 0x20),
+            "rssi": reply[9],
+            "snr": reply[10],
             "freqoff": _signed_byte(reply[8]),
             "freq_10khz": readfreq_10khz,
             "freq_khz": readfreq_10khz * 10,
+            "mult": reply[11] if len(reply) > 11 else 0,
+            "hdlevel": reply[15] if len(reply) > 15 else 0,
+            "filtered_hdlevel": reply[16] if len(reply) > 16 else 0,
+        }
+
+    def am_tune(
+        self,
+        freq_khz: int,
+        antcap: int = 0,
+        tune_mode: int = 0,
+        injection: int = 0,
+        dir_tune: int = 0,
+    ) -> None:
+        arg1 = ((dir_tune & 0x01) << 5) | ((tune_mode & 0x03) << 2) | (injection & 0x03)
+        cmd = [
+            CMD_AM_TUNE_FREQ,
+            arg1,
+            freq_khz & 0xFF,
+            (freq_khz >> 8) & 0xFF,
+            antcap & 0xFF,
+            (antcap >> 8) & 0xFF,
+            0x00,
+        ]
+        self._write_command(cmd)
+
+    def am_rsq_status(self, attune: bool = True, stcack: bool = False) -> Dict[str, int]:
+        flags = (0x04 if attune else 0x00) | (0x01 if stcack else 0x00)
+        self._write_command([CMD_AM_RSQ_STATUS, flags])
+        reply = self._read_reply(19)
+        readfreq_khz = int.from_bytes(reply[6:8], "little")
+        return {
+            "valid": bool(reply[5] & 0x01),
+            "rssi": reply[9],
+            "snr": reply[10],
+            "freqoff": _signed_byte(reply[8]),
+            "freq_khz": readfreq_khz,
+            "band_limit": bool(reply[5] & 0x02) if len(reply) > 5 else False,
+            "afcrl": bool(reply[5] & 0x08) if len(reply) > 5 else False,
+            "mult": reply[11] if len(reply) > 11 else 0,
+            "hd_detected": bool(reply[17] & 0x01) if len(reply) > 17 else False,
+            "filtered_hd_detected": bool(reply[17] & 0x10) if len(reply) > 17 else False,
+            "hdlevel": reply[16] if len(reply) > 16 else 0,
+            "filtered_hdlevel": reply[18] if len(reply) > 18 else 0,
+        }
+
+    def hd_digrad_status(self) -> Dict[str, int]:
+        self._write_command([CMD_HD_DIGRAD_STATUS, 0x00])
+        reply = self._read_reply(19)
+        return {
+            "hd_logo": bool(reply[5] & 0x80) if len(reply) > 5 else False,
+            "analog_source": bool(reply[5] & 0x40) if len(reply) > 5 else False,
+            "digital_source": bool(reply[5] & 0x20) if len(reply) > 5 else False,
+            "audio_acquired": bool(reply[5] & 0x08) if len(reply) > 5 else False,
+            "acq": bool(reply[5] & 0x04) if len(reply) > 5 else False,
+            "cdnr_high": bool(reply[5] & 0x02) if len(reply) > 5 else False,
+            "cdnr_low": bool(reply[5] & 0x01) if len(reply) > 5 else False,
+            "blend_control": (reply[6] >> 4) & 0x0F if len(reply) > 6 else 0,
+            "digital_audio_available": reply[6] & 0x3F if len(reply) > 6 else 0,
+            "cdnr": reply[7] if len(reply) > 7 else 0,
+            "tx_gain": _signed_byte(reply[8]) if len(reply) > 8 else 0,
+            "audio_program_available": reply[9] if len(reply) > 9 else 0,
+            "audio_program_playing": reply[10] if len(reply) > 10 else 0,
+            "audio_ca": reply[11] if len(reply) > 11 else 0,
         }
 
     def _get_service_list_payload(self) -> bytes:
