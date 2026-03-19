@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .backend import RadioBackend, RadioConfig
@@ -154,11 +155,67 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
 
-def run_server(config: RadioConfig, host: str, port: int) -> None:
+def _detect_local_ipv4_addresses() -> List[str]:
+    addresses: set[str] = set()
+    hostname = socket.gethostname()
+    try:
+        for info in socket.getaddrinfo(hostname, None, family=socket.AF_INET, type=socket.SOCK_STREAM):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                addresses.add(ip)
+    except socket.gaierror:
+        pass
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        ip = probe.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            addresses.add(ip)
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    return sorted(addresses)
+
+
+def _startup_urls(host: str, port: int, alias: str) -> List[str]:
+    urls: List[str] = [f"http://127.0.0.1:{port}/"]
+    bind_host = str(host).strip()
+    if bind_host not in {"", "0.0.0.0", "::"}:
+        urls.append(f"http://{bind_host}:{port}/")
+    else:
+        for ip in _detect_local_ipv4_addresses():
+            urls.append(f"http://{ip}:{port}/")
+    if alias:
+        alias = alias.strip()
+        if alias:
+            urls.append(f"http://{alias}.local:{port}/")
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append(url)
+    return deduped
+
+
+def _print_startup_banner(host: str, port: int, alias: str) -> None:
+    hostname = socket.gethostname()
+    print("Raspiaudio radio server started")
+    print("Open one of these URLs:")
+    for url in _startup_urls(host, port, alias):
+        print(f"  {url}")
+    if alias:
+        print(f"Suggested network alias: {alias}")
+        print(f"  If your hostname or mDNS alias is set to `{alias}`, try http://{alias}.local:{port}/")
+    print(f"Current host name: {hostname}")
+
+
+def run_server(config: RadioConfig, host: str, port: int, alias: str = "piradio") -> None:
     backend = RadioBackend(config)
     httpd = RadioHTTPServer((host, port), backend)
     try:
-        print(f"Raspiaudio radio server listening on http://{host}:{port}")
+        _print_startup_banner(host, port, alias)
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass

@@ -118,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="Start the local HTTP backend and web UI.")
     serve.add_argument("--host", default="0.0.0.0", help="HTTP bind address (default: 0.0.0.0)")
     serve.add_argument("--port", type=int, default=8686, help="HTTP port (default: 8686)")
+    serve.add_argument("--alias", default="piradio", help="Suggested local network alias to display at startup")
     serve.add_argument("--patch", type=Path, default=FW_ROOT / "rom00_patch.016.bin")
     serve.add_argument("--dab-fw", type=Path, default=FW_ROOT / "dab_radio_6_0_9.bin")
     serve.add_argument("--fmhd-fw", type=Path, default=FW_ROOT / "fmhd_radio_5_3_3.bin")
@@ -225,7 +226,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             default_mode=args.mode,
             record_device=args.record_device,
         )
-        run_server(config=config, host=args.host, port=args.port)
+        run_server(config=config, host=args.host, port=args.port, alias=args.alias)
         return
 
     if args.command == "boot":
