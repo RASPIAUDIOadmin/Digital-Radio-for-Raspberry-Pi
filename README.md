@@ -93,9 +93,12 @@ http://<raspberry-pi-ip>:8686/
 The CLI uses the same backend as the Web UI.
 
 That means you can control the radio manually from the terminal, or use the commands as a base for your own scripts and applications.
+just type to have the interactive mode:
+```bash
+python radio.py
+```
 
-Examples:
-
+or start with a parameter
 ```bash
 python radio.py boot --mode dab
 python radio.py scan --mode fm
