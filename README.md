@@ -4,6 +4,10 @@
 
 This project turns a Raspberry Pi and a SI4689-based shield into a fully local digital radio.
 
+The Raspiaudio Digital Radio Shield for Raspberry Pi is a compact all-in-one radio board that brings AM, FM, DAB, DAB+, and HD Radio support to Raspberry Pi boards with a 40-pin header. It combines a local Web UI, CLI control, analog audio output, I2S digital audio, a built-in 1 x 5 W amplifier, a switchable onboard speaker output, and an onboard 3-way navigation control with up, down, and push actions for standalone menu-based projects.
+
+*HD Radio is subject to licensing. Please verify that you are legally allowed to use it in your country and for your intended application.*
+
 <p align="center">
   <img src="pic/Digital%20radio%20Pi%20Raspiaudio%20front.png" alt="Raspiaudio digital radio front" width="46%" />
   <img src="pic/Digital%20radio%20Pi%20Raspiaudio%20back.png" alt="Raspiaudio digital radio back" width="46%" />
@@ -34,6 +38,16 @@ The whole project is open source:
 - CLI to control the backend from the terminal or integrate the radio into your own software
 - analog audio output on the shield
 - I2S audio path for digital capture and recording
+- built-in `1 x 5 W` amplifier
+- switchable onboard speaker output
+- onboard 3-way navigation button: up, down, and push
+- audio jack output
+- screwless passive speaker output for an external speaker
+  - `4 ohm` recommended
+  - `8 ohm` supported
+- SMA antenna connector for the included antenna or a different external antenna
+- AM antenna balun for impedance matching
+- AM loop antenna connection support
 - amplifier enable on `GPIO17`
 - local recordings list in the browser
 
@@ -60,6 +74,7 @@ It gives you:
 - volume control
 - recording controls
 - recordings browser
+- a simple radio workflow directly from a browser on the local network
 
 Start the server on the Raspberry Pi:
 
@@ -121,6 +136,11 @@ Current shield-oriented defaults:
 - `AMP_EN = BCM17`
 - `SPI bus/device = 0/0`
 - local firmware files loaded from `firmwares/`
+- onboard navigation input with `up / down / push`
+- onboard speaker output with dedicated on / off control
+- SMA antenna connector
+- AM impedance-matching balun
+- passive speaker connector
 
 ## Dependencies
 
@@ -139,3 +159,33 @@ It is also a base to:
 - integrate the SI4689 shield into a custom Raspberry Pi project
 - create your own UI on top of the CLI or HTTP backend
 - experiment with local digital radio features without depending on cloud services
+
+## Inputs / Outputs
+
+- Power input:
+  - `5V` on Raspberry Pi header pins `2` and `4`
+  - `GND` on pins `6, 9, 14, 20, 25, 30, 34, 39`
+- SPI radio interface:
+  - `MOSI` on `GPIO10` / pin `19`
+  - `MISO` on `GPIO9` / pin `21`
+  - `SPICLK` on `GPIO11` / pin `23`
+  - `SSBSI` on `GPIO8` / pin `24`
+- Radio control:
+  - `INT` on `GPIO23` / pin `16`
+  - `SI4689 RST` on `GPIO25` / pin `22`
+  - `ENABLE_AMPLI` on `GPIO17` / pin `11`
+- I2S digital audio:
+  - `I2S BCK` on `GPIO18` / pin `12`
+  - `I2S LRCK` on `GPIO19` / pin `35`
+  - `I2S DOUT` on `GPIO20` / pin `38`
+- Navigation button:
+  - `Switch CW` on `GPIO5` / pin `29`
+  - `Switch PUSH` on `GPIO6` / pin `31`
+  - `Switch CCW` on `GPIO13` / pin `33`
+- RF and audio connections on the shield:
+  - `SMA` antenna connector
+  - AM loop antenna input
+  - AM impedance-matching balun
+  - audio jack output
+  - onboard speaker output with on / off switch
+  - passive external speaker output via screwless connector
