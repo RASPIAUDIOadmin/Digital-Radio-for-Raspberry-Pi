@@ -68,9 +68,9 @@ body::after {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   grid-template-areas:
     "media artwork"
+    "favorites favorites"
     "status status"
     "source source"
-    "favorites favorites"
     "stations stations"
     "recordings recordings";
   gap: 1rem;
@@ -713,9 +713,9 @@ body::after {
     grid-template-areas:
       "media"
       "artwork"
+      "favorites"
       "status"
       "source"
-      "favorites"
       "stations"
       "recordings";
   }
