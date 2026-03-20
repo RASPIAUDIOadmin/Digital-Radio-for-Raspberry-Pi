@@ -25,6 +25,32 @@ The focus is simple:
 
 The whole project is open source:
 - GitHub: [RASPIAUDIOadmin/DAB_RADIO](https://github.com/RASPIAUDIOadmin/DAB_RADIO)
+- Product: [Raspiaudio Digital Radio Shield for Raspberry Pi](https://raspiaudio.com/product/digital-radio/)
+
+## Quickstart
+
+Because we understand that you might be busy with your job or family, here is how to have instant fun.
+
+Clone the project:
+
+```bash
+git clone https://github.com/RASPIAUDIOadmin/DAB_RADIO.git
+cd DAB_RADIO
+```
+
+Start the local radio server:
+
+```bash
+python radio.py serve --port 8686
+```
+
+Then open:
+
+```text
+http://piradio.local:8686/
+```
+
+If you are already on the Raspberry Pi, this is enough to get the Web UI and the CLI backend running.
 
 ## Main features
 
@@ -85,6 +111,41 @@ Then open:
 
 ```text
 http://piradio.local:8686/
+```
+
+## I2S recording on Raspberry Pi
+
+If you want recording from the SI4689 I2S output, enable the Raspberry Pi capture overlay in `/boot/firmware/config.txt`:
+
+```ini
+dtparam=i2s=on
+dtoverlay=adau7002-simple,card-name=si4689_i2s
+```
+
+Then reboot the Raspberry Pi.
+
+After reboot, you should see the capture card with:
+
+```bash
+arecord -l
+```
+
+Expected result:
+
+```text
+card 2: si4689i2s [si4689_i2s], device 0: ...
+```
+
+The server now auto-detects this ALSA capture device for recordings, so the normal command stays:
+
+```bash
+python radio.py serve --port 8686
+```
+
+If needed, you can still force a device manually:
+
+```bash
+python radio.py serve --port 8686 --record-device plughw:CARD=si4689i2s,DEV=0
 ```
 
 ## CLI mode
@@ -149,7 +210,7 @@ Current shield-oriented defaults:
 On Raspberry Pi OS:
 
 ```bash
-sudo apt install python3-spidev python3-rpi.gpio python3-smbus2
+sudo apt install python3-spidev python3-rpi.gpio python3-smbus2 alsa-utils
 ```
 
 ## Open source and reusable

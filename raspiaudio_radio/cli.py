@@ -195,7 +195,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--flash-amhd-addr", type=lambda x: int(x, 0), default=0x0011E000)
     serve.add_argument("--volume", type=int, default=40, help="Initial analog volume 0-63")
     serve.add_argument("--mode", choices=MODE_CHOICES, default="dab", help="Startup mode")
-    serve.add_argument("--record-device", default="default", help="ALSA capture device for recordings")
+    serve.add_argument(
+        "--record-device",
+        default="auto",
+        help="ALSA capture device for recordings (default: auto-detect)",
+    )
 
     boot = subparsers.add_parser("boot", help="Initialize the radio on the server.")
     boot.add_argument("--mode", choices=MODE_CHOICES)

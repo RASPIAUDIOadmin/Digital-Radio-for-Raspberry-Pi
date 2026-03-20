@@ -52,6 +52,16 @@ DAB_MOT_BODY_PACKET = 0x74
 MAX_DAB_MOT_OBJECTS = 8
 MAX_DAB_MOT_AGE_S = 45.0
 _MOT_IMAGE_NAME_RE = re.compile(rb"([A-Za-z0-9_.-]+\.(?:jpe?g|png|gif|bmp))", re.IGNORECASE)
+_ARECORD_CARD_RE = re.compile(r"^card\s+\d+:\s+(?P<card>[^\s]+)\s+\[.*?\],\s+device\s+(?P<device>\d+):")
+_AUTO_RECORD_DEVICE_NAMES = (
+    "plughw:CARD=si4689i2s,DEV=0",
+    "plughw:CARD=si4689_i2s,DEV=0",
+    "sysdefault:CARD=si4689i2s",
+    "sysdefault:CARD=si4689_i2s",
+    "hw:CARD=si4689i2s,DEV=0",
+    "hw:CARD=si4689_i2s,DEV=0",
+)
+_AUTO_RECORD_DEVICE_HINTS = ("si4689", "adau7002", "i2s")
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
@@ -202,6 +212,62 @@ def _infer_artist_title(text: str) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _list_arecord_named_devices() -> List[str]:
+    try:
+        result = subprocess.run(
+            ["arecord", "-L"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return []
+    devices: List[str] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or raw_line[:1].isspace():
+            continue
+        devices.append(line)
+    return devices
+
+
+def _list_arecord_capture_hardware() -> List[str]:
+    try:
+        result = subprocess.run(
+            ["arecord", "-l"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return []
+    devices: List[str] = []
+    for raw_line in result.stdout.splitlines():
+        match = _ARECORD_CARD_RE.match(raw_line.strip())
+        if match is None:
+            continue
+        devices.append(f"plughw:CARD={match.group('card')},DEV={match.group('device')}")
+    return devices
+
+
+def _auto_detect_record_device() -> str:
+    named_devices = _list_arecord_named_devices()
+    for candidate in _AUTO_RECORD_DEVICE_NAMES:
+        if candidate in named_devices:
+            return candidate
+    for candidate in named_devices:
+        lowered = candidate.casefold()
+        if any(hint in lowered for hint in _AUTO_RECORD_DEVICE_HINTS):
+            return candidate
+    for candidate in _list_arecord_capture_hardware():
+        lowered = candidate.casefold()
+        if any(hint in lowered for hint in _AUTO_RECORD_DEVICE_HINTS):
+            return candidate
+    return "default"
+
+
 @dataclass(frozen=True)
 class RadioConfig:
     patch_path: Path
@@ -252,7 +318,7 @@ class RadioConfig:
     am_rssi_min: int = 4
     am_snr_min: int = 0
     am_hd_timeout_ms: int = 2500
-    record_device: str = "default"
+    record_device: str = "auto"
     record_channels: int = 2
     record_format: str = "S16_LE"
 
@@ -1428,14 +1494,14 @@ class RadioBackend:
             "sample_rate": self.config.sample_rate,
             "channels": self.config.record_channels,
             "format": self.config.record_format,
-            "device": self.config.record_device,
+            "device": self._resolve_record_device_locked(),
             "_started_epoch": time.time(),
         }
         command = [
             "arecord",
             "-q",
             "-D",
-            self.config.record_device,
+            meta["device"],
             "-f",
             self.config.record_format,
             "-r",
@@ -1460,12 +1526,18 @@ class RadioBackend:
             except Exception:
                 pass
             raise RuntimeError(
-                "Recording failed to start. Check the ALSA capture device for I2S input."
+                f"Recording failed to start on ALSA device {meta['device']}. Check the I2S capture path."
                 + (f" Details: {stderr.strip()}" if stderr and stderr.strip() else "")
             )
         self._recording_process = process
         self._recording_meta = meta
         self._write_recording_meta_locked(meta)
+
+    def _resolve_record_device_locked(self) -> str:
+        configured = str(self.config.record_device or "").strip()
+        if configured and configured.casefold() != "auto":
+            return configured
+        return _auto_detect_record_device()
 
     def _stop_recording_locked(self) -> None:
         if self._recording_process is None:
