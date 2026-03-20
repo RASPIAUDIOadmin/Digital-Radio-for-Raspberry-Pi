@@ -3,6 +3,7 @@ const state = {
   stations: [],
   favorites: [],
   recordings: [],
+  recordingsSignature: "",
   loadedMode: null,
   filter: "",
   pollingHandle: null,
@@ -119,7 +120,7 @@ function updateStatus(status) {
     : "No scan yet";
   document.getElementById("stationCount").textContent = state.stations.length;
   document.getElementById("favoriteCount").textContent = state.favorites.length;
-  document.getElementById("recordingCount").textContent = state.recordings.length;
+  document.getElementById("recordingCount").textContent = status.recordings_count ?? state.recordings.length;
 
   const ampButton = document.getElementById("ampButton");
   ampButton.textContent = status.amp_enabled ? "Amplifier on" : "Amplifier off";
@@ -152,7 +153,6 @@ function updateStatus(status) {
   renderModes();
   renderStations();
   renderFavorites();
-  renderRecordings();
 }
 
 function renderStations() {
@@ -248,6 +248,17 @@ function renderRecordings() {
   });
 }
 
+function recordingsSignature(recordings) {
+  return JSON.stringify(
+    (recordings || []).map((recording) => ({
+      file_name: recording.file_name,
+      active: Boolean(recording.active),
+      started_at: recording.started_at,
+      url: recording.url,
+    })),
+  );
+}
+
 async function refreshStatus() {
   try {
     const status = await api("/api/status");
@@ -285,8 +296,14 @@ async function refreshFavorites() {
 async function refreshRecordings() {
   try {
     const data = await api("/api/recordings");
-    state.recordings = data.recordings || [];
-    renderRecordings();
+    const recordings = data.recordings || [];
+    const signature = recordingsSignature(recordings);
+    state.recordings = recordings;
+    if (signature !== state.recordingsSignature) {
+      state.recordingsSignature = signature;
+      renderRecordings();
+    }
+    document.getElementById("recordingCount").textContent = recordings.length;
   } catch (error) {
     setError(error.message);
   }
