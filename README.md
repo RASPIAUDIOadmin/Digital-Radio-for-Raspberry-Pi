@@ -2,7 +2,7 @@
 
 ![Raspiaudio Web UI](pic/webui.png)
 
-This project turns a Raspberry Pi and a SI4689-based shield into a fully local digital radio.
+Add this shield to a Raspberry Pi Zero, 4 or 5 to install a fully local FM, DAB, AM and HD Radio (United States) receiver in minutes, listen without internet, record audio, and control everything from a polished web UI on your local network.
 
 The Raspiaudio Digital Radio Shield for Raspberry Pi is a compact all-in-one radio board that brings AM, FM, DAB, DAB+, and HD Radio support to Raspberry Pi boards with a 40-pin header. It combines a local Web UI, CLI control, analog audio output, I2S digital audio, a built-in 1 x 5 W amplifier, a switchable onboard speaker output, and an onboard 3-way navigation control with up, down, and push actions for standalone menu-based projects.
 
@@ -24,7 +24,7 @@ The focus is simple:
 - CLI access for automation, scripting, and custom applications
 
 The whole project is open source:
-- GitHub: [RASPIAUDIOadmin/DAB_RADIO](https://github.com/RASPIAUDIOadmin/DAB_RADIO)
+- GitHub: [RASPIAUDIOadmin/Digital-Radio-for-Raspberry-Pi](https://github.com/RASPIAUDIOadmin/Digital-Radio-for-Raspberry-Pi)
 - Product: [Raspiaudio Digital Radio Shield for Raspberry Pi](https://raspiaudio.com/product/digital-radio/)
 
 ## Quickstart
@@ -34,8 +34,8 @@ Because we understand that you might be busy with your job or family, here is ho
 Clone the project:
 
 ```bash
-git clone https://github.com/RASPIAUDIOadmin/DAB_RADIO.git
-cd DAB_RADIO
+git clone https://github.com/RASPIAUDIOadmin/Digital-Radio-for-Raspberry-Pi.git
+cd Digital-Radio-for-Raspberry-Pi
 ```
 
 Start the local radio server:
