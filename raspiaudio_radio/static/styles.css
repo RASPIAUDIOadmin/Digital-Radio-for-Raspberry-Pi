@@ -416,7 +416,10 @@ body::after {
 
 .media-artwork-shell {
   position: relative;
-  min-height: 220px;
+  width: 100%;
+  aspect-ratio: 1;
+  min-height: 0;
+  display: grid;
   border-radius: 1.4rem;
   overflow: hidden;
   border: 1px solid var(--brand-line);
@@ -428,14 +431,20 @@ body::after {
 
 .media-artwork,
 .media-artwork-fallback {
+  grid-area: 1 / 1;
   width: 100%;
-  aspect-ratio: 1;
+  height: 100%;
   display: grid;
   place-items: center;
 }
 
 .media-artwork {
   object-fit: cover;
+}
+
+.media-artwork[hidden],
+.media-artwork-fallback[hidden] {
+  display: none !important;
 }
 
 .media-artwork-fallback {
