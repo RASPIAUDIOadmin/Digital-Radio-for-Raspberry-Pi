@@ -126,7 +126,9 @@ function updateStatus(status) {
   ampButton.classList.toggle("is-on", Boolean(status.amp_enabled));
 
   const recordButton = document.getElementById("recordButton");
-  recordButton.textContent = recording.active ? "Stop recording" : "Start recording";
+  recordButton.textContent = recording.active ? "STOP" : "REC";
+  recordButton.title = recording.active ? "Stop recording" : "Start recording";
+  recordButton.setAttribute("aria-label", recording.active ? "Stop recording" : "Start recording");
   recordButton.classList.toggle("is-recording", Boolean(recording.active));
 
   const badge = document.getElementById("statusBadge");
@@ -296,24 +298,6 @@ async function refreshAll() {
   await refreshRecordings();
 }
 
-async function bootRadio() {
-  const button = document.getElementById("bootButton");
-  setBusy(button, true, "Booting...");
-  try {
-    const status = await api("/api/boot", {
-      method: "POST",
-      body: JSON.stringify({ force: false }),
-    });
-    updateStatus(status);
-    await refreshStations(status.mode);
-    await refreshFavorites();
-  } catch (error) {
-    setError(error.message);
-  } finally {
-    setBusy(button, false);
-  }
-}
-
 async function setMode(mode) {
   try {
     const status = await api("/api/mode", {
@@ -437,9 +421,7 @@ async function stopServer() {
 }
 
 function wireEvents() {
-  document.getElementById("bootButton").addEventListener("click", bootRadio);
   document.getElementById("scanButton").addEventListener("click", scanStations);
-  document.getElementById("refreshButton").addEventListener("click", refreshAll);
   document.getElementById("stopServerButton").addEventListener("click", stopServer);
   document.getElementById("volumeDownButton").addEventListener("click", () => updateVolume({ delta: -2 }));
   document.getElementById("volumeUpButton").addEventListener("click", () => updateVolume({ delta: 2 }));

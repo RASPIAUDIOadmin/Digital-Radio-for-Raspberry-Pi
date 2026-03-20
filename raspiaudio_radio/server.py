@@ -142,7 +142,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_static(self, request_path: str) -> None:
         relative = request_path.lstrip("/") or "index.html"
-        if relative not in {"index.html", "app.js", "styles.css"}:
+        if relative not in {"index.html", "app.js", "styles.css", "favicon.png"}:
             self._send_error_json(404, "File not found.")
             return
         file_path = STATIC_DIR / relative

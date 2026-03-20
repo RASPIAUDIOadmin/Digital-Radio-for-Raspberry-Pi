@@ -66,6 +66,13 @@ body::after {
 .dashboard {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-areas:
+    "media artwork"
+    "status status"
+    "source source"
+    "favorites favorites"
+    "stations stations"
+    "recordings recordings";
   gap: 1rem;
   align-items: start;
 }
@@ -107,16 +114,10 @@ body::after {
 }
 
 .hero-copy h1 {
-  font-size: clamp(2.2rem, 5vw, 4.1rem);
-  line-height: 0.94;
-  max-width: 13ch;
-}
-
-.hero-text {
-  max-width: 56ch;
-  margin: 1rem 0 0;
-  line-height: 1.6;
-  color: rgba(47, 53, 66, 0.82);
+  font-size: clamp(2rem, 4vw, 3.35rem);
+  line-height: 1;
+  max-width: none;
+  white-space: nowrap;
 }
 
 .hero-link {
@@ -125,6 +126,15 @@ body::after {
   text-decoration: none;
   border-bottom: 1px solid rgba(21, 55, 141, 0.22);
   padding-bottom: 0.12rem;
+}
+
+.hero-link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 1rem 0 0;
+  line-height: 1.6;
+  color: rgba(47, 53, 66, 0.82);
 }
 
 .hero-link:hover {
@@ -147,6 +157,28 @@ body::after {
 .hero-actions {
   margin-top: 1.25rem;
   flex-wrap: wrap;
+}
+
+.hero-control-bar {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.hero-volume {
+  display: grid;
+  gap: 0.65rem;
+  min-width: min(100%, 420px);
+}
+
+.hero-volume-strip {
+  min-width: min(100%, 420px);
+}
+
+.hero-volume-strip .btn {
+  min-width: 3.2rem;
 }
 
 .hero-live {
@@ -243,8 +275,20 @@ body::after {
   box-shadow: 0 14px 32px rgba(194, 54, 54, 0.26);
 }
 
-.btn-accent.is-recording {
-  background: linear-gradient(135deg, #c23636, #8c1b1b);
+.btn-rec {
+  width: 4rem;
+  height: 4rem;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--brand-white);
+  background: radial-gradient(circle at 35% 35%, #ff857e, #d72d2d 62%, #971313 100%);
+  box-shadow: 0 16px 34px rgba(194, 54, 54, 0.3);
+  letter-spacing: 0.08em;
+}
+
+.btn-rec.is-recording {
+  background: radial-gradient(circle at 35% 35%, #ffb0aa, #f04a4a 62%, #b11c1c 100%);
+  box-shadow: 0 18px 38px rgba(194, 54, 54, 0.38);
 }
 
 .btn-ghost.is-on {
@@ -338,7 +382,7 @@ body::after {
 }
 
 .volume-strip {
-  margin-top: 1rem;
+  margin-top: 0;
 }
 
 .volume-strip input[type="range"] {
@@ -347,7 +391,7 @@ body::after {
 }
 
 .toggle-row {
-  margin-top: 1rem;
+  margin-top: 0;
   flex-wrap: wrap;
 }
 
@@ -402,21 +446,32 @@ body::after {
   background: linear-gradient(160deg, rgba(46, 102, 212, 0.16), rgba(255, 255, 255, 0.98));
 }
 
-.media-panel {
-  grid-column: 1 / -1;
+.source-panel {
+  grid-area: source;
 }
 
-.media-layout {
-  margin-top: 1rem;
+.status-panel {
+  grid-area: status;
+}
+
+.media-panel {
+  grid-area: media;
+}
+
+.artwork-panel {
+  grid-area: artwork;
   display: grid;
-  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
-  gap: 1rem;
+  justify-items: center;
   align-items: start;
 }
 
-.media-artwork-shell {
+.favorites-panel {
+  grid-area: favorites;
+}
+
+.artwork-shell {
   position: relative;
-  width: 100%;
+  width: min(100%, 480px);
   aspect-ratio: 1;
   min-height: 0;
   display: grid;
@@ -455,6 +510,7 @@ body::after {
 }
 
 .media-copy {
+  margin-top: 1rem;
   display: grid;
   gap: 0.85rem;
 }
@@ -503,6 +559,14 @@ body::after {
 .station-panel,
 .recordings-panel {
   grid-column: 1 / -1;
+}
+
+.station-panel {
+  grid-area: stations;
+}
+
+.recordings-panel {
+  grid-area: recordings;
 }
 
 .station-toolbar {
@@ -640,9 +704,20 @@ body::after {
 }
 
 @media (max-width: 980px) {
-  .hero,
+  .hero {
+    grid-template-columns: 1fr;
+  }
+
   .dashboard {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "media"
+      "artwork"
+      "status"
+      "source"
+      "favorites"
+      "stations"
+      "recordings";
   }
 
   .mode-grid {
@@ -655,8 +730,8 @@ body::after {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .media-layout {
-    grid-template-columns: 1fr;
+  .artwork-shell {
+    width: min(100%, 420px);
   }
 }
 
@@ -672,10 +747,13 @@ body::after {
   }
 
   .hero-copy h1 {
-    font-size: 2.35rem;
+    font-size: clamp(1.8rem, 8vw, 2.35rem);
+    white-space: normal;
   }
 
   .hero-actions,
+  .hero-control-bar,
+  .hero-link-row,
   .status-line,
   .toggle-row,
   .volume-strip,
