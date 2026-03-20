@@ -142,10 +142,18 @@ The server now auto-detects this ALSA capture device for recordings, so the norm
 python radio.py serve --port 8686
 ```
 
+The default backend uses the Raspberry Pi as the I2S clock master and the SI4689 as I2S slave, which matches the Skyworks SDK example and the `adau7002-simple` capture overlay.
+
 If needed, you can still force a device manually:
 
 ```bash
 python radio.py serve --port 8686 --record-device plughw:CARD=si4689i2s,DEV=0
+```
+
+If your hardware is wired for the opposite clock direction, you can override it:
+
+```bash
+python radio.py serve --port 8686 --i2s-master
 ```
 
 ## CLI mode

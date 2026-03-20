@@ -293,7 +293,7 @@ class RadioConfig:
     amp_pin: Optional[int] = 17
     amp_active_high: bool = True
     audio_out: str = "both"
-    i2s_master: bool = True
+    i2s_master: bool = False
     sample_rate: int = 48_000
     sample_size: int = 16
     xtal_freq: int = 19_200_000

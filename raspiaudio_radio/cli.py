@@ -183,6 +183,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--disable-amp", action="store_true", help="Disable amplifier GPIO control")
     serve.add_argument("--amp-active-low", action="store_true", help="Treat amplifier GPIO as active-low")
     serve.add_argument("--audio-out", choices=["analog", "i2s", "both"], default="both")
+    serve.add_argument("--i2s-master", dest="i2s_master", action="store_true", help="Si4689 drives BCLK/LRCLK")
+    serve.add_argument("--i2s-slave", dest="i2s_master", action="store_false", help="Raspberry Pi drives BCLK/LRCLK (default)")
+    serve.set_defaults(i2s_master=False)
     serve.add_argument("--sample-rate", type=int, default=48_000)
     serve.add_argument("--sample-size", type=int, default=16)
     serve.add_argument("--xtal", type=lambda x: int(x, 0), default=19_200_000)
@@ -276,6 +279,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             amp_pin=None if args.disable_amp else args.amp_pin,
             amp_active_high=not args.amp_active_low,
             audio_out=args.audio_out,
+            i2s_master=args.i2s_master,
             sample_rate=args.sample_rate,
             sample_size=args.sample_size,
             xtal_freq=args.xtal,
