@@ -14,8 +14,7 @@ The Raspiaudio Digital Radio Shield for Raspberry Pi is a compact all-in-one rad
 </p>
 
 <p align="center">
-  <img src="pic/Digital%20radio%20Pi%20Raspiaudio%20situation.png" alt="Raspiaudio digital radio in use" width="46%" />
-  <img src="pic/Digital%20radio%20Pi%20Raspiaudio%20situation%20%282%29.png" alt="Raspiaudio digital radio setup view" width="46%" />
+  <img src="pic/Digital%20radio%20Pi%20Raspiaudio%20situation.png" alt="Raspiaudio digital radio in use" width="68%" />
 </p>
 
 The focus is simple:
