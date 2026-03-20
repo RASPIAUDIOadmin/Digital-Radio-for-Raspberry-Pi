@@ -144,6 +144,8 @@ python radio.py serve --port 8686
 
 The default backend uses the Raspberry Pi as the I2S clock master and the SI4689 as I2S slave, which matches the Skyworks SDK example and the `adau7002-simple` capture overlay.
 
+By default, the backend also trims the first `3` seconds of each WAV recording to remove the unstable I2S startup noise.
+
 If needed, you can still force a device manually:
 
 ```bash
@@ -154,6 +156,12 @@ If your hardware is wired for the opposite clock direction, you can override it:
 
 ```bash
 python radio.py serve --port 8686 --i2s-master
+```
+
+If you want to keep the full raw capture without trimming the first seconds:
+
+```bash
+python radio.py serve --port 8686 --record-trim-seconds 0
 ```
 
 ## CLI mode

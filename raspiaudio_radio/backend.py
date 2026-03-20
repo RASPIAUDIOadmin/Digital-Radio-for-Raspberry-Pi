@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import threading
 import time
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -268,6 +269,44 @@ def _auto_detect_record_device() -> str:
     return "default"
 
 
+def _wav_duration_seconds(file_path: Path) -> Optional[float]:
+    try:
+        with wave.open(str(file_path), "rb") as wav_file:
+            frames = wav_file.getnframes()
+            rate = wav_file.getframerate()
+            if rate <= 0:
+                return None
+            return round(frames / rate, 1)
+    except (FileNotFoundError, wave.Error, OSError):
+        return None
+
+
+def _trim_wav_leading_seconds(file_path: Path, trim_seconds: float) -> float:
+    trim_seconds = max(0.0, float(trim_seconds))
+    if trim_seconds <= 0.0 or not file_path.exists():
+        return 0.0
+    try:
+        with wave.open(str(file_path), "rb") as source:
+            params = source.getparams()
+            rate = source.getframerate()
+            if rate <= 0:
+                return 0.0
+            trim_frames = int(round(trim_seconds * rate))
+            total_frames = source.getnframes()
+            if trim_frames <= 0 or total_frames <= trim_frames:
+                return 0.0
+            source.setpos(trim_frames)
+            remaining = source.readframes(total_frames - trim_frames)
+    except (wave.Error, OSError):
+        return 0.0
+    temp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    with wave.open(str(temp_path), "wb") as target:
+        target.setparams(params)
+        target.writeframes(remaining)
+    temp_path.replace(file_path)
+    return round(trim_frames / rate, 1)
+
+
 @dataclass(frozen=True)
 class RadioConfig:
     patch_path: Path
@@ -321,6 +360,7 @@ class RadioConfig:
     record_device: str = "auto"
     record_channels: int = 2
     record_format: str = "S16_LE"
+    record_trim_leading_seconds: float = 3.0
 
 
 class AmplifierGate:
@@ -1566,6 +1606,12 @@ class RadioBackend:
         finished_at = datetime.now()
         meta["finished_at"] = finished_at.isoformat(timespec="seconds")
         meta["duration_seconds"] = round(time.time() - float(meta["_started_epoch"]), 1)
+        trimmed = _trim_wav_leading_seconds(Path(meta["file_path"]), self.config.record_trim_leading_seconds)
+        if trimmed > 0:
+            meta["trimmed_leading_seconds"] = trimmed
+        actual_duration = _wav_duration_seconds(Path(meta["file_path"]))
+        if actual_duration is not None:
+            meta["duration_seconds"] = actual_duration
         if stderr:
             meta["note"] = stderr
         self._write_recording_meta_locked(meta)

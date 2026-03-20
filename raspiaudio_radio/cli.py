@@ -188,6 +188,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.set_defaults(i2s_master=False)
     serve.add_argument("--sample-rate", type=int, default=48_000)
     serve.add_argument("--sample-size", type=int, default=16)
+    serve.add_argument(
+        "--record-trim-seconds",
+        type=float,
+        default=3.0,
+        help="Drop this many unstable seconds from the beginning of each WAV recording (default: 3.0)",
+    )
     serve.add_argument("--xtal", type=lambda x: int(x, 0), default=19_200_000)
     serve.add_argument("--ctun", type=lambda x: int(x, 0), default=0x07)
     serve.add_argument("--antcap", type=lambda x: int(x, 0), default=0)
@@ -282,6 +288,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             i2s_master=args.i2s_master,
             sample_rate=args.sample_rate,
             sample_size=args.sample_size,
+            record_trim_leading_seconds=args.record_trim_seconds,
             xtal_freq=args.xtal,
             ctun=args.ctun,
             antcap=args.antcap,
