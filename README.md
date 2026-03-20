@@ -79,13 +79,13 @@ It gives you:
 Start the server on the Raspberry Pi:
 
 ```bash
-python radio.py serve --host 0.0.0.0 --port 8686
+python radio.py serve --port 8686
 ```
 
 Then open:
 
 ```text
-http://<raspberry-pi-ip>:8686/
+http://piradio.local:8686/
 ```
 
 ## CLI mode

@@ -237,6 +237,12 @@ body::after {
   box-shadow: 0 14px 32px rgba(229, 107, 11, 0.26);
 }
 
+.btn-danger {
+  color: var(--brand-white);
+  background: linear-gradient(135deg, #d73c3c, #8e1f1f);
+  box-shadow: 0 14px 32px rgba(194, 54, 54, 0.26);
+}
+
 .btn-accent.is-recording {
   background: linear-gradient(135deg, #c23636, #8c1b1b);
 }
@@ -394,6 +400,77 @@ body::after {
   border-color: var(--brand-blue);
   box-shadow: 0 18px 34px rgba(46, 102, 212, 0.16);
   background: linear-gradient(160deg, rgba(46, 102, 212, 0.16), rgba(255, 255, 255, 0.98));
+}
+
+.media-panel {
+  grid-column: 1 / -1;
+}
+
+.media-layout {
+  margin-top: 1rem;
+  display: grid;
+  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.media-artwork-shell {
+  position: relative;
+  min-height: 220px;
+  border-radius: 1.4rem;
+  overflow: hidden;
+  border: 1px solid var(--brand-line);
+  background:
+    radial-gradient(circle at top left, rgba(46, 102, 212, 0.22), transparent 55%),
+    linear-gradient(145deg, rgba(16, 33, 75, 0.94), rgba(46, 102, 212, 0.86));
+  box-shadow: 0 20px 42px rgba(16, 33, 75, 0.18);
+}
+
+.media-artwork,
+.media-artwork-fallback {
+  width: 100%;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+}
+
+.media-artwork {
+  object-fit: cover;
+}
+
+.media-artwork-fallback {
+  font-family: "Arial Narrow", "Franklin Gothic Medium", "Trebuchet MS", sans-serif;
+  font-size: clamp(2.4rem, 6vw, 4rem);
+  letter-spacing: 0.16em;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.media-copy {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.media-line {
+  border-radius: 1.2rem;
+  padding: 0.95rem 1rem;
+  border: 1px solid var(--brand-line);
+  background: linear-gradient(155deg, rgba(46, 102, 212, 0.08), rgba(255, 255, 255, 0.96));
+}
+
+.media-line strong {
+  color: var(--brand-ink);
+  font-size: 1.2rem;
+}
+
+.media-line-wide p {
+  margin: 0;
+  min-height: 3.2rem;
+  color: rgba(47, 53, 66, 0.82);
+  line-height: 1.5;
+}
+
+.media-foot {
+  margin-top: 0;
 }
 
 .favorite-list {
@@ -567,6 +644,10 @@ body::after {
   .station-list,
   .recording-list {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .media-layout {
+    grid-template-columns: 1fr;
   }
 }
 

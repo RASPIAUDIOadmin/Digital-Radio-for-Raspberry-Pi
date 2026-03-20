@@ -55,6 +55,7 @@ CMD_LOAD_INIT = 0x06
 CMD_BOOT = 0x07
 CMD_SET_PROPERTY = 0x13
 CMD_GET_PROPERTY = 0x14
+CMD_GET_DIGITAL_SERVICE_DATA = 0x84
 
 CMD_GET_PART_INFO = 0x02
 
@@ -97,6 +98,7 @@ PROP_DAB_TUNE_FE_VARB = 0x1711
 PROP_DAB_TUNE_FE_CFG = 0x1712
 PROP_DAB_EVENT_INTERRUPT_SOURCE = 0xB300
 PROP_DAB_VALID_RSSI_THRESHOLD = 0xB201
+PROP_DAB_XPAD_ENABLE = 0xB400
 
 # Default NVM flash addresses (from _RECOMMENDED_FLASH_ADDRESSES.txt)
 # FLASH_MINI flow loads mini patch from host, then full patch + firmware from flash.
@@ -522,7 +524,12 @@ class Si468xDabRadio:
         self._write_command(cmd, timeout=timeout, allow_cmd_error_after=allow_cmd_error)
 
     def flash_load_and_boot(self, start_addr: int, allow_cmd_error: bool = False) -> None:
-        self._send_load_init(allow_cmd_error=allow_cmd_error)
+        """
+        SDK FLASH_FULL flow after the full patch has already been host-loaded.
+
+        Do not send LOAD_INIT again here: the flow chart expects FLASH_LOAD
+        directly after the host-loaded patch, then BOOT.
+        """
         self.flash_load_strict(start_addr, allow_cmd_error=allow_cmd_error)
         self._boot(allow_cmd_error=allow_cmd_error)
 
@@ -549,9 +556,9 @@ class Si468xDabRadio:
     ) -> None:
         """
         SDK OPTION__BOOT_FROM_FLASH_MINI flow:
-        LOAD_INIT -> FLASH_LOAD(full patch) -> LOAD_INIT -> FLASH_LOAD(firmware) -> BOOT
+        HOST_LOAD(mini patch) -> wait -> FLASH_LOAD(full patch) ->
+        LOAD_INIT -> FLASH_LOAD(firmware) -> BOOT
         """
-        self._send_load_init(allow_cmd_error=allow_cmd_error)
         self.flash_load_strict(patch_addr, allow_cmd_error=allow_cmd_error)
         if full_patch_wait_ms > 0:
             time.sleep(full_patch_wait_ms / 1000.0)
@@ -700,6 +707,7 @@ class Si468xDabRadio:
         # Interrupts: RECFG, RECFGWRN, SRVLIST
         self.set_property(PROP_DAB_EVENT_INTERRUPT_SOURCE, 0x00C1)
         self.set_property(PROP_DAB_VALID_RSSI_THRESHOLD, 6)
+        self.set_property(PROP_DAB_XPAD_ENABLE, 0x0001)
 
     def configure_fmhd_frontend(self) -> None:
         self.set_property(PROP_FM_TUNE_FE_VARM, 0xFD12)
@@ -945,6 +953,33 @@ class Si468xDabRadio:
                     )
                 offset += 4
         return services
+
+    def get_digital_service_data(self, status_only: bool = False, ack: bool = True) -> Dict[str, object]:
+        flags = (0x10 if status_only else 0x00) | (0x01 if ack else 0x00)
+        self._write_command([CMD_GET_DIGITAL_SERVICE_DATA, flags])
+        header = self._read_reply(24)
+        if len(header) < 24:
+            raise RuntimeError("Short GET_DIGITAL_SERVICE_DATA header reply")
+        byte_count = int.from_bytes(bytes(header[18:20]), "little")
+        reply = header
+        if not status_only and byte_count > 0:
+            reply = self._read_reply(24 + byte_count)
+        payload = bytes(reply[24 : 24 + byte_count]) if len(reply) >= 24 else b""
+        return {
+            "overflow": bool(header[4] & 0x02),
+            "packet_ready": bool(header[4] & 0x01),
+            "buffer_count": header[5],
+            "service_state": header[6],
+            "data_src": (header[7] >> 6) & 0x03,
+            "dscty": header[7] & 0x3F,
+            "service_id": int.from_bytes(bytes(header[8:12]), "little"),
+            "component_id": int.from_bytes(bytes(header[12:16]), "little"),
+            "uatype": int.from_bytes(bytes(header[16:18]), "little"),
+            "byte_count": byte_count,
+            "seg_num": int.from_bytes(bytes(header[20:22]), "little"),
+            "num_segs": int.from_bytes(bytes(header[22:24]), "little"),
+            "payload": payload,
+        }
 
     def start_digital_service(self, service_id: int, component_id: int) -> None:
         cmd = [

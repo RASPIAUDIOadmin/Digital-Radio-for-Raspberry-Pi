@@ -48,6 +48,41 @@ function formatTimestamp(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+function updateDabMedia(status) {
+  const media = status.dab_media || {};
+  const isDab = status.mode === "dab";
+  const current = status.current_station || {};
+  const hasText = Boolean(media.text || media.artist || media.title);
+
+  document.getElementById("mediaArtist").textContent = media.artist || (isDab ? "No artist yet" : "DAB only");
+  document.getElementById("mediaTitle").textContent = media.title || (isDab ? "No title yet" : "DAB only");
+  document.getElementById("mediaText").textContent = isDab
+    ? media.text || "No DAB text received yet."
+    : "Switch to DAB and tune a station to read metadata.";
+  document.getElementById("mediaUpdated").textContent = media.updated_at
+    ? `Updated: ${formatTimestamp(media.updated_at)}`
+    : (isDab ? "No metadata received yet." : "DAB metadata is inactive.");
+  document.getElementById("mediaHint").textContent = isDab
+    ? "Artwork is not available from the open sample flow yet."
+    : "Artwork and DLS text are only available in DAB mode.";
+
+  const statusPill = document.getElementById("mediaStatus");
+  statusPill.textContent = !isDab ? "DAB only" : hasText ? "Live text" : "Waiting";
+
+  const artwork = document.getElementById("mediaArtwork");
+  const fallback = document.getElementById("mediaArtworkFallback");
+  if (media.artwork_url) {
+    artwork.hidden = false;
+    artwork.src = media.artwork_url;
+    fallback.hidden = true;
+  } else {
+    artwork.hidden = true;
+    artwork.removeAttribute("src");
+    fallback.hidden = false;
+    fallback.textContent = (current.label || "DAB").slice(0, 3).toUpperCase();
+  }
+}
+
 function renderModes() {
   const currentMode = state.status?.mode;
   document.querySelectorAll(".mode-card").forEach((button) => {
@@ -107,6 +142,7 @@ function updateStatus(status) {
   }
 
   setError(status.last_error || "");
+  updateDabMedia(status);
   renderModes();
   renderStations();
   renderFavorites();
@@ -373,10 +409,34 @@ async function toggleRecord() {
   }
 }
 
+async function stopServer() {
+  const button = document.getElementById("stopServerButton");
+  setBusy(button, true, "Stopping...");
+  try {
+    await api("/api/server/stop", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    if (state.pollingHandle) {
+      window.clearInterval(state.pollingHandle);
+      state.pollingHandle = null;
+    }
+    const badge = document.getElementById("statusBadge");
+    badge.className = "status-badge status-idle";
+    badge.textContent = "Stopped";
+    document.getElementById("bootState").textContent = "Server stopped. Reload the page after restarting the service.";
+    setError("Server shutdown requested.");
+  } catch (error) {
+    setError(error.message);
+    setBusy(button, false);
+  }
+}
+
 function wireEvents() {
   document.getElementById("bootButton").addEventListener("click", bootRadio);
   document.getElementById("scanButton").addEventListener("click", scanStations);
   document.getElementById("refreshButton").addEventListener("click", refreshAll);
+  document.getElementById("stopServerButton").addEventListener("click", stopServer);
   document.getElementById("volumeDownButton").addEventListener("click", () => updateVolume({ delta: -2 }));
   document.getElementById("volumeUpButton").addEventListener("click", () => updateVolume({ delta: 2 }));
   document.getElementById("ampButton").addEventListener("click", toggleAmplifier);

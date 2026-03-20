@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import socket
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List
@@ -90,6 +91,18 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/record":
                 self._send_ok(self.server.backend.record(action=str(body.get("action", "toggle"))))
+                return
+            if parsed.path == "/api/flash/program":
+                self._send_ok(
+                    self.server.backend.flash_program(
+                        mode=body.get("mode"),
+                        run_self_test=bool(body.get("self_test", True)),
+                    )
+                )
+                return
+            if parsed.path == "/api/server/stop":
+                self._send_ok({"stopping": True})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             self._send_error_json(404, "Unknown route.")
         except ValueError as exc:

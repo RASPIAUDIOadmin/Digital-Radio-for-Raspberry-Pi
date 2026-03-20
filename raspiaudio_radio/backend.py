@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import re
 import shutil
 import subprocess
 import threading
@@ -13,6 +14,10 @@ from typing import Any, Dict, List, Optional
 
 from legacy.dab_radio_i2c_safe2 import (
     DAB_BAND_III,
+    FLASH_ADDR_DAB,
+    FLASH_ADDR_PATCH_FULL,
+    FLASH_SECTOR_SIZE,
+    FLASH_WRITE_BLOCK,
     PROP_AUDIO_MUTE,
     Si468xDabRadio,
     load_scan_file,
@@ -36,6 +41,9 @@ MODE_DEFS: Dict[str, Dict[str, Any]] = {
 SCAN_KEYS = ("dab", "fm", "hd", "am", "am_hd")
 VALID_AUDIO_OUT = {"analog", "i2s", "both"}
 SCAN_FILE_HEADER = "Automatically generated and machine read file, do not change!\n"
+FLASH_ADDR_FMHD = 0x00006000
+FLASH_ADDR_AMHD = 0x0011E000
+DAB_DATA_SRC_PAD_DLS = 0x02
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
@@ -77,9 +85,59 @@ def _iso_or_none(timestamp: Optional[float]) -> Optional[str]:
     return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
 
 
+def _empty_dab_media() -> Dict[str, Any]:
+    return {
+        "text": "",
+        "title": None,
+        "artist": None,
+        "encoding": None,
+        "toggle": None,
+        "updated_at": None,
+        "artwork_url": None,
+        "artwork_supported": False,
+    }
+
+
+def _decode_dab_text(payload: bytes, encoding: Optional[int]) -> str:
+    raw = bytes(payload or b"").replace(b"\x00", b" ").strip()
+    if not raw:
+        return ""
+    enc = int(encoding) if encoding is not None else -1
+    candidates = ["latin-1"]
+    if enc in {6, 4}:
+        candidates = ["utf-16-be", "utf-16-le", "utf-8", "latin-1"]
+    elif enc == 0x0F:
+        candidates = ["utf-8", "latin-1"]
+    for codec in candidates:
+        try:
+            text = raw.decode(codec, errors="strict")
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("latin-1", errors="replace")
+    return " ".join(text.replace("\r", " ").replace("\n", " ").split())
+
+
+def _infer_artist_title(text: str) -> tuple[Optional[str], Optional[str]]:
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return None, None
+    for separator in (" - ", " – ", " | ", " / "):
+        if separator in cleaned:
+            left, right = [part.strip() for part in cleaned.split(separator, 1)]
+            if left and right:
+                return right, left
+    match = re.match(r"^(?P<title>.+?)\s+by\s+(?P<artist>.+)$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return match.group("artist").strip(), match.group("title").strip()
+    return None, None
+
+
 @dataclass(frozen=True)
 class RadioConfig:
     patch_path: Path
+    mini_patch_path: Path
     dab_firmware_path: Path
     fmhd_firmware_path: Path
     amhd_firmware_path: Path
@@ -95,6 +153,7 @@ class RadioConfig:
     spi_bus: int = 0
     spi_dev: int = 0
     spi_speed_hz: int = 30_000_000
+    flash_program_spi_hz: int = 1_000_000
     rst_pin: int = 25
     int_pin: Optional[int] = None
     amp_pin: Optional[int] = 17
@@ -107,6 +166,10 @@ class RadioConfig:
     ctun: int = 0x07
     antcap: int = 0
     lock_ms: int = 5000
+    flash_patch_addr: int = FLASH_ADDR_PATCH_FULL
+    flash_dab_addr: int = FLASH_ADDR_DAB
+    flash_fmhd_addr: int = FLASH_ADDR_FMHD
+    flash_amhd_addr: int = FLASH_ADDR_AMHD
     default_volume: int = 40
     default_mode: str = "dab"
     fm_min_khz: int = 87_500
@@ -183,6 +246,7 @@ class RadioBackend:
         self._current_volume = _clamp_int(config.default_volume, 0, 63)
         self._last_signal: Optional[Dict[str, Any]] = None
         self._last_error: Optional[str] = None
+        self._dab_media: Dict[str, Any] = _empty_dab_media()
         self._stations: Dict[str, List[Dict[str, Any]]] = {key: [] for key in SCAN_KEYS}
         self._last_scan_count: Dict[str, int] = {key: 0 for key in SCAN_KEYS}
         self._last_scan_time: Dict[str, Optional[float]] = {key: None for key in SCAN_KEYS}
@@ -306,15 +370,63 @@ class RadioBackend:
                 raise ValueError("record action must be start, stop or toggle.")
             return self._status_payload_locked(refresh_signal=False)
 
+    def flash_program(self, mode: Optional[str] = None, run_self_test: bool = True) -> Dict[str, Any]:
+        with self._lock:
+            target_mode = self._normalize_mode(mode) if mode is not None else self._current_mode
+            if self._recording_active_locked():
+                self._stop_recording_locked()
+            self._shutdown_locked(close_amp=False)
+
+            report = {
+                "mode": target_mode,
+                "mode_label": MODE_DEFS[target_mode]["label"],
+                "firmware_key": self._mode_info(target_mode)["firmware"],
+                "patch_image": str(self.config.patch_path),
+                "mini_patch_image": str(self.config.mini_patch_path),
+                "firmware_image": str(self._firmware_path_for_mode(target_mode)),
+                "flash_patch_addr": self.config.flash_patch_addr,
+                "flash_firmware_addr": self._flash_firmware_addr_for_mode(target_mode),
+                "self_test_requested": bool(run_self_test),
+                "self_test": [],
+                "programmed": False,
+            }
+            restore_exc: Optional[Exception] = None
+            try:
+                self._flash_program_locked(target_mode, report)
+                report["programmed"] = True
+                if run_self_test:
+                    report["bootable"] = self._flash_self_test_locked(target_mode, report)
+                else:
+                    report["bootable"] = None
+                report["status"] = "ok" if report["bootable"] is not False else "self_test_failed"
+                report["error"] = None if report["bootable"] is not False else self._flash_self_test_error(report)
+                self._last_error = report["error"]
+                report["restored_status"] = self._restore_runtime_locked()
+                return report
+            except Exception as exc:
+                self._last_error = str(exc)
+                try:
+                    report["restored_status"] = self._restore_runtime_locked()
+                except Exception as inner_exc:
+                    restore_exc = inner_exc
+                    report["restore_error"] = str(inner_exc)
+                if restore_exc is not None:
+                    raise RuntimeError(f"{exc} | restore failed: {restore_exc}") from exc
+                raise
+
     def close(self) -> None:
         with self._lock:
             self._stop_recording_locked()
             self._shutdown_locked(close_amp=True)
 
-    def _set_mode_locked(self, mode: str) -> None:
+    def _normalize_mode(self, mode: str) -> str:
         normalized = str(mode).strip().lower().replace("-", "_")
         if normalized not in MODE_DEFS:
             raise ValueError(f"Unsupported mode: {mode}")
+        return normalized
+
+    def _set_mode_locked(self, mode: str) -> None:
+        normalized = self._normalize_mode(mode)
         if normalized == self._current_mode:
             return
         if self._recording_active_locked():
@@ -322,6 +434,7 @@ class RadioBackend:
         self._current_mode = normalized
         self._current_station = None
         self._last_signal = None
+        self._dab_media = _empty_dab_media()
 
     def _mode_info(self, mode: Optional[str] = None) -> Dict[str, Any]:
         return MODE_DEFS[mode or self._current_mode]
@@ -344,6 +457,14 @@ class RadioBackend:
             "dab": self.config.dab_firmware_path,
             "fmhd": self.config.fmhd_firmware_path,
             "amhd": self.config.amhd_firmware_path,
+        }[firmware_key]
+
+    def _flash_firmware_addr_for_mode(self, mode: Optional[str] = None) -> int:
+        firmware_key = self._mode_info(mode)["firmware"]
+        return {
+            "dab": self.config.flash_dab_addr,
+            "fmhd": self.config.flash_fmhd_addr,
+            "amhd": self.config.flash_amhd_addr,
         }[firmware_key]
 
     def _load_scan_files_locked(self) -> None:
@@ -393,6 +514,8 @@ class RadioBackend:
 
     def _status_payload_locked(self, refresh_signal: bool) -> Dict[str, Any]:
         self._refresh_recording_state_locked()
+        if self._booted and self._current_station is not None and self._current_station.get("mode") == "dab":
+            self._poll_dab_media_locked()
         if refresh_signal and self._booted and self._current_station is not None:
             try:
                 self._last_signal = self._read_current_signal_locked()
@@ -413,6 +536,7 @@ class RadioBackend:
             "amp_requested": self._amp_requested,
             "amp_pin": self.config.amp_pin,
             "current_station": self._decorate_station_locked(self._current_station) if self._current_station else None,
+            "dab_media": self._dab_media_payload_locked(),
             "signal": dict(self._last_signal or {}),
             "station_count": len(self._stations[scan_key]),
             "favorite_count": len(self._favorites),
@@ -444,6 +568,69 @@ class RadioBackend:
         item["is_current"] = self._current_station is not None and item["station_id"] == self._current_station.get("station_id")
         item["mode_label"] = MODE_DEFS[item["mode"]]["label"]
         return item
+
+    def _dab_media_payload_locked(self) -> Dict[str, Any]:
+        payload = dict(self._dab_media)
+        payload["updated_at"] = _iso_or_none(payload.get("updated_at"))
+        payload["available"] = bool(payload.get("text"))
+        return payload
+
+    def _poll_dab_media_locked(self, max_packets: int = 6) -> None:
+        station = self._current_station
+        if station is None or station.get("mode") != "dab":
+            return
+        radio = self._require_radio_locked()
+        try:
+            status = radio.get_digital_service_data(status_only=True, ack=False)
+        except Exception:
+            return
+        packets = int(status.get("buffer_count") or 0)
+        if not status.get("packet_ready") and packets <= 0:
+            return
+        packets = max(1 if status.get("packet_ready") else 0, min(max_packets, packets))
+        for _ in range(packets):
+            try:
+                packet = radio.get_digital_service_data(status_only=False, ack=True)
+            except Exception:
+                return
+            self._consume_dab_packet_locked(packet)
+
+    def _consume_dab_packet_locked(self, packet: Dict[str, Any]) -> None:
+        station = self._current_station
+        if station is None or station.get("mode") != "dab":
+            return
+        if int(packet.get("byte_count") or 0) <= 0:
+            return
+        if int(packet.get("service_id") or 0) != int(station.get("service_id") or 0):
+            return
+        if int(packet.get("component_id") or 0) != int(station.get("component_id") or 0):
+            return
+        if int(packet.get("data_src") or -1) != DAB_DATA_SRC_PAD_DLS:
+            return
+        payload = bytes(packet.get("payload") or b"")
+        if len(payload) < 2:
+            return
+        prefix0 = payload[0]
+        if (prefix0 & 0x10) == 0:
+            encoding = (payload[1] >> 4) & 0x0F
+            if encoding == 0x04:
+                encoding = 0x06
+            text = _decode_dab_text(payload[2:], encoding)
+            artist, title = _infer_artist_title(text)
+            self._dab_media = {
+                "text": text,
+                "title": title,
+                "artist": artist,
+                "encoding": encoding,
+                "toggle": 1 if (prefix0 & 0x80) else 0,
+                "updated_at": time.time(),
+                "artwork_url": None,
+                "artwork_supported": False,
+            }
+            return
+        command_type = prefix0 & 0x0F
+        if command_type == 0x01:
+            self._dab_media = _empty_dab_media()
 
     def _normalize_station(self, scan_key: str, raw: Dict[str, Any]) -> Dict[str, Any]:
         mode_info = MODE_DEFS[scan_key]
@@ -493,16 +680,7 @@ class RadioBackend:
             if self._recording_active_locked():
                 self._stop_recording_locked()
             self._shutdown_locked(close_amp=False)
-            radio = Si468xDabRadio(
-                i2c_bus=self.config.i2c_bus,
-                i2c_addr=self.config.i2c_addr,
-                rst_pin=self.config.rst_pin,
-                int_pin=self.config.int_pin,
-                use_spi=True,
-                spi_bus=self.config.spi_bus,
-                spi_dev=self.config.spi_dev,
-                spi_speed_hz=self.config.spi_speed_hz,
-            )
+            radio = self._create_radio()
             try:
                 radio.reset()
                 radio.power_up(xtal_freq=self.config.xtal_freq, ctun=self.config.ctun, retries=2)
@@ -529,6 +707,134 @@ class RadioBackend:
         self._amp.set_enabled(self._amp_requested)
         return self._status_payload_locked(refresh_signal=False)
 
+    def _create_radio(self, *, spi_speed_hz: Optional[int] = None) -> Si468xDabRadio:
+        return Si468xDabRadio(
+            i2c_bus=self.config.i2c_bus,
+            i2c_addr=self.config.i2c_addr,
+            rst_pin=self.config.rst_pin,
+            int_pin=self.config.int_pin,
+            use_spi=True,
+            spi_bus=self.config.spi_bus,
+            spi_dev=self.config.spi_dev,
+            spi_speed_hz=self.config.spi_speed_hz if spi_speed_hz is None else int(spi_speed_hz),
+        )
+
+    def _restore_runtime_locked(self) -> Dict[str, Any]:
+        return self._boot_locked(force=True)
+
+    def _flash_program_locked(self, mode: str, report: Dict[str, Any]) -> None:
+        radio = self._create_radio()
+        try:
+            radio.reset()
+            radio.power_up(xtal_freq=self.config.xtal_freq, ctun=self.config.ctun, retries=2)
+            radio.load_patch_only(self.config.mini_patch_path)
+            if radio.use_spi and radio.spi is not None:
+                radio.spi.max_speed_hz = min(int(radio.spi.max_speed_hz), int(self.config.flash_program_spi_hz))
+            radio.flash_enter_program_mode()
+            self._program_flash_image_locked(
+                radio,
+                self.config.patch_path,
+                self.config.flash_patch_addr,
+                "full patch",
+            )
+            self._program_flash_image_locked(
+                radio,
+                self._firmware_path_for_mode(mode),
+                self._flash_firmware_addr_for_mode(mode),
+                f"{report['mode_label']} firmware",
+            )
+        finally:
+            radio.close()
+
+    def _flash_self_test_locked(self, mode: str, report: Dict[str, Any]) -> bool:
+        attempts = [
+            ("mini", self._flash_boot_mini_locked),
+            ("full", self._flash_boot_full_locked),
+        ]
+        bootable = False
+        for name, boot_fn in attempts:
+            entry: Dict[str, Any] = {"method": name, "ok": False}
+            radio = self._create_radio()
+            try:
+                radio.reset()
+                radio.power_up(xtal_freq=self.config.xtal_freq, ctun=self.config.ctun, retries=2)
+                boot_fn(radio, mode)
+                entry["probe"] = self._probe_firmware_locked(radio, mode)
+                entry["ok"] = True
+                bootable = True
+            except Exception as exc:
+                entry["error"] = str(exc)
+            finally:
+                report["self_test"].append(entry)
+                radio.close()
+            if bootable:
+                break
+        return bootable
+
+    def _flash_self_test_error(self, report: Dict[str, Any]) -> str:
+        attempts = report.get("self_test") or []
+        if not attempts:
+            return "Flash self-test failed."
+        return "Flash self-test failed. " + " | ".join(
+            f"{item['method']}: {item.get('error', 'unknown error')}"
+            for item in attempts
+        )
+
+    def _flash_boot_mini_locked(self, radio: Si468xDabRadio, mode: str) -> None:
+        radio.load_patch_only(self.config.mini_patch_path, allow_cmd_error=True)
+        time.sleep(0.004)
+        radio.flash_load_mini_and_boot(
+            self.config.flash_patch_addr,
+            self._flash_firmware_addr_for_mode(mode),
+            full_patch_wait_ms=4,
+            nvmspi_rate_khz=0,
+            allow_cmd_error=True,
+        )
+
+    def _flash_boot_full_locked(self, radio: Si468xDabRadio, mode: str) -> None:
+        radio.load_patch_only(self.config.patch_path, allow_cmd_error=True)
+        time.sleep(0.004)
+        radio.flash_load_and_boot(
+            self._flash_firmware_addr_for_mode(mode),
+            allow_cmd_error=True,
+        )
+
+    def _probe_firmware_locked(self, radio: Si468xDabRadio, mode: str) -> Dict[str, Any]:
+        band = self._mode_info(mode)["band"]
+        if band == "dab":
+            status = radio.dab_digrad_status()
+            status["probe"] = "dab_digrad_status"
+            return status
+        if band == "fm":
+            status = radio.fm_rsq_status(attune=False)
+            status["probe"] = "fm_rsq_status"
+            return status
+        status = radio.am_rsq_status(attune=False)
+        status["probe"] = "am_rsq_status"
+        return status
+
+    def _program_flash_image_locked(
+        self,
+        radio: Si468xDabRadio,
+        image_path: Path,
+        start_addr: int,
+        label: str,
+    ) -> None:
+        image_size = image_path.stat().st_size
+        sectors = (image_size + FLASH_SECTOR_SIZE - 1) // FLASH_SECTOR_SIZE
+        for sector in range(sectors):
+            radio.flash_erase_sector(start_addr + (sector * FLASH_SECTOR_SIZE))
+        written = 0
+        with image_path.open("rb") as handle:
+            while True:
+                chunk = handle.read(FLASH_WRITE_BLOCK)
+                if not chunk:
+                    break
+                radio.flash_write_block(start_addr + written, chunk)
+                written += len(chunk)
+        if written != image_size:
+            raise RuntimeError(f"Incomplete flash write for {label}: {written}/{image_size} bytes")
+
     def _shutdown_locked(self, close_amp: bool) -> None:
         if close_amp:
             self._amp.close()
@@ -545,6 +851,7 @@ class RadioBackend:
         self._radio = None
         self._booted = False
         self._loaded_firmware = None
+        self._dab_media = _empty_dab_media()
 
     def _require_radio_locked(self) -> Si468xDabRadio:
         if self._radio is None or not self._booted:
@@ -836,6 +1143,7 @@ class RadioBackend:
                 )
             except Exception:
                 pass
+        self._dab_media = _empty_dab_media()
         radio.dab_tune(int(station["freq_index"]), antcap=self.config.antcap)
         status = self._wait_dab_ready_locked(timeout_ms=max(self.config.lock_ms, 8000))
         if status is None:
@@ -844,9 +1152,11 @@ class RadioBackend:
         self._current_station = dict(station)
         self._last_signal = dict(status)
         self._last_signal["score"] = _dab_score(status)
+        self._poll_dab_media_locked()
 
     def _play_analog_locked(self, station: Dict[str, Any]) -> None:
         radio = self._require_radio_locked()
+        self._dab_media = _empty_dab_media()
         radio.set_property(PROP_AUDIO_MUTE, 0)
         band = station["band"]
         require_hd = station["mode"] in {"hd", "am_hd"}

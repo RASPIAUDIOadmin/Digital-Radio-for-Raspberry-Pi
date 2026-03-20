@@ -68,6 +68,7 @@ def _print_status(status: Dict[str, Any]) -> None:
     current = status.get("current_station") or {}
     signal = status.get("signal") or {}
     recording = status.get("recording") or {"active": False}
+    dab_media = status.get("dab_media") or {}
     print(f"booted: {'yes' if status.get('booted') else 'no'}")
     print(f"mode: {status.get('mode_label')} ({status.get('mode')})")
     print(f"firmware: {status.get('firmware')}")
@@ -84,6 +85,15 @@ def _print_status(status: Dict[str, Any]) -> None:
             f"CNR={signal.get('cnr')} "
             f"SCORE={signal.get('score')}"
         )
+    if status.get("mode") == "dab":
+        if dab_media.get("artist"):
+            print(f"dab_artist: {dab_media['artist']}")
+        if dab_media.get("title"):
+            print(f"dab_title: {dab_media['title']}")
+        if dab_media.get("text"):
+            print(f"dab_text: {dab_media['text']}")
+        elif current.get("label"):
+            print("dab_text: unavailable")
     if recording.get("active"):
         print(
             "recording: "
@@ -94,6 +104,39 @@ def _print_status(status: Dict[str, Any]) -> None:
         print("recording: off")
     if status.get("last_error"):
         print(f"last_error: {status['last_error']}")
+
+
+def _print_flash_report(report: Dict[str, Any]) -> None:
+    print(f"status: {report.get('status')}")
+    print(f"programmed: {'yes' if report.get('programmed') else 'no'}")
+    if report.get("bootable") is not None:
+        print(f"bootable: {'yes' if report.get('bootable') else 'no'}")
+    print(f"mode: {report.get('mode_label')} ({report.get('mode')})")
+    print(f"firmware_key: {report.get('firmware_key')}")
+    print(f"patch_image: {report.get('patch_image')}")
+    print(f"mini_patch_image: {report.get('mini_patch_image')}")
+    print(f"firmware_image: {report.get('firmware_image')}")
+    print(f"flash_patch_addr: 0x{int(report.get('flash_patch_addr', 0)):08X}")
+    print(f"flash_firmware_addr: 0x{int(report.get('flash_firmware_addr', 0)):08X}")
+    self_test = report.get("self_test") or []
+    if not self_test:
+        print("self_test: skipped")
+    for item in self_test:
+        status = "PASS" if item.get("ok") else "FAIL"
+        line = f"self_test[{item.get('method')}]: {status}"
+        if item.get("error"):
+            line += f" | {item['error']}"
+        if item.get("probe"):
+            line += f" | probe={item['probe']}"
+        print(line)
+    restored = report.get("restored_status")
+    if isinstance(restored, dict):
+        print(f"restored_mode: {restored.get('mode_label')} ({restored.get('mode')})")
+        print(f"restored_station: {(restored.get('current_station') or {}).get('label', 'None')}")
+    if report.get("restore_error"):
+        print(f"restore_error: {report['restore_error']}")
+    if report.get("error"):
+        print(f"error: {report['error']}")
 
 
 def _fetch_stations(base_url: str, mode: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -120,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=8686, help="HTTP port (default: 8686)")
     serve.add_argument("--alias", default="piradio", help="Suggested local network alias to display at startup")
     serve.add_argument("--patch", type=Path, default=FW_ROOT / "rom00_patch.016.bin")
+    serve.add_argument("--mini-patch", type=Path, default=FW_ROOT / "rom00_patch_mini.003.bin")
     serve.add_argument("--dab-fw", type=Path, default=FW_ROOT / "dab_radio_6_0_9.bin")
     serve.add_argument("--fmhd-fw", type=Path, default=FW_ROOT / "fmhd_radio_5_3_3.bin")
     serve.add_argument("--amhd-fw", type=Path, default=FW_ROOT / "amhd_radio_3_0_6.bin")
@@ -133,6 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--spi-bus", type=int, default=0)
     serve.add_argument("--spi-dev", type=int, default=0)
     serve.add_argument("--spi-speed", type=int, default=30_000_000)
+    serve.add_argument("--flash-program-spi-speed", type=int, default=1_000_000, help="Temporary SPI speed used for flash programming")
     serve.add_argument("--rst-pin", type=int, default=25)
     serve.add_argument("--amp-pin", type=int, default=17, help="BCM GPIO used to enable the speaker amplifier")
     serve.add_argument("--disable-amp", action="store_true", help="Disable amplifier GPIO control")
@@ -144,6 +189,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--ctun", type=lambda x: int(x, 0), default=0x07)
     serve.add_argument("--antcap", type=lambda x: int(x, 0), default=0)
     serve.add_argument("--lock-ms", type=int, default=5000)
+    serve.add_argument("--flash-patch-addr", type=lambda x: int(x, 0), default=0x00004000)
+    serve.add_argument("--flash-dab-addr", type=lambda x: int(x, 0), default=0x00092000)
+    serve.add_argument("--flash-fmhd-addr", type=lambda x: int(x, 0), default=0x00006000)
+    serve.add_argument("--flash-amhd-addr", type=lambda x: int(x, 0), default=0x0011E000)
     serve.add_argument("--volume", type=int, default=40, help="Initial analog volume 0-63")
     serve.add_argument("--mode", choices=MODE_CHOICES, default="dab", help="Startup mode")
     serve.add_argument("--record-device", default="default", help="ALSA capture device for recordings")
@@ -180,6 +229,11 @@ def build_parser() -> argparse.ArgumentParser:
     record = subparsers.add_parser("record", help="Start, stop, or toggle recording.")
     record.add_argument("action", choices=["start", "stop", "toggle"], nargs="?", default="toggle")
 
+    flash = subparsers.add_parser("flash", help="Program firmware into SPI flash via the Si4689 and run a self-test.")
+    flash.add_argument("mode", choices=MODE_CHOICES, nargs="?", default="dab")
+    flash.add_argument("--no-self-test", action="store_true", help="Skip the flash boot self-test after programming")
+    flash.add_argument("--json", action="store_true", help="Print raw JSON")
+
     recordings = subparsers.add_parser("recordings", help="List saved recordings.")
     recordings.add_argument("--json", action="store_true", help="Print raw JSON")
 
@@ -199,6 +253,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         config = RadioConfig(
             patch_path=args.patch.resolve(),
+            mini_patch_path=args.mini_patch.resolve(),
             dab_firmware_path=args.dab_fw.resolve(),
             fmhd_firmware_path=args.fmhd_fw.resolve(),
             amhd_firmware_path=args.amhd_fw.resolve(),
@@ -212,6 +267,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             spi_bus=args.spi_bus,
             spi_dev=args.spi_dev,
             spi_speed_hz=args.spi_speed,
+            flash_program_spi_hz=args.flash_program_spi_speed,
             rst_pin=args.rst_pin,
             amp_pin=None if args.disable_amp else args.amp_pin,
             amp_active_high=not args.amp_active_low,
@@ -222,6 +278,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             ctun=args.ctun,
             antcap=args.antcap,
             lock_ms=args.lock_ms,
+            flash_patch_addr=args.flash_patch_addr,
+            flash_dab_addr=args.flash_dab_addr,
+            flash_fmhd_addr=args.flash_fmhd_addr,
+            flash_amhd_addr=args.flash_amhd_addr,
             default_volume=args.volume,
             default_mode=args.mode,
             record_device=args.record_device,
@@ -305,6 +365,20 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.command == "record":
         status = _request(args.url, "POST", "/api/record", {"action": args.action}, timeout=120)
         _print_status(status)
+        return
+
+    if args.command == "flash":
+        report = _request(
+            args.url,
+            "POST",
+            "/api/flash/program",
+            {"mode": args.mode, "self_test": not args.no_self_test},
+            timeout=900,
+        )
+        if args.json:
+            print(json.dumps(report, indent=2))
+            return
+        _print_flash_report(report)
         return
 
     if args.command == "recordings":

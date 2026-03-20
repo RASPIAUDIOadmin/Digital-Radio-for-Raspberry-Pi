@@ -21,6 +21,7 @@
             <button id="bootButton" class="btn btn-primary">Boot radio</button>
             <button id="scanButton" class="btn btn-secondary">Scan stations</button>
             <button id="refreshButton" class="btn btn-ghost">Refresh</button>
+            <button id="stopServerButton" class="btn btn-danger">Stop server</button>
           </div>
         </div>
         <div class="hero-live">
@@ -110,6 +111,40 @@
             <span id="audioOutLabel">Audio out: both</span>
           </div>
           <div id="errorLine" class="error-line"></div>
+        </section>
+
+        <section class="panel media-panel reveal delay-1">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Now Playing Details</p>
+              <h2>DAB text and artwork</h2>
+            </div>
+            <span id="mediaStatus" class="count-pill">Waiting</span>
+          </div>
+          <div class="media-layout">
+            <div class="media-artwork-shell">
+              <img id="mediaArtwork" class="media-artwork" alt="DAB slideshow artwork" hidden />
+              <div id="mediaArtworkFallback" class="media-artwork-fallback">DAB</div>
+            </div>
+            <div class="media-copy">
+              <div class="media-line">
+                <span class="meta-label">Artist</span>
+                <strong id="mediaArtist">No artist yet</strong>
+              </div>
+              <div class="media-line">
+                <span class="meta-label">Title</span>
+                <strong id="mediaTitle">No title yet</strong>
+              </div>
+              <div class="media-line media-line-wide">
+                <span class="meta-label">Raw DLS text</span>
+                <p id="mediaText">Switch to DAB and tune a station to read metadata.</p>
+              </div>
+              <div class="status-line media-foot">
+                <span id="mediaUpdated">No metadata received yet.</span>
+                <span id="mediaHint">Artwork is not available from the open sample flow yet.</span>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section class="panel reveal delay-2">
