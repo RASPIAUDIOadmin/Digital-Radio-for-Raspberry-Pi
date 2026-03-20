@@ -83,6 +83,13 @@ PROP_DIGITAL_IO_OUTPUT_SAMPLE_RATE = 0x0201
 PROP_DIGITAL_IO_OUTPUT_FORMAT = 0x0202
 PROP_AUDIO_ANALOG_VOLUME = 0x0300
 PROP_AUDIO_MUTE = 0x0301
+PROP_AM_SEEK_BAND_BOTTOM = 0x4100
+PROP_AM_SEEK_BAND_TOP = 0x4101
+PROP_AM_SEEK_FREQUENCY_SPACING = 0x4102
+PROP_AM_VALID_RSSI_THRESHOLD = 0x4202
+PROP_AM_VALID_SNR_TIME = 0x4203
+PROP_AM_VALID_SNR_THRESHOLD = 0x4204
+PROP_AM_VALID_HDLEVEL_THRESHOLD = 0x4205
 PROP_FM_SEEK_BAND_BOTTOM = 0x3100
 PROP_FM_SEEK_BAND_TOP = 0x3101
 PROP_FM_SEEK_FREQUENCY_SPACING = 0x3102
@@ -160,6 +167,9 @@ LABEL_TO_INDEX: Dict[str, int] = {label: idx for idx, (label, _) in enumerate(DA
 FM_BAND_DEFAULT_MIN_KHZ = 87_500
 FM_BAND_DEFAULT_MAX_KHZ = 108_000
 FM_BAND_DEFAULT_STEP_KHZ = 100
+AM_BAND_DEFAULT_MIN_KHZ = 531
+AM_BAND_DEFAULT_MAX_KHZ = 1710
+AM_BAND_DEFAULT_STEP_KHZ = 9
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -722,6 +732,16 @@ class Si468xDabRadio:
         self.set_property(PROP_FM_VALID_SNR_TIME, 127)
         self.set_property(PROP_FM_VALID_HDLEVEL_THRESHOLD, 20)
 
+    def configure_amhd_frontend(self) -> None:
+        # Use the EU medium-wave band plan and the SDK-validity defaults.
+        self.set_property(PROP_AM_SEEK_BAND_BOTTOM, AM_BAND_DEFAULT_MIN_KHZ)
+        self.set_property(PROP_AM_SEEK_BAND_TOP, AM_BAND_DEFAULT_MAX_KHZ)
+        self.set_property(PROP_AM_SEEK_FREQUENCY_SPACING, AM_BAND_DEFAULT_STEP_KHZ)
+        self.set_property(PROP_AM_VALID_RSSI_THRESHOLD, 35)
+        self.set_property(PROP_AM_VALID_SNR_TIME, 40)
+        self.set_property(PROP_AM_VALID_SNR_THRESHOLD, 4)
+        self.set_property(PROP_AM_VALID_HDLEVEL_THRESHOLD, 0)
+
     def set_volume(self, level: int) -> int:
         """Set analog volume 0-63; returns clamped level."""
         level = max(0, min(63, level))
@@ -849,12 +869,12 @@ class Si468xDabRadio:
     def am_rsq_status(self, attune: bool = True, stcack: bool = False) -> Dict[str, int]:
         flags = (0x04 if attune else 0x00) | (0x01 if stcack else 0x00)
         self._write_command([CMD_AM_RSQ_STATUS, flags])
-        reply = self._read_reply(19)
+        reply = self._read_reply(30)
         readfreq_khz = int.from_bytes(reply[6:8], "little")
         return {
             "valid": bool(reply[5] & 0x01),
-            "rssi": reply[9],
-            "snr": reply[10],
+            "rssi": _signed_byte(reply[9]),
+            "snr": _signed_byte(reply[10]),
             "freqoff": _signed_byte(reply[8]),
             "freq_khz": readfreq_khz,
             "band_limit": bool(reply[5] & 0x02) if len(reply) > 5 else False,

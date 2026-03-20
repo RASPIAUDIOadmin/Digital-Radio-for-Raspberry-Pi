@@ -84,11 +84,13 @@ def _analog_score(status: Dict[str, Any]) -> int:
 
 
 def _station_sort_key(station: Dict[str, Any]) -> tuple[str, int, str]:
-    return (
-        str(station.get("label", "")).casefold(),
-        int(station.get("freq_khz") or 0),
-        str(station.get("station_id", "")),
-    )
+    band = str(station.get("band", "")).casefold()
+    label = str(station.get("label", "")).casefold()
+    freq_khz = int(station.get("freq_khz") or 0)
+    station_id = str(station.get("station_id", ""))
+    if band in {"fm", "am"}:
+        return (band, freq_khz, f"{label}\t{station_id}")
+    return (band, 0, f"{label}\t{freq_khz}\t{station_id}")
 
 
 def _sanitize_filename(value: str) -> str:
@@ -354,8 +356,11 @@ class RadioConfig:
     am_min_khz: int = 531
     am_max_khz: int = 1710
     am_step_khz: int = 9
-    am_rssi_min: int = 4
-    am_snr_min: int = 0
+    am_rssi_min: int = 20
+    am_snr_min: int = 4
+    am_peak_rssi_min: int = 10
+    am_peak_prominence: float = 5.0
+    am_peak_window_channels: int = 2
     am_hd_timeout_ms: int = 2500
     record_device: str = "auto"
     record_channels: int = 2
@@ -986,6 +991,8 @@ class RadioBackend:
                     radio.set_dab_freq_list(self._dab_freqs)
                 elif self._mode_info()["band"] == "fm":
                     radio.configure_fmhd_frontend()
+                elif self._mode_info()["band"] == "am":
+                    radio.configure_amhd_frontend()
                 self._radio = radio
                 self._booted = True
                 self._loaded_firmware = firmware_key
@@ -1217,6 +1224,8 @@ class RadioBackend:
         require_hd = scan_key in {"hd", "am_hd"}
         if band == "fm" and not require_hd:
             return self._scan_fm_clusters_locked()
+        if band == "am" and not require_hd:
+            return self._scan_am_peaks_locked()
         found: Dict[int, Dict[str, Any]] = {}
         for freq_khz in self._analog_scan_frequencies_locked(band, require_hd):
             station = self._probe_analog_station_locked(freq_khz, band, require_hd)
@@ -1226,6 +1235,51 @@ class RadioBackend:
             if existing is None or int(station.get("score", 0)) > int(existing.get("score", 0)):
                 found[station["freq_khz"]] = station
         return self._save_scan_file_locked(scan_key, list(found.values()))
+
+    def _scan_am_peaks_locked(self) -> List[Dict[str, Any]]:
+        radio = self._require_radio_locked()
+        samples: List[Dict[str, Any]] = []
+        for freq_khz in self._analog_scan_frequencies_locked("am", require_hd=False):
+            radio.am_tune(freq_khz, antcap=self.config.antcap, tune_mode=0)
+            time.sleep(0.25)
+            signal = self._merge_fmhd_status(radio.am_rsq_status(attune=True), radio.hd_digrad_status())
+            signal["freq_khz"] = int(signal.get("freq_khz") or freq_khz)
+            samples.append(signal)
+
+        stations: List[Dict[str, Any]] = []
+        window = max(1, int(self.config.am_peak_window_channels))
+        for index, signal in enumerate(samples):
+            rssi = int(signal.get("rssi", 0))
+            if rssi < int(self.config.am_peak_rssi_min):
+                continue
+            neighbors = samples[max(0, index - window):index] + samples[index + 1:index + window + 1]
+            if not neighbors:
+                continue
+            neighbor_rssi = [int(item.get("rssi", 0)) for item in neighbors]
+            if any(rssi < value for value in neighbor_rssi):
+                continue
+            prominence = rssi - (sum(neighbor_rssi) / len(neighbor_rssi))
+            if prominence < float(self.config.am_peak_prominence):
+                continue
+            freq_khz = int(signal.get("freq_khz") or 0)
+            radio.am_tune(freq_khz, antcap=self.config.antcap, tune_mode=0)
+            confirmed = self._wait_am_signal_locked(require_hd=False)
+            if confirmed is None:
+                continue
+            station = self._normalize_station(
+                "am",
+                {
+                    "freq_khz": freq_khz,
+                    "label": self._default_station_label("am", freq_khz, 0, False),
+                    "analog_available": True,
+                    "hd_available": False,
+                    "program_mask": 0,
+                    "program_id": 0,
+                },
+            )
+            station["score"] = _analog_score(confirmed)
+            stations.append(station)
+        return self._save_scan_file_locked("am", stations)
 
     def _scan_fm_clusters_locked(self) -> List[Dict[str, Any]]:
         cluster_window_khz = 200
@@ -1357,14 +1411,16 @@ class RadioBackend:
     def _wait_am_signal_locked(self, require_hd: bool) -> Optional[Dict[str, Any]]:
         radio = self._require_radio_locked()
         if not require_hd:
-            time.sleep(0.2)
+            time.sleep(0.35)
             best: Optional[Dict[str, Any]] = None
-            for _ in range(3):
+            for _ in range(5):
                 signal = self._merge_fmhd_status(radio.am_rsq_status(attune=True), radio.hd_digrad_status())
                 if best is None or signal["score"] > best["score"]:
                     best = signal
-                time.sleep(0.05)
+                time.sleep(0.08)
             if best and self._is_am_analog_ready(best):
+                return best
+            if best and int(best.get("snr", -128)) <= -120 and int(best.get("rssi", 0)) > 0:
                 return best
             return None
         deadline = time.time() + (self.config.am_hd_timeout_ms / 1000.0)
@@ -1390,7 +1446,13 @@ class RadioBackend:
         )
 
     def _is_am_analog_ready(self, signal: Dict[str, Any]) -> bool:
-        return int(signal.get("rssi", 0)) >= self.config.am_rssi_min and int(signal.get("snr", 0)) >= self.config.am_snr_min
+        if int(signal.get("snr", -128)) <= -120:
+            return int(signal.get("rssi", 0)) >= self.config.am_peak_rssi_min
+        return (
+            bool(signal.get("valid"))
+            and int(signal.get("rssi", 0)) >= self.config.am_rssi_min
+            and int(signal.get("snr", 0)) >= self.config.am_snr_min
+        )
 
     def _is_am_hd_ready(self, signal: Dict[str, Any]) -> bool:
         return (
