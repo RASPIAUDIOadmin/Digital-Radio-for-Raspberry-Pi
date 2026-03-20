@@ -53,25 +53,29 @@ function updateDabMedia(status) {
   const isDab = status.mode === "dab";
   const current = status.current_station || {};
   const hasText = Boolean(media.text || media.artist || media.title);
+  const hasArtwork = Boolean(media.artwork_url);
+  const mediaTimestamp = media.artwork_updated_at || media.updated_at;
 
   document.getElementById("mediaArtist").textContent = media.artist || (isDab ? "No artist yet" : "DAB only");
   document.getElementById("mediaTitle").textContent = media.title || (isDab ? "No title yet" : "DAB only");
   document.getElementById("mediaText").textContent = isDab
     ? media.text || "No DAB text received yet."
     : "Switch to DAB and tune a station to read metadata.";
-  document.getElementById("mediaUpdated").textContent = media.updated_at
-    ? `Updated: ${formatTimestamp(media.updated_at)}`
+  document.getElementById("mediaUpdated").textContent = mediaTimestamp
+    ? `Updated: ${formatTimestamp(mediaTimestamp)}`
     : (isDab ? "No metadata received yet." : "DAB metadata is inactive.");
   document.getElementById("mediaHint").textContent = isDab
-    ? "Artwork is not available from the open sample flow yet."
+    ? hasArtwork
+      ? "Slideshow image received from the current DAB station."
+      : "Waiting for slideshow image from the current DAB station."
     : "Artwork and DLS text are only available in DAB mode.";
 
   const statusPill = document.getElementById("mediaStatus");
-  statusPill.textContent = !isDab ? "DAB only" : hasText ? "Live text" : "Waiting";
+  statusPill.textContent = !isDab ? "DAB only" : hasArtwork && hasText ? "Artwork + text" : hasArtwork ? "Artwork" : hasText ? "Live text" : "Waiting";
 
   const artwork = document.getElementById("mediaArtwork");
   const fallback = document.getElementById("mediaArtworkFallback");
-  if (media.artwork_url) {
+  if (hasArtwork) {
     artwork.hidden = false;
     artwork.src = media.artwork_url;
     fallback.hidden = true;

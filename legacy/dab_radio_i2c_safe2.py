@@ -707,7 +707,8 @@ class Si468xDabRadio:
         # Interrupts: RECFG, RECFGWRN, SRVLIST
         self.set_property(PROP_DAB_EVENT_INTERRUPT_SOURCE, 0x00C1)
         self.set_property(PROP_DAB_VALID_RSSI_THRESHOLD, 6)
-        self.set_property(PROP_DAB_XPAD_ENABLE, 0x0001)
+        # Enable DLS plus DAB MOT/SLS packets so slideshow images can be read.
+        self.set_property(PROP_DAB_XPAD_ENABLE, 0x0005)
 
     def configure_fmhd_frontend(self) -> None:
         self.set_property(PROP_FM_TUNE_FE_VARM, 0xFD12)

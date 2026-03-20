@@ -43,6 +43,9 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             recordings = self.server.backend.get_recordings()
             self._send_ok({"recordings": recordings, "count": len(recordings)})
             return
+        if parsed.path == "/api/dab/artwork":
+            self._serve_dab_artwork()
+            return
         if parsed.path.startswith("/recordings/"):
             self._serve_recording(parsed.path)
             return
@@ -157,9 +160,23 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             return
         self._serve_file(file_path, cache_control="no-store")
 
+    def _serve_dab_artwork(self) -> None:
+        artwork = self.server.backend.get_dab_artwork()
+        if artwork is None:
+            self._send_error_json(404, "Artwork not available.")
+            return
+        self._serve_bytes(
+            artwork["content"],
+            artwork.get("content_type") or "application/octet-stream",
+            cache_control="no-store",
+        )
+
     def _serve_file(self, file_path: Path, cache_control: str = "no-cache") -> None:
         content = file_path.read_bytes()
         content_type, _ = mimetypes.guess_type(file_path.name)
+        self._serve_bytes(content, content_type or "application/octet-stream", cache_control=cache_control)
+
+    def _serve_bytes(self, content: bytes, content_type: str, cache_control: str = "no-cache") -> None:
         self.send_response(200)
         self.send_header("Content-Type", content_type or "application/octet-stream")
         self.send_header("Content-Length", str(len(content)))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import mimetypes
 import re
 import shutil
 import subprocess
@@ -44,6 +45,13 @@ SCAN_FILE_HEADER = "Automatically generated and machine read file, do not change
 FLASH_ADDR_FMHD = 0x00006000
 FLASH_ADDR_AMHD = 0x0011E000
 DAB_DATA_SRC_PAD_DLS = 0x02
+DAB_DATA_SRC_PAD_DATA = 0x01
+DAB_DSCTY_MOT = 60
+DAB_MOT_HEADER_PACKET = 0x73
+DAB_MOT_BODY_PACKET = 0x74
+MAX_DAB_MOT_OBJECTS = 8
+MAX_DAB_MOT_AGE_S = 45.0
+_MOT_IMAGE_NAME_RE = re.compile(rb"([A-Za-z0-9_.-]+\.(?:jpe?g|png|gif|bmp))", re.IGNORECASE)
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
@@ -95,6 +103,66 @@ def _empty_dab_media() -> Dict[str, Any]:
         "updated_at": None,
         "artwork_url": None,
         "artwork_supported": False,
+    }
+
+
+def _guess_image_content_type(filename: Optional[str]) -> Optional[str]:
+    if not filename:
+        return None
+    content_type, _ = mimetypes.guess_type(filename)
+    if content_type and content_type.startswith("image/"):
+        return content_type
+    return None
+
+
+def _extract_mot_filename(header_bytes: bytes) -> Optional[str]:
+    match = _MOT_IMAGE_NAME_RE.search(bytes(header_bytes or b""))
+    if match is None:
+        return None
+    return match.group(1).decode("ascii", errors="ignore")
+
+
+def _join_mot_segments(segments: Dict[int, bytes], last_index: Optional[int]) -> Optional[bytes]:
+    if last_index is None:
+        return None
+    if any(index not in segments for index in range(last_index + 1)):
+        return None
+    return b"".join(segments[index] for index in range(last_index + 1))
+
+
+def _extract_image_payload(payload: bytes, filename: Optional[str]) -> tuple[Optional[bytes], Optional[str]]:
+    blob = bytes(payload or b"")
+    for signature, content_type in ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png")):
+        offset = blob.find(signature)
+        if offset >= 0:
+            image = blob[offset:]
+            if content_type == "image/jpeg":
+                end = image.rfind(b"\xff\xd9")
+                if end >= 0:
+                    image = image[: end + 2]
+            return image, content_type
+    if filename:
+        guessed = _guess_image_content_type(filename)
+        if guessed and blob:
+            return blob, guessed
+    return None, None
+
+
+def _parse_mot_segment(payload: bytes) -> Optional[Dict[str, Any]]:
+    blob = bytes(payload or b"")
+    if len(blob) < 11:
+        return None
+    chunk_length = int.from_bytes(blob[7:9], "big")
+    chunk_end = 9 + chunk_length
+    if chunk_end + 2 > len(blob):
+        return None
+    segment_raw = int.from_bytes(blob[2:4], "big")
+    return {
+        "packet_type": blob[0],
+        "segment_index": segment_raw & 0x7FFF,
+        "is_last": bool(segment_raw & 0x8000),
+        "object_id": int.from_bytes(blob[4:7], "big"),
+        "chunk": blob[9:chunk_end],
     }
 
 
@@ -247,6 +315,11 @@ class RadioBackend:
         self._last_signal: Optional[Dict[str, Any]] = None
         self._last_error: Optional[str] = None
         self._dab_media: Dict[str, Any] = _empty_dab_media()
+        self._dab_artwork_bytes: Optional[bytes] = None
+        self._dab_artwork_content_type: Optional[str] = None
+        self._dab_artwork_name: Optional[str] = None
+        self._dab_artwork_updated_at: Optional[float] = None
+        self._dab_mot_objects: Dict[int, Dict[str, Any]] = {}
         self._stations: Dict[str, List[Dict[str, Any]]] = {key: [] for key in SCAN_KEYS}
         self._last_scan_count: Dict[str, int] = {key: 0 for key in SCAN_KEYS}
         self._last_scan_time: Dict[str, Optional[float]] = {key: None for key in SCAN_KEYS}
@@ -289,6 +362,16 @@ class RadioBackend:
     def get_recordings(self) -> List[Dict[str, Any]]:
         with self._lock:
             return self._list_recordings_locked()
+
+    def get_dab_artwork(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if not self._dab_artwork_bytes:
+                return None
+            return {
+                "content": bytes(self._dab_artwork_bytes),
+                "content_type": self._dab_artwork_content_type or "application/octet-stream",
+                "name": self._dab_artwork_name,
+            }
 
     def scan(self, force: bool = True) -> Dict[str, Any]:
         with self._lock:
@@ -434,7 +517,7 @@ class RadioBackend:
         self._current_mode = normalized
         self._current_station = None
         self._last_signal = None
-        self._dab_media = _empty_dab_media()
+        self._reset_dab_media_locked(clear_artwork=True)
 
     def _mode_info(self, mode: Optional[str] = None) -> Dict[str, Any]:
         return MODE_DEFS[mode or self._current_mode]
@@ -572,10 +655,15 @@ class RadioBackend:
     def _dab_media_payload_locked(self) -> Dict[str, Any]:
         payload = dict(self._dab_media)
         payload["updated_at"] = _iso_or_none(payload.get("updated_at"))
-        payload["available"] = bool(payload.get("text"))
+        payload["artwork_url"] = self._dab_artwork_url_locked()
+        payload["artwork_content_type"] = self._dab_artwork_content_type
+        payload["artwork_name"] = self._dab_artwork_name
+        payload["artwork_updated_at"] = _iso_or_none(self._dab_artwork_updated_at)
+        payload["artwork_supported"] = bool(payload.get("artwork_supported") or self._dab_artwork_bytes)
+        payload["available"] = bool(payload.get("text") or payload.get("artwork_url"))
         return payload
 
-    def _poll_dab_media_locked(self, max_packets: int = 6) -> None:
+    def _poll_dab_media_locked(self, max_packets: int = 16) -> None:
         station = self._current_station
         if station is None or station.get("mode") != "dab":
             return
@@ -605,9 +693,14 @@ class RadioBackend:
             return
         if int(packet.get("component_id") or 0) != int(station.get("component_id") or 0):
             return
-        if int(packet.get("data_src") or -1) != DAB_DATA_SRC_PAD_DLS:
-            return
         payload = bytes(packet.get("payload") or b"")
+        data_src = int(packet.get("data_src") or -1)
+        dscty = int(packet.get("dscty") or -1)
+        if data_src == DAB_DATA_SRC_PAD_DATA and dscty == DAB_DSCTY_MOT:
+            self._consume_dab_mot_packet_locked(payload)
+            return
+        if data_src != DAB_DATA_SRC_PAD_DLS:
+            return
         if len(payload) < 2:
             return
         prefix0 = payload[0]
@@ -625,12 +718,109 @@ class RadioBackend:
                 "toggle": 1 if (prefix0 & 0x80) else 0,
                 "updated_at": time.time(),
                 "artwork_url": None,
-                "artwork_supported": False,
+                "artwork_supported": bool(self._dab_media.get("artwork_supported") or self._dab_artwork_bytes),
             }
             return
         command_type = prefix0 & 0x0F
         if command_type == 0x01:
-            self._dab_media = _empty_dab_media()
+            self._reset_dab_media_locked(clear_artwork=False)
+
+    def _reset_dab_media_locked(self, clear_artwork: bool) -> None:
+        self._dab_media = _empty_dab_media()
+        if clear_artwork:
+            self._dab_artwork_bytes = None
+            self._dab_artwork_content_type = None
+            self._dab_artwork_name = None
+            self._dab_artwork_updated_at = None
+            self._dab_mot_objects = {}
+        elif self._dab_artwork_bytes:
+            self._dab_media["artwork_supported"] = True
+
+    def _dab_artwork_url_locked(self) -> Optional[str]:
+        if not self._dab_artwork_bytes:
+            return None
+        if self._dab_artwork_updated_at is None:
+            return "/api/dab/artwork"
+        return f"/api/dab/artwork?ts={int(self._dab_artwork_updated_at * 1000)}"
+
+    def _consume_dab_mot_packet_locked(self, payload: bytes) -> None:
+        mot = _parse_mot_segment(payload)
+        if mot is None:
+            return
+        self._dab_media["artwork_supported"] = True
+        now = time.time()
+        object_id = int(mot["object_id"])
+        entry = self._dab_mot_objects.get(object_id)
+        if entry is None:
+            entry = {
+                "header_segments": {},
+                "body_segments": {},
+                "header_last": None,
+                "body_last": None,
+                "filename": None,
+                "updated_at": now,
+            }
+            self._dab_mot_objects[object_id] = entry
+        entry["updated_at"] = now
+
+        packet_type = int(mot["packet_type"])
+        segment_index = int(mot["segment_index"])
+        if packet_type == DAB_MOT_HEADER_PACKET:
+            entry["header_segments"][segment_index] = bytes(mot["chunk"])
+            if mot["is_last"]:
+                entry["header_last"] = segment_index
+            header_bytes = _join_mot_segments(entry["header_segments"], entry["header_last"])
+            if header_bytes:
+                entry["filename"] = _extract_mot_filename(header_bytes) or entry.get("filename")
+        elif packet_type == DAB_MOT_BODY_PACKET:
+            entry["body_segments"][segment_index] = bytes(mot["chunk"])
+            if mot["is_last"]:
+                entry["body_last"] = segment_index
+            body_bytes = _join_mot_segments(entry["body_segments"], entry["body_last"])
+            if body_bytes:
+                header_bytes = _join_mot_segments(entry["header_segments"], entry["header_last"])
+                filename = entry.get("filename") or _extract_mot_filename(header_bytes or b"")
+                if filename:
+                    entry["filename"] = filename
+                image_bytes, content_type = _extract_image_payload(body_bytes, filename)
+                if image_bytes:
+                    self._set_dab_artwork_locked(image_bytes, content_type, filename)
+        self._prune_dab_mot_objects_locked(now)
+
+    def _set_dab_artwork_locked(
+        self,
+        image_bytes: bytes,
+        content_type: Optional[str],
+        filename: Optional[str],
+    ) -> None:
+        image = bytes(image_bytes or b"")
+        if not image:
+            return
+        effective_type = content_type or _guess_image_content_type(filename) or "application/octet-stream"
+        if self._dab_artwork_bytes == image and self._dab_artwork_content_type == effective_type:
+            return
+        self._dab_artwork_bytes = image
+        self._dab_artwork_content_type = effective_type
+        self._dab_artwork_name = filename
+        self._dab_artwork_updated_at = time.time()
+        self._dab_media["artwork_supported"] = True
+
+    def _prune_dab_mot_objects_locked(self, now: float) -> None:
+        stale_ids = [
+            object_id
+            for object_id, entry in self._dab_mot_objects.items()
+            if (now - float(entry.get("updated_at") or now)) > MAX_DAB_MOT_AGE_S
+        ]
+        for object_id in stale_ids:
+            self._dab_mot_objects.pop(object_id, None)
+        if len(self._dab_mot_objects) <= MAX_DAB_MOT_OBJECTS:
+            return
+        oldest = sorted(
+            self._dab_mot_objects.items(),
+            key=lambda item: float(item[1].get("updated_at") or 0.0),
+        )
+        for object_id, _ in oldest[: len(self._dab_mot_objects) - MAX_DAB_MOT_OBJECTS]:
+            self._dab_mot_objects.pop(object_id, None)
 
     def _normalize_station(self, scan_key: str, raw: Dict[str, Any]) -> Dict[str, Any]:
         mode_info = MODE_DEFS[scan_key]
@@ -851,7 +1041,7 @@ class RadioBackend:
         self._radio = None
         self._booted = False
         self._loaded_firmware = None
-        self._dab_media = _empty_dab_media()
+        self._reset_dab_media_locked(clear_artwork=True)
 
     def _require_radio_locked(self) -> Si468xDabRadio:
         if self._radio is None or not self._booted:
@@ -1143,7 +1333,7 @@ class RadioBackend:
                 )
             except Exception:
                 pass
-        self._dab_media = _empty_dab_media()
+        self._reset_dab_media_locked(clear_artwork=True)
         radio.dab_tune(int(station["freq_index"]), antcap=self.config.antcap)
         status = self._wait_dab_ready_locked(timeout_ms=max(self.config.lock_ms, 8000))
         if status is None:
@@ -1156,7 +1346,7 @@ class RadioBackend:
 
     def _play_analog_locked(self, station: Dict[str, Any]) -> None:
         radio = self._require_radio_locked()
-        self._dab_media = _empty_dab_media()
+        self._reset_dab_media_locked(clear_artwork=True)
         radio.set_property(PROP_AUDIO_MUTE, 0)
         band = station["band"]
         require_hd = station["mode"] in {"hd", "am_hd"}
