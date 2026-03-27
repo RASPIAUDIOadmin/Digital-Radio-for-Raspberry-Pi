@@ -28,6 +28,7 @@ The focus is simple:
 The whole project is open source:
 - GitHub: [RASPIAUDIOadmin/Digital-Radio-for-Raspberry-Pi](https://github.com/RASPIAUDIOadmin/Digital-Radio-for-Raspberry-Pi)
 - Product: [Raspiaudio Digital Radio Shield for Raspberry Pi](https://raspiaudio.com/product/digital-radio/)
+<li><a href="https://raspiaudio.com/product/digital-radio/" target="_blank" rel="noopener">Store </a></li>
 
 ## Quickstart
 
