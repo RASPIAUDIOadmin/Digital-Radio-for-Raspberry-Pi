@@ -1,10 +1,6 @@
 # Raspiaudio Digital Radio for Raspberry Pi
 
-<p align="center">
-  <a href="https://youtu.be/ORMRDO0aOpA">
-    <img src="https://img.youtube.com/vi/ORMRDO0aOpA/maxresdefault.jpg" width="700">
-  </a>
-</p>
+[![Watch the video](https://img.youtube.com/vi/ORMRDO0aOpA/hqdefault.jpg)](https://youtu.be/ORMRDO0aOpA)
 ![Raspiaudio Web UI](pic/webui.png)
 
 Add this shield to a Raspberry Pi Zero, 4 or 5 to install a fully local FM, DAB, AM and HD Radio (United States) receiver in minutes, listen without internet, record audio, and control everything from a polished web UI on your local network.
