@@ -23,7 +23,17 @@
           </div>
           <div class="hero-actions">
             <button id="scanButton" class="btn btn-primary">Scan stations</button>
+            <button id="restartServerButton" class="btn btn-secondary">Restart server</button>
             <button id="stopServerButton" class="btn btn-danger">Stop server</button>
+          </div>
+          <div class="hero-settings">
+            <label class="toggle-card" for="oledToggle">
+              <span class="toggle-copy">
+                <strong>OLED screen</strong>
+                <small id="oledStatusText">Use the local SSD1306 display and keep I2C bus 1 busy.</small>
+              </span>
+              <input id="oledToggle" type="checkbox" role="switch" aria-label="Enable OLED screen" />
+            </label>
           </div>
           <div class="hero-control-bar">
             <div class="hero-volume">

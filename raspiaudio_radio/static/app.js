@@ -10,6 +10,10 @@ const state = {
   volumeDebounce: null,
 };
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -100,6 +104,8 @@ function updateStatus(status) {
   const current = status.current_station || {};
   const signal = status.signal || {};
   const recording = status.recording || { active: false };
+  const oled = status.oled || {};
+  const oledRequested = oled.requested ?? oled.enabled;
 
   document.getElementById("signalScore").textContent = signal.score ?? 0;
   document.getElementById("currentStation").textContent = current.label || "No station";
@@ -121,6 +127,12 @@ function updateStatus(status) {
   document.getElementById("stationCount").textContent = state.stations.length;
   document.getElementById("favoriteCount").textContent = state.favorites.length;
   document.getElementById("recordingCount").textContent = status.recordings_count ?? state.recordings.length;
+  document.getElementById("oledToggle").checked = Boolean(oledRequested);
+  document.getElementById("oledStatusText").textContent = oledRequested
+    ? oled.error
+      ? `Screen requested on I2C bus ${oled.i2c_bus}. Last OLED error: ${oled.error}`
+      : `Screen enabled on I2C bus ${oled.i2c_bus}, address 0x${Number(oled.i2c_addr || 0).toString(16)}.`
+    : `Screen disabled. I2C bus ${oled.i2c_bus} is free for other accessories.`;
 
   const ampButton = document.getElementById("ampButton");
   ampButton.textContent = status.amp_enabled ? "Amplifier on" : "Amplifier off";
@@ -414,6 +426,23 @@ async function toggleRecord() {
   }
 }
 
+async function setOledEnabled(enabled) {
+  const toggle = document.getElementById("oledToggle");
+  toggle.disabled = true;
+  try {
+    const status = await api("/api/oled", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    updateStatus(status);
+  } catch (error) {
+    setError(error.message);
+    await refreshStatus();
+  } finally {
+    toggle.disabled = false;
+  }
+}
+
 async function stopServer() {
   const button = document.getElementById("stopServerButton");
   setBusy(button, true, "Stopping...");
@@ -437,13 +466,77 @@ async function stopServer() {
   }
 }
 
+function startPolling() {
+  if (state.pollingHandle) {
+    window.clearInterval(state.pollingHandle);
+  }
+  state.pollingHandle = window.setInterval(async () => {
+    await refreshStatus();
+    if (state.status?.recording?.active) {
+      await refreshRecordings();
+    }
+  }, 3000);
+}
+
+async function waitForServer(timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(1200);
+    try {
+      const status = await api("/api/status");
+      updateStatus(status);
+      await refreshStations(status.mode);
+      await refreshFavorites();
+      await refreshRecordings();
+      return;
+    } catch (error) {
+      // Retry until the server is back.
+    }
+  }
+  throw new Error("Server restart requested, but the UI could not reconnect within 30 seconds.");
+}
+
+async function restartServer() {
+  const button = document.getElementById("restartServerButton");
+  setBusy(button, true, "Restarting...");
+  if (state.pollingHandle) {
+    window.clearInterval(state.pollingHandle);
+    state.pollingHandle = null;
+  }
+  try {
+    try {
+      await api("/api/server/restart", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    } catch (error) {
+      setError(`Restart requested. Waiting for the service to come back. ${error.message}`);
+    }
+    const badge = document.getElementById("statusBadge");
+    badge.className = "status-badge status-ready";
+    badge.textContent = "Restarting";
+    document.getElementById("bootState").textContent = "Server restart requested. Reconnecting...";
+    await waitForServer();
+    startPolling();
+    setError("Server restarted.");
+  } catch (error) {
+    setError(error.message);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 function wireEvents() {
   document.getElementById("scanButton").addEventListener("click", scanStations);
+  document.getElementById("restartServerButton").addEventListener("click", restartServer);
   document.getElementById("stopServerButton").addEventListener("click", stopServer);
   document.getElementById("volumeDownButton").addEventListener("click", () => updateVolume({ delta: -2 }));
   document.getElementById("volumeUpButton").addEventListener("click", () => updateVolume({ delta: 2 }));
   document.getElementById("ampButton").addEventListener("click", toggleAmplifier);
   document.getElementById("recordButton").addEventListener("click", toggleRecord);
+  document.getElementById("oledToggle").addEventListener("change", (event) => {
+    setOledEnabled(Boolean(event.target.checked));
+  });
   document.getElementById("volumeSlider").addEventListener("input", (event) => {
     clearTimeout(state.volumeDebounce);
     state.volumeDebounce = window.setTimeout(() => {
@@ -462,12 +555,7 @@ function wireEvents() {
 async function init() {
   wireEvents();
   await refreshAll();
-  state.pollingHandle = window.setInterval(async () => {
-    await refreshStatus();
-    if (state.status?.recording?.active) {
-      await refreshRecordings();
-    }
-  }, 3000);
+  startPolling();
 }
 
 window.addEventListener("DOMContentLoaded", init);

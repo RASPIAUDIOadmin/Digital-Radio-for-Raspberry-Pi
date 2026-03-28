@@ -822,6 +822,7 @@ class RadioBackend:
         self._favorites: set[str] = set()
         self._recording_process: Optional[subprocess.Popen[str]] = None
         self._recording_meta: Optional[Dict[str, Any]] = None
+        self._oled_requested = bool(config.oled_enabled)
         self._dab_freqs = [freq for _, freq in DAB_BAND_III]
         self._dab_freq_index = {freq: idx for idx, freq in enumerate(self._dab_freqs)}
         self._load_scan_files_locked()
@@ -843,13 +844,7 @@ class RadioBackend:
                 "GPIO button navigation requested, but RPi.GPIO is unavailable. "
                 f"Import failed with: {_GPIO_IMPORT_ERROR}"
             )
-        self._oled = OledStatusDisplay(
-            enabled=config.oled_enabled,
-            bus_num=config.oled_i2c_bus,
-            address=config.oled_i2c_addr,
-            update_interval_s=config.oled_update_interval_s,
-            status_supplier=self._oled_snapshot,
-        )
+        self._oled = self._new_oled_locked(enabled=self._oled_requested)
         self._oled.start()
         atexit.register(self.close)
 
@@ -942,6 +937,17 @@ class RadioBackend:
                 self._amp.set_enabled(self._amp_requested)
             return self._status_payload_locked(refresh_signal=False)
 
+    def set_oled_enabled(self, enabled: bool) -> Dict[str, Any]:
+        with self._lock:
+            self._oled_requested = bool(enabled)
+            previous = self._oled
+            self._oled = self._new_oled_locked(enabled=self._oled_requested)
+            current = self._oled
+        previous.close()
+        current.start()
+        with self._lock:
+            return self._status_payload_locked(refresh_signal=False)
+
     def set_favorite(self, station_id: str, favorite: Optional[bool] = None) -> Dict[str, Any]:
         with self._lock:
             station_id = str(station_id).strip()
@@ -1028,6 +1034,15 @@ class RadioBackend:
             self._shutdown_locked(close_amp=True)
         button_nav.close()
         oled.close()
+
+    def _new_oled_locked(self, *, enabled: bool) -> OledStatusDisplay:
+        return OledStatusDisplay(
+            enabled=enabled,
+            bus_num=self.config.oled_i2c_bus,
+            address=self.config.oled_i2c_addr,
+            update_interval_s=self.config.oled_update_interval_s,
+            status_supplier=self._oled_snapshot,
+        )
 
     def _normalize_mode(self, mode: str) -> str:
         normalized = str(mode).strip().lower().replace("-", "_")
@@ -1155,6 +1170,7 @@ class RadioBackend:
                 "ccw_pin": self.config.nav_ccw_pin,
             },
             "oled": {
+                "requested": self._oled_requested,
                 "enabled": self._oled.enabled,
                 "i2c_bus": self.config.oled_i2c_bus,
                 "i2c_addr": self.config.oled_i2c_addr,

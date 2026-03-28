@@ -159,6 +159,10 @@ body::after {
   flex-wrap: wrap;
 }
 
+.hero-settings {
+  margin-top: 0.85rem;
+}
+
 .hero-control-bar {
   margin-top: 1rem;
   display: flex;
@@ -203,6 +207,40 @@ body::after {
 
 .hero-now span:last-child {
   color: rgba(47, 53, 66, 0.66);
+}
+
+.toggle-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  max-width: min(100%, 32rem);
+  padding: 0.95rem 1rem;
+  border-radius: 1.1rem;
+  border: 1px solid var(--brand-line);
+  background: linear-gradient(155deg, rgba(46, 102, 212, 0.08), rgba(255, 255, 255, 0.96));
+  box-shadow: 0 14px 26px rgba(46, 102, 212, 0.08);
+}
+
+.toggle-copy {
+  display: grid;
+  gap: 0.22rem;
+}
+
+.toggle-copy strong {
+  color: var(--brand-ink);
+}
+
+.toggle-copy small {
+  color: rgba(47, 53, 66, 0.68);
+  line-height: 1.35;
+}
+
+.toggle-card input[type="checkbox"] {
+  width: 1.2rem;
+  height: 1.2rem;
+  accent-color: var(--brand-blue);
+  flex: 0 0 auto;
 }
 
 .eyebrow {

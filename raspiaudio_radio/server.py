@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import sys
 from typing import Any, Dict, List
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -93,6 +96,9 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/amplifier":
                 self._send_ok(self.server.backend.set_amplifier(bool(body.get("enabled", False))))
                 return
+            if parsed.path == "/api/oled":
+                self._send_ok(self.server.backend.set_oled_enabled(bool(body.get("enabled", False))))
+                return
             if parsed.path == "/api/favorite":
                 self._send_ok(
                     self.server.backend.set_favorite(
@@ -115,6 +121,10 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/server/stop":
                 self._send_ok({"stopping": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            if parsed.path == "/api/server/restart":
+                self._send_ok({"restarting": True})
+                threading.Thread(target=_restart_process, args=(self.server,), daemon=True).start()
                 return
             self._send_error_json(404, "Unknown route.")
         except ValueError as exc:
@@ -272,6 +282,20 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             return "invalid"
         return (start, end)
+
+
+def _restart_process(server: RadioHTTPServer) -> None:
+    time.sleep(0.35)
+    try:
+        server.backend.close()
+    except Exception:
+        pass
+    try:
+        server.server_close()
+    except Exception:
+        pass
+    argv = [sys.executable, *sys.argv]
+    os.execv(sys.executable, argv)
 
 
 def _detect_local_ipv4_addresses() -> List[str]:
