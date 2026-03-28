@@ -12,7 +12,7 @@ import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from legacy.dab_radio_i2c_safe2 import (
     DAB_BAND_III,
@@ -32,6 +32,25 @@ except ImportError as exc:  # pragma: no cover - only relevant on the Pi
     _GPIO_IMPORT_ERROR = exc
 else:
     _GPIO_IMPORT_ERROR = None
+
+try:
+    from smbus2 import SMBus, i2c_msg  # type: ignore
+except ImportError as exc:  # pragma: no cover - only relevant on the Pi
+    SMBus = None
+    i2c_msg = None
+    _SMBUS_IMPORT_ERROR = exc
+else:
+    _SMBUS_IMPORT_ERROR = None
+
+try:
+    from PIL import Image, ImageDraw, ImageFont  # type: ignore
+except ImportError as exc:  # pragma: no cover - only relevant on the Pi
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+    _PIL_IMPORT_ERROR = exc
+else:
+    _PIL_IMPORT_ERROR = None
 
 MODE_DEFS: Dict[str, Dict[str, Any]] = {
     "dab": {"id": "dab", "label": "DAB", "band": "dab", "firmware": "dab", "scan_key": "dab", "tune_mode": None},
@@ -63,6 +82,7 @@ _AUTO_RECORD_DEVICE_NAMES = (
     "hw:CARD=si4689_i2s,DEV=0",
 )
 _AUTO_RECORD_DEVICE_HINTS = ("si4689", "adau7002", "i2s")
+OLED_LINE_WIDTH = 12
 
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
@@ -104,6 +124,30 @@ def _iso_or_none(timestamp: Optional[float]) -> Optional[str]:
     if timestamp is None:
         return None
     return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+
+
+def _compact_text(value: Any) -> str:
+    return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+
+
+def _truncate_text(value: Any, width: int) -> str:
+    text = _compact_text(value)
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+
+def _marquee_text(value: Any, width: int, tick: int) -> str:
+    text = _compact_text(value)
+    if len(text) <= width:
+        return text
+    spacer = "   "
+    loop = text + spacer
+    offset = tick % len(loop)
+    repeated = loop + loop
+    return repeated[offset: offset + width]
 
 
 def _empty_dab_media() -> Dict[str, Any]:
@@ -333,6 +377,18 @@ class RadioConfig:
     int_pin: Optional[int] = None
     amp_pin: Optional[int] = 17
     amp_active_high: bool = True
+    nav_cw_pin: Optional[int] = 5
+    nav_push_pin: Optional[int] = 6
+    nav_ccw_pin: Optional[int] = 13
+    nav_active_low: bool = True
+    nav_debounce_ms: int = 80
+    nav_combo_window_s: float = 0.7
+    nav_station_timeout_s: float = 1.5
+    nav_poll_interval_s: float = 0.02
+    oled_enabled: bool = True
+    oled_i2c_bus: int = 1
+    oled_i2c_addr: int = 0x3C
+    oled_update_interval_s: float = 0.35
     audio_out: str = "both"
     i2s_master: bool = False
     sample_rate: int = 48_000
@@ -410,6 +466,329 @@ class AmplifierGate:
         self.enabled = False
 
 
+class ButtonNavigator:
+    def __init__(
+        self,
+        cw_pin: Optional[int],
+        push_pin: Optional[int],
+        ccw_pin: Optional[int],
+        *,
+        active_low: bool,
+        debounce_ms: int,
+        poll_interval_s: float,
+        on_event: Callable[[str, float], None],
+    ) -> None:
+        self.cw_pin = cw_pin
+        self.push_pin = push_pin
+        self.ccw_pin = ccw_pin
+        self.active_low = bool(active_low)
+        self.debounce_s = max(0.01, float(debounce_ms) / 1000.0)
+        self.poll_interval_s = max(0.01, float(poll_interval_s))
+        self._on_event = on_event
+        self._pins = {"cw": self.cw_pin, "push": self.push_pin, "ccw": self.ccw_pin}
+        self.enabled = False
+        self._ready = False
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._pressed: Dict[str, bool] = {name: False for name in self._pins}
+        self._next_event_at: Dict[str, float] = {name: 0.0 for name in self._pins}
+
+    def start(self) -> bool:
+        if not all(pin is not None for pin in self._pins.values()):
+            self.enabled = False
+            return False
+        if GPIO is None:
+            self.enabled = False
+            return False
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        pull = GPIO.PUD_UP if self.active_low else GPIO.PUD_DOWN
+        for name, pin in self._pins.items():
+            assert pin is not None
+            GPIO.setup(pin, GPIO.IN, pull_up_down=pull)
+            self._pressed[name] = self._is_active(pin)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="button-nav", daemon=True)
+        self._thread.start()
+        self._ready = True
+        self.enabled = True
+        return True
+
+    def _is_active(self, pin: int) -> bool:
+        level = GPIO.input(pin) if GPIO is not None else 0
+        return level == (GPIO.LOW if self.active_low else GPIO.HIGH)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.poll_interval_s):
+            now = time.monotonic()
+            for name, pin in self._pins.items():
+                if pin is None:
+                    continue
+                active = self._is_active(pin)
+                if active and not self._pressed[name] and now >= self._next_event_at[name]:
+                    self._next_event_at[name] = now + self.debounce_s
+                    try:
+                        self._on_event(name, now)
+                    except Exception:
+                        pass
+                self._pressed[name] = active
+
+    def close(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        if self._ready and GPIO is not None:
+            for pin in self._pins.values():
+                if pin is None:
+                    continue
+                try:
+                    GPIO.cleanup(pin)
+                except Exception:
+                    pass
+        self._thread = None
+        self._ready = False
+        self.enabled = False
+
+
+class OledStatusDisplay:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        bus_num: int,
+        address: int,
+        update_interval_s: float,
+        status_supplier: Callable[[], Dict[str, Any]],
+    ) -> None:
+        self._requested = bool(enabled)
+        self.bus_num = int(bus_num)
+        self.address = int(address)
+        self.update_interval_s = max(0.2, float(update_interval_s))
+        self._status_supplier = status_supplier
+        self._bus: Optional[SMBus] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._last_lines: Optional[tuple[str, str]] = None
+        self._font_primary = None
+        self._font_secondary = None
+        self.error: Optional[str] = None
+        self.enabled = False
+
+    def start(self) -> bool:
+        if not self._requested:
+            return False
+        if SMBus is None or i2c_msg is None:
+            self.error = f"smbus2 unavailable: {_SMBUS_IMPORT_ERROR}"
+            return False
+        if Image is None or ImageDraw is None or ImageFont is None:
+            self.error = f"Pillow unavailable: {_PIL_IMPORT_ERROR}"
+            return False
+        self._font_primary, self._font_secondary = self._load_fonts()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="oled-status", daemon=True)
+        self._thread.start()
+        try:
+            self._ensure_ready()
+        except Exception as exc:
+            self.error = str(exc)
+        return True
+
+    def _ensure_ready(self) -> None:
+        if self.enabled:
+            return
+        last_error: Optional[Exception] = None
+        for _ in range(3):
+            try:
+                if self._bus is None:
+                    self._bus = SMBus(self.bus_num)
+                self._init_display()
+                self._clear()
+                self.enabled = True
+                self.error = None
+                return
+            except Exception as exc:
+                last_error = exc
+                try:
+                    if self._bus is not None:
+                        self._bus.close()
+                except Exception:
+                    pass
+                self._bus = None
+                time.sleep(0.15)
+        raise last_error or RuntimeError("OLED init failed")
+
+    def _load_fonts(self) -> tuple[Any, Any]:
+        assert ImageFont is not None
+        font_candidates = (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        )
+        for candidate in font_candidates:
+            try:
+                primary = ImageFont.truetype(candidate, 16)
+                secondary = ImageFont.truetype(candidate, 16)
+                return primary, secondary
+            except Exception:
+                continue
+        fallback = ImageFont.load_default()
+        return fallback, fallback
+
+    def _write_command(self, *values: int) -> None:
+        if self._bus is None or i2c_msg is None:
+            raise RuntimeError("OLED bus is not initialized.")
+        payload = bytes([0x00, *[int(value) & 0xFF for value in values]])
+        last_error: Optional[Exception] = None
+        for _ in range(3):
+            try:
+                self._bus.i2c_rdwr(i2c_msg.write(self.address, payload))
+                return
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.03)
+        raise last_error or RuntimeError("OLED command write failed")
+
+    def _write_data(self, data: bytes) -> None:
+        if self._bus is None or i2c_msg is None:
+            raise RuntimeError("OLED bus is not initialized.")
+        blob = bytes(data or b"")
+        for start in range(0, len(blob), 16):
+            chunk = blob[start:start + 16]
+            last_error: Optional[Exception] = None
+            for _ in range(3):
+                try:
+                    self._bus.i2c_rdwr(i2c_msg.write(self.address, bytes([0x40]) + chunk))
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    time.sleep(0.03)
+            if last_error is not None:
+                raise last_error
+
+    def _init_display(self) -> None:
+        self._write_command(
+            0xAE,
+            0xD5, 0x80,
+            0xA8, 0x1F,
+            0xD3, 0x00,
+            0x40,
+            0x8D, 0x14,
+            0x20, 0x00,
+            0xA1,
+            0xC8,
+            0xDA, 0x02,
+            0x81, 0x8F,
+            0xD9, 0xF1,
+            0xDB, 0x40,
+            0xA4,
+            0xA6,
+            0x2E,
+            0xAF,
+        )
+
+    def _clear(self) -> None:
+        self._show_buffer(bytes([0x00] * (128 * 4)))
+
+    def _show_buffer(self, buffer: bytes) -> None:
+        self._write_command(0x21, 0x00, 0x7F, 0x22, 0x00, 0x03)
+        self._write_data(buffer)
+
+    def _image_to_buffer(self, image: Any) -> bytes:
+        pixels = image.load()
+        buffer = bytearray(128 * 4)
+        for page in range(4):
+            for x in range(128):
+                value = 0
+                for bit in range(8):
+                    if pixels[x, (page * 8) + bit]:
+                        value |= 1 << bit
+                buffer[(page * 128) + x] = value
+        return bytes(buffer)
+
+    def _render_lines(self, lines: tuple[str, str]) -> None:
+        assert Image is not None and ImageDraw is not None
+        image = Image.new("1", (128, 32), 0)
+        draw = ImageDraw.Draw(image)
+        draw.text((0, 1), lines[0], font=self._font_primary, fill=255)
+        draw.text((0, 17), lines[1], font=self._font_secondary, fill=255)
+        self._show_buffer(self._image_to_buffer(image))
+
+    def _format_lines(self, snapshot: Dict[str, Any], tick: int) -> tuple[str, str]:
+        mode = _compact_text(snapshot.get("mode_label") or "RADIO").upper()
+        volume = int(snapshot.get("volume") or 0)
+        muted = bool(snapshot.get("muted"))
+        recording = bool(snapshot.get("recording_active"))
+        recording_elapsed = int(snapshot.get("recording_elapsed") or 0)
+        station_label = _compact_text(snapshot.get("station_label") or "")
+        if not station_label:
+            station_label = "Waiting for station" if snapshot.get("booted") else "Server ready"
+        meta = _compact_text(snapshot.get("dab_now") or snapshot.get("freq_label") or snapshot.get("last_error") or "")
+        if not meta:
+            meta = "Use Web UI or buttons"
+        signal = snapshot.get("signal") or {}
+        score = signal.get("score")
+        if recording:
+            status_text = f"REC {recording_elapsed}s"
+        elif muted:
+            status_text = f"{mode} MUTE"
+        elif score is not None:
+            status_text = f"{mode} V{volume:02d} S{int(score):02d}"
+        else:
+            status_text = f"{mode} V{volume:02d}"
+        page = (tick // 12) % 2
+        primary_source = station_label
+        if page == 1 and meta and meta.casefold() != station_label.casefold():
+            primary_source = meta
+        primary = _marquee_text(primary_source, OLED_LINE_WIDTH, tick)
+        secondary = _marquee_text(status_text, OLED_LINE_WIDTH, tick // 2)
+        return (primary, secondary)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.update_interval_s):
+            try:
+                if not self.enabled:
+                    self._ensure_ready()
+                snapshot = self._status_supplier()
+                tick = int(time.monotonic() / self.update_interval_s)
+                lines = self._format_lines(snapshot, tick)
+                if lines != self._last_lines:
+                    self._render_lines(lines)
+                    self._last_lines = lines
+            except Exception as exc:
+                self.error = str(exc)
+                self.enabled = False
+                self._last_lines = None
+                try:
+                    if self._bus is not None:
+                        self._bus.close()
+                except Exception:
+                    pass
+                self._bus = None
+
+    def close(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        if self._bus is not None:
+            try:
+                self._clear()
+            except Exception:
+                pass
+            try:
+                self._write_command(0xAE)
+            except Exception:
+                pass
+            try:
+                self._bus.close()
+            except Exception:
+                pass
+        self._bus = None
+        self._thread = None
+        self.enabled = False
+
+
 class RadioBackend:
     def __init__(self, config: RadioConfig) -> None:
         self.config = config
@@ -417,6 +796,7 @@ class RadioBackend:
         self._radio: Optional[Si468xDabRadio] = None
         self._amp = AmplifierGate(config.amp_pin, config.amp_active_high)
         self._amp_requested = True
+        self._muted = False
         self._booted = False
         self._loaded_firmware: Optional[str] = None
         self._audio_out_mode = config.audio_out if config.audio_out in VALID_AUDIO_OUT else "both"
@@ -425,6 +805,11 @@ class RadioBackend:
         self._current_volume = _clamp_int(config.default_volume, 0, 63)
         self._last_signal: Optional[Dict[str, Any]] = None
         self._last_error: Optional[str] = None
+        self._closing = False
+        self._nav_pending_push = False
+        self._nav_station_mode = False
+        self._nav_push_timer: Optional[threading.Timer] = None
+        self._nav_station_timer: Optional[threading.Timer] = None
         self._dab_media: Dict[str, Any] = _empty_dab_media()
         self._dab_artwork_bytes: Optional[bytes] = None
         self._dab_artwork_content_type: Optional[str] = None
@@ -442,6 +827,30 @@ class RadioBackend:
         self._load_scan_files_locked()
         self._load_favorites_locked()
         self.config.recordings_dir.mkdir(parents=True, exist_ok=True)
+        self._button_nav = ButtonNavigator(
+            config.nav_cw_pin,
+            config.nav_push_pin,
+            config.nav_ccw_pin,
+            active_low=config.nav_active_low,
+            debounce_ms=config.nav_debounce_ms,
+            poll_interval_s=config.nav_poll_interval_s,
+            on_event=self._handle_nav_button_event,
+        )
+        if not self._button_nav.start() and all(
+            pin is not None for pin in (config.nav_cw_pin, config.nav_push_pin, config.nav_ccw_pin)
+        ) and GPIO is None:
+            self._last_error = (
+                "GPIO button navigation requested, but RPi.GPIO is unavailable. "
+                f"Import failed with: {_GPIO_IMPORT_ERROR}"
+            )
+        self._oled = OledStatusDisplay(
+            enabled=config.oled_enabled,
+            bus_num=config.oled_i2c_bus,
+            address=config.oled_i2c_addr,
+            update_interval_s=config.oled_update_interval_s,
+            status_supplier=self._oled_snapshot,
+        )
+        self._oled.start()
         atexit.register(self.close)
 
     def boot(self, mode: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
@@ -609,9 +1018,16 @@ class RadioBackend:
                 raise
 
     def close(self) -> None:
+        button_nav = self._button_nav
+        oled = self._oled
         with self._lock:
+            self._closing = True
+            self._cancel_nav_push_timer_locked()
+            self._cancel_nav_station_timer_locked()
             self._stop_recording_locked()
             self._shutdown_locked(close_amp=True)
+        button_nav.close()
+        oled.close()
 
     def _normalize_mode(self, mode: str) -> str:
         normalized = str(mode).strip().lower().replace("-", "_")
@@ -726,9 +1142,24 @@ class RadioBackend:
             "firmware": self._loaded_firmware,
             "audio_out": self._audio_out_mode,
             "volume": self._current_volume,
+            "muted": self._muted,
             "amp_enabled": self._amp.enabled if self._booted else False,
             "amp_requested": self._amp_requested,
             "amp_pin": self.config.amp_pin,
+            "button_nav": {
+                "enabled": self._button_nav.enabled,
+                "mode": "station" if self._nav_station_mode else "volume",
+                "pending_push": self._nav_pending_push,
+                "cw_pin": self.config.nav_cw_pin,
+                "push_pin": self.config.nav_push_pin,
+                "ccw_pin": self.config.nav_ccw_pin,
+            },
+            "oled": {
+                "enabled": self._oled.enabled,
+                "i2c_bus": self.config.oled_i2c_bus,
+                "i2c_addr": self.config.oled_i2c_addr,
+                "error": self._oled.error,
+            },
             "current_station": self._decorate_station_locked(self._current_station) if self._current_station else None,
             "dab_media": self._dab_media_payload_locked(),
             "signal": dict(self._last_signal or {}),
@@ -741,6 +1172,39 @@ class RadioBackend:
             "recordings_count": len(self._list_recordings_locked()),
             "last_error": self._last_error,
         }
+
+    def _oled_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            self._refresh_recording_state_locked()
+            station = self._current_station or {}
+            signal = dict(self._last_signal or {})
+            recording = self._recording_payload_locked()
+            station_label = _compact_text(station.get("label") or "")
+            freq_khz = int(station.get("freq_khz") or 0)
+            if station.get("band") == "fm":
+                freq_label = f"{freq_khz / 1000.0:.1f} MHz" if freq_khz else ""
+            else:
+                freq_label = f"{freq_khz} kHz" if freq_khz else ""
+            dab_now = self._dab_media.get("text") or ""
+            if not dab_now:
+                title = _compact_text(self._dab_media.get("title") or "")
+                artist = _compact_text(self._dab_media.get("artist") or "")
+                dab_now = " - ".join(part for part in (title, artist) if part)
+            return {
+                "booted": self._booted,
+                "mode": self._current_mode,
+                "mode_label": self._mode_info()["label"],
+                "volume": self._current_volume,
+                "muted": self._muted,
+                "amp_enabled": self._amp.enabled if self._booted else False,
+                "station_label": station_label,
+                "freq_label": freq_label,
+                "dab_now": dab_now,
+                "recording_active": bool(recording.get("active")),
+                "recording_elapsed": int(round(float(recording.get("elapsed_seconds") or 0))),
+                "signal": signal,
+                "last_error": self._last_error,
+            }
 
     def _stations_for_mode_locked(self) -> List[Dict[str, Any]]:
         return self._stations[self._scan_key()]
@@ -1007,6 +1471,7 @@ class RadioBackend:
         radio = self._require_radio_locked()
         self._apply_audio_config_locked(radio)
         self._current_volume = radio.set_volume(self._current_volume)
+        self._apply_mute_locked(radio)
         self._amp.set_enabled(self._amp_requested)
         return self._status_payload_locked(refresh_signal=False)
 
@@ -1168,6 +1633,123 @@ class RadioBackend:
             sample_rate=self.config.sample_rate,
             sample_size=self.config.sample_size,
         )
+
+    def _apply_mute_locked(self, radio: Optional[Si468xDabRadio] = None) -> None:
+        target = self._require_radio_locked() if radio is None else radio
+        target.set_property(PROP_AUDIO_MUTE, 0x0003 if self._muted else 0x0000)
+
+    def _toggle_mute_locked(self) -> None:
+        self._boot_locked(force=False)
+        self._muted = not self._muted
+        self._apply_mute_locked()
+        self._last_error = None
+
+    def _step_volume_locked(self, delta: int) -> None:
+        self._boot_locked(force=False)
+        radio = self._require_radio_locked()
+        next_level = _clamp_int(self._current_volume + int(delta), 0, 63)
+        self._current_volume = radio.set_volume(next_level)
+        self._last_error = None
+
+    def _current_station_index_locked(self) -> Optional[int]:
+        station = self._current_station
+        if station is None:
+            return None
+        station_id = str(station.get("station_id") or "")
+        for index, candidate in enumerate(self._stations_for_mode_locked()):
+            if candidate.get("station_id") == station_id:
+                return index
+        return None
+
+    def _step_station_locked(self, delta: int) -> bool:
+        self._boot_locked(force=False)
+        stations = self._stations_for_mode_locked()
+        if not stations:
+            self._last_error = (
+                f"No saved {self._mode_info()['label']} stations available for button navigation. "
+                "Scan stations first."
+            )
+            return False
+        current_index = self._current_station_index_locked()
+        if current_index is None:
+            next_index = 0 if delta >= 0 else len(stations) - 1
+        else:
+            step = 1 if delta >= 0 else -1
+            next_index = (current_index + step) % len(stations)
+        station = dict(stations[next_index])
+        if self._current_mode == "dab":
+            self._play_dab_locked(station)
+        else:
+            self._play_analog_locked(station)
+        self._last_error = None
+        return True
+
+    def _cancel_nav_push_timer_locked(self) -> None:
+        timer = self._nav_push_timer
+        self._nav_push_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_nav_station_timer_locked(self) -> None:
+        timer = self._nav_station_timer
+        self._nav_station_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _arm_nav_push_timer_locked(self) -> None:
+        self._cancel_nav_push_timer_locked()
+        timer = threading.Timer(self.config.nav_combo_window_s, self._nav_push_timeout_fired)
+        timer.daemon = True
+        self._nav_push_timer = timer
+        timer.start()
+
+    def _arm_nav_station_timer_locked(self) -> None:
+        self._cancel_nav_station_timer_locked()
+        timer = threading.Timer(self.config.nav_station_timeout_s, self._nav_station_timeout_fired)
+        timer.daemon = True
+        self._nav_station_timer = timer
+        timer.start()
+
+    def _nav_push_timeout_fired(self) -> None:
+        with self._lock:
+            self._nav_push_timer = None
+            if self._closing or not self._nav_pending_push:
+                return
+            self._nav_pending_push = False
+            try:
+                self._toggle_mute_locked()
+            except Exception as exc:
+                self._last_error = f"Button mute failed: {exc}"
+
+    def _nav_station_timeout_fired(self) -> None:
+        with self._lock:
+            self._nav_station_timer = None
+            self._nav_station_mode = False
+
+    def _handle_nav_button_event(self, name: str, _event_time: float) -> None:
+        with self._lock:
+            if self._closing:
+                return
+            try:
+                if name == "push":
+                    self._nav_pending_push = True
+                    self._arm_nav_push_timer_locked()
+                    return
+                step = 1 if name == "cw" else -1
+                if self._nav_pending_push:
+                    self._nav_pending_push = False
+                    self._cancel_nav_push_timer_locked()
+                    if self._step_station_locked(step):
+                        self._nav_station_mode = True
+                        self._arm_nav_station_timer_locked()
+                    return
+                if self._nav_station_mode:
+                    if self._step_station_locked(step):
+                        self._arm_nav_station_timer_locked()
+                    return
+                self._step_volume_locked(step)
+            except Exception as exc:
+                self._last_error = f"Button navigation failed: {exc}"
 
     def _scan_dab_locked(self) -> List[Dict[str, Any]]:
         radio = self._require_radio_locked()
@@ -1510,12 +2092,13 @@ class RadioBackend:
         self._current_station = dict(station)
         self._last_signal = dict(status)
         self._last_signal["score"] = _dab_score(status)
+        self._apply_mute_locked(radio)
         self._poll_dab_media_locked()
 
     def _play_analog_locked(self, station: Dict[str, Any]) -> None:
         radio = self._require_radio_locked()
         self._reset_dab_media_locked(clear_artwork=True)
-        radio.set_property(PROP_AUDIO_MUTE, 0)
+        self._apply_mute_locked(radio)
         band = station["band"]
         require_hd = station["mode"] in {"hd", "am_hd"}
         tune_mode = 3 if band == "fm" and require_hd else 2 if band == "am" and require_hd else 0
@@ -1529,6 +2112,7 @@ class RadioBackend:
             raise RuntimeError(f"Failed to tune {station['label']}.")
         self._current_station = dict(station)
         self._last_signal = dict(signal)
+        self._apply_mute_locked(radio)
 
     def _read_current_signal_locked(self) -> Dict[str, Any]:
         radio = self._require_radio_locked()

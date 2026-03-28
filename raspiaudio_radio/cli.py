@@ -74,7 +74,20 @@ def _print_status(status: Dict[str, Any]) -> None:
     print(f"firmware: {status.get('firmware')}")
     print(f"audio_out: {status.get('audio_out')}")
     print(f"volume: {status.get('volume')}/63")
+    print(f"mute: {'on' if status.get('muted') else 'off'}")
     print(f"amplifier: {'on' if status.get('amp_enabled') else 'off'} (GPIO {status.get('amp_pin')})")
+    oled = status.get("oled") or {}
+    if oled.get("enabled"):
+        print(f"oled: on (I2C bus {oled.get('i2c_bus')} addr 0x{int(oled.get('i2c_addr') or 0):02X})")
+    elif oled.get("error"):
+        print(f"oled: unavailable ({oled.get('error')})")
+    button_nav = status.get("button_nav") or {}
+    if button_nav.get("enabled"):
+        print(
+            "buttons: "
+            f"{button_nav.get('mode')} mode "
+            f"(CW GPIO {button_nav.get('cw_pin')}, PUSH GPIO {button_nav.get('push_pin')}, CCW GPIO {button_nav.get('ccw_pin')})"
+        )
     print(f"station: {current.get('label', 'None')}")
     if signal:
         print(
@@ -182,6 +195,28 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--amp-pin", type=int, default=17, help="BCM GPIO used to enable the speaker amplifier")
     serve.add_argument("--disable-amp", action="store_true", help="Disable amplifier GPIO control")
     serve.add_argument("--amp-active-low", action="store_true", help="Treat amplifier GPIO as active-low")
+    serve.add_argument("--nav-cw-pin", type=int, default=5, help="BCM GPIO used for clockwise volume/station step")
+    serve.add_argument("--nav-push-pin", type=int, default=6, help="BCM GPIO used for push/mute combo")
+    serve.add_argument("--nav-ccw-pin", type=int, default=13, help="BCM GPIO used for counter-clockwise volume/station step")
+    serve.add_argument("--disable-nav-buttons", action="store_true", help="Disable the autonomous button navigation inputs")
+    serve.add_argument("--nav-active-high", action="store_true", help="Treat the navigation buttons as active-high instead of pull-up active-low")
+    serve.add_argument("--nav-debounce-ms", type=int, default=80, help="Debounce time for the navigation buttons (default: 80 ms)")
+    serve.add_argument(
+        "--nav-combo-window",
+        type=float,
+        default=0.7,
+        help="Delay after PUSH to decide between mute and station-navigation combo (default: 0.7 s)",
+    )
+    serve.add_argument(
+        "--nav-station-timeout",
+        type=float,
+        default=1.5,
+        help="Return to volume mode after this much station-navigation inactivity (default: 1.5 s)",
+    )
+    serve.add_argument("--disable-oled", action="store_true", help="Disable the 128x32 SSD1306 I2C status display")
+    serve.add_argument("--oled-bus", type=int, default=1, help="I2C bus used by the SSD1306 status display (default: 1)")
+    serve.add_argument("--oled-addr", type=lambda x: int(x, 0), default=0x3C, help="I2C address used by the SSD1306 status display (default: 0x3C)")
+    serve.add_argument("--oled-interval", type=float, default=0.35, help="OLED refresh interval in seconds (default: 0.35)")
     serve.add_argument("--audio-out", choices=["analog", "i2s", "both"], default="both")
     serve.add_argument("--i2s-master", dest="i2s_master", action="store_true", help="Si4689 drives BCLK/LRCLK")
     serve.add_argument("--i2s-slave", dest="i2s_master", action="store_false", help="Raspberry Pi drives BCLK/LRCLK (default)")
@@ -284,6 +319,17 @@ def main(argv: Optional[List[str]] = None) -> None:
             rst_pin=args.rst_pin,
             amp_pin=None if args.disable_amp else args.amp_pin,
             amp_active_high=not args.amp_active_low,
+            nav_cw_pin=None if args.disable_nav_buttons else args.nav_cw_pin,
+            nav_push_pin=None if args.disable_nav_buttons else args.nav_push_pin,
+            nav_ccw_pin=None if args.disable_nav_buttons else args.nav_ccw_pin,
+            nav_active_low=not args.nav_active_high,
+            nav_debounce_ms=args.nav_debounce_ms,
+            nav_combo_window_s=args.nav_combo_window,
+            nav_station_timeout_s=args.nav_station_timeout,
+            oled_enabled=not args.disable_oled,
+            oled_i2c_bus=args.oled_bus,
+            oled_i2c_addr=args.oled_addr,
+            oled_update_interval_s=args.oled_interval,
             audio_out=args.audio_out,
             i2s_master=args.i2s_master,
             sample_rate=args.sample_rate,
