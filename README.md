@@ -172,21 +172,44 @@ python radio.py serve --port 8686 --record-trim-seconds 0
 The CLI uses the same backend as the Web UI.
 
 That means you can control the radio manually from the terminal, or use the commands as a base for your own scripts and applications.
-just type to have the interactive mode:
+
+### Simple interactive CLI workflow
+
+Open a first terminal on the Raspberry Pi and start the local backend:
+
 ```bash
-python radio.py
+python radio.py serve --port 8686
 ```
 
-or start with a parameter
+Then keep a second terminal open and send commands interactively, one by one:
+
+```bash
+python radio.py status
+python radio.py stations --mode dab
+python radio.py play 0
+python radio.py volume 31
+python radio.py volume +2
+python radio.py amp on
+python radio.py record start
+python radio.py record stop
+python radio.py recordings
+```
+
+Useful examples:
+
 ```bash
 python radio.py boot --mode dab
 python radio.py scan --mode fm
 python radio.py stations --mode fm
-python radio.py play 0
-python radio.py volume +2
-python radio.py amp off
-python radio.py record start
-python radio.py recordings
+python radio.py play AIRZEN RADIO
+python radio.py play dab:0000f204:00000009:199360
+python radio.py favorite 0
+```
+
+To see all available commands:
+
+```bash
+python radio.py --help
 ```
 
 ## Repository layout
