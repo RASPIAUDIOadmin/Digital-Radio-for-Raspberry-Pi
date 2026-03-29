@@ -81,6 +81,10 @@ def _print_status(status: Dict[str, Any]) -> None:
         print(f"oled: on (I2C bus {oled.get('i2c_bus')} addr 0x{int(oled.get('i2c_addr') or 0):02X})")
     elif oled.get("error"):
         print(f"oled: unavailable ({oled.get('error')})")
+    system_service = status.get("system_service") or {}
+    if system_service.get("service"):
+        enabled_text = "on" if system_service.get("enabled") else "off"
+        print(f"start_with_system: {enabled_text} ({system_service.get('service')})")
     button_nav = status.get("button_nav") or {}
     if button_nav.get("enabled"):
         print(
@@ -187,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--am-hd-scan", type=Path, default=REPO_ROOT / "am_hd_scan.txt")
     serve.add_argument("--favorites-file", type=Path, default=REPO_ROOT / "favorites.json")
     serve.add_argument("--recordings-dir", type=Path, default=REPO_ROOT / "recordings")
+    serve.add_argument("--state-file", type=Path, default=REPO_ROOT / "runtime_state.json")
     serve.add_argument("--spi-bus", type=int, default=0)
     serve.add_argument("--spi-dev", type=int, default=0)
     serve.add_argument("--spi-speed", type=int, default=30_000_000)
@@ -312,6 +317,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             am_hd_scan_file=args.am_hd_scan.resolve(),
             favorites_file=args.favorites_file.resolve(),
             recordings_dir=args.recordings_dir.resolve(),
+            runtime_state_file=args.state_file.resolve(),
             spi_bus=args.spi_bus,
             spi_dev=args.spi_dev,
             spi_speed_hz=args.spi_speed,

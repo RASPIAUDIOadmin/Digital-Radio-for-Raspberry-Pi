@@ -106,6 +106,7 @@ function updateStatus(status) {
   const recording = status.recording || { active: false };
   const oled = status.oled || {};
   const oledRequested = oled.requested ?? oled.enabled;
+  const systemService = status.system_service || {};
 
   document.getElementById("signalScore").textContent = signal.score ?? 0;
   document.getElementById("currentStation").textContent = current.label || "No station";
@@ -133,6 +134,12 @@ function updateStatus(status) {
       ? `Screen requested on I2C bus ${oled.i2c_bus}. Last OLED error: ${oled.error}`
       : `Screen enabled on I2C bus ${oled.i2c_bus}, address 0x${Number(oled.i2c_addr || 0).toString(16)}.`
     : `Screen disabled. I2C bus ${oled.i2c_bus} is free for other accessories.`;
+  document.getElementById("systemAutostartToggle").checked = Boolean(systemService.enabled);
+  document.getElementById("systemAutostartText").textContent = systemService.error
+    ? `Autostart status for ${systemService.service || "service"} is unavailable: ${systemService.error}`
+    : systemService.enabled
+      ? `${systemService.service || "raspiaudio-radio.service"} is enabled for the next Raspberry Pi boot.`
+      : `${systemService.service || "raspiaudio-radio.service"} is disabled for the next Raspberry Pi boot.`;
 
   const ampButton = document.getElementById("ampButton");
   ampButton.textContent = status.amp_enabled ? "Amplifier on" : "Amplifier off";
@@ -443,6 +450,23 @@ async function setOledEnabled(enabled) {
   }
 }
 
+async function setSystemAutostart(enabled) {
+  const toggle = document.getElementById("systemAutostartToggle");
+  toggle.disabled = true;
+  try {
+    const status = await api("/api/system-autostart", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    updateStatus(status);
+  } catch (error) {
+    setError(error.message);
+    await refreshStatus();
+  } finally {
+    toggle.disabled = false;
+  }
+}
+
 async function stopServer() {
   const button = document.getElementById("stopServerButton");
   setBusy(button, true, "Stopping...");
@@ -536,6 +560,9 @@ function wireEvents() {
   document.getElementById("recordButton").addEventListener("click", toggleRecord);
   document.getElementById("oledToggle").addEventListener("change", (event) => {
     setOledEnabled(Boolean(event.target.checked));
+  });
+  document.getElementById("systemAutostartToggle").addEventListener("change", (event) => {
+    setSystemAutostart(Boolean(event.target.checked));
   });
   document.getElementById("volumeSlider").addEventListener("input", (event) => {
     clearTimeout(state.volumeDebounce);

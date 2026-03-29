@@ -367,6 +367,7 @@ class RadioConfig:
     am_hd_scan_file: Path
     favorites_file: Path
     recordings_dir: Path
+    runtime_state_file: Path
     i2c_bus: int = 1
     i2c_addr: int = 0x64
     spi_bus: int = 0
@@ -422,6 +423,7 @@ class RadioConfig:
     record_channels: int = 2
     record_format: str = "S16_LE"
     record_trim_leading_seconds: float = 3.0
+    system_service_name: str = "raspiaudio-radio.service"
 
 
 class AmplifierGate:
@@ -810,6 +812,8 @@ class RadioBackend:
         self._nav_station_mode = False
         self._nav_push_timer: Optional[threading.Timer] = None
         self._nav_station_timer: Optional[threading.Timer] = None
+        self._resume_timer: Optional[threading.Timer] = None
+        self._resume_attempts = 0
         self._dab_media: Dict[str, Any] = _empty_dab_media()
         self._dab_artwork_bytes: Optional[bytes] = None
         self._dab_artwork_content_type: Optional[str] = None
@@ -823,11 +827,21 @@ class RadioBackend:
         self._recording_process: Optional[subprocess.Popen[str]] = None
         self._recording_meta: Optional[Dict[str, Any]] = None
         self._oled_requested = bool(config.oled_enabled)
+        self._resume_station_id: Optional[str] = None
+        self._service_status_cache: Dict[str, Any] = {
+            "service": self.config.system_service_name,
+            "enabled": None,
+            "active": None,
+            "available": False,
+            "error": None,
+        }
+        self._service_status_updated_at = 0.0
         self._dab_freqs = [freq for _, freq in DAB_BAND_III]
         self._dab_freq_index = {freq: idx for idx, freq in enumerate(self._dab_freqs)}
         self._load_scan_files_locked()
         self._load_favorites_locked()
         self.config.recordings_dir.mkdir(parents=True, exist_ok=True)
+        self._load_runtime_state_locked()
         self._button_nav = ButtonNavigator(
             config.nav_cw_pin,
             config.nav_push_pin,
@@ -847,6 +861,8 @@ class RadioBackend:
         self._oled = self._new_oled_locked(enabled=self._oled_requested)
         self._oled.start()
         atexit.register(self.close)
+        with self._lock:
+            self._schedule_runtime_resume_locked(delay_s=2.0)
 
     def boot(self, mode: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
         with self._lock:
@@ -857,6 +873,7 @@ class RadioBackend:
     def set_mode(self, mode: str) -> Dict[str, Any]:
         with self._lock:
             self._set_mode_locked(mode)
+            self._save_runtime_state_locked()
             return self._boot_locked(force=False)
 
     def get_status(self) -> Dict[str, Any]:
@@ -918,6 +935,7 @@ class RadioBackend:
             else:
                 self._play_analog_locked(station)
             self._last_error = None
+            self._save_runtime_state_locked()
             return self._status_payload_locked(refresh_signal=True)
 
     def set_volume(self, *, level: Optional[int] = None, delta: Optional[int] = None) -> Dict[str, Any]:
@@ -928,6 +946,7 @@ class RadioBackend:
             if delta is not None:
                 next_level += int(delta)
             self._current_volume = radio.set_volume(_clamp_int(next_level, 0, 63))
+            self._save_runtime_state_locked()
             return self._status_payload_locked(refresh_signal=False)
 
     def set_amplifier(self, enabled: bool) -> Dict[str, Any]:
@@ -935,6 +954,7 @@ class RadioBackend:
             self._amp_requested = bool(enabled)
             if self._booted:
                 self._amp.set_enabled(self._amp_requested)
+            self._save_runtime_state_locked()
             return self._status_payload_locked(refresh_signal=False)
 
     def set_oled_enabled(self, enabled: bool) -> Dict[str, Any]:
@@ -946,6 +966,30 @@ class RadioBackend:
         previous.close()
         current.start()
         with self._lock:
+            self._save_runtime_state_locked()
+            return self._status_payload_locked(refresh_signal=False)
+
+    def set_start_with_system(self, enabled: bool) -> Dict[str, Any]:
+        with self._lock:
+            service_name = str(self.config.system_service_name or "").strip()
+            if not service_name:
+                raise RuntimeError("No systemd service is configured for autostart.")
+        command = ["sudo", "-n", "systemctl", "enable" if enabled else "disable", service_name]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Unable to update autostart for {service_name}: {exc}") from exc
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or f"systemctl exited with {result.returncode}").strip()
+            raise RuntimeError(f"Unable to {'enable' if enabled else 'disable'} {service_name}: {message}")
+        with self._lock:
+            self._refresh_system_service_status_locked(force=True)
             return self._status_payload_locked(refresh_signal=False)
 
     def set_favorite(self, station_id: str, favorite: Optional[bool] = None) -> Dict[str, Any]:
@@ -1030,6 +1074,8 @@ class RadioBackend:
             self._closing = True
             self._cancel_nav_push_timer_locked()
             self._cancel_nav_station_timer_locked()
+            self._cancel_resume_timer_locked()
+            self._save_runtime_state_locked()
             self._stop_recording_locked()
             self._shutdown_locked(close_amp=True)
         button_nav.close()
@@ -1043,6 +1089,63 @@ class RadioBackend:
             update_interval_s=self.config.oled_update_interval_s,
             status_supplier=self._oled_snapshot,
         )
+
+    def _refresh_system_service_status_locked(self, *, force: bool = False) -> Dict[str, Any]:
+        now = time.monotonic()
+        if not force and (now - self._service_status_updated_at) < 2.0:
+            return dict(self._service_status_cache)
+        service_name = str(self.config.system_service_name or "").strip()
+        status = {
+            "service": service_name,
+            "enabled": None,
+            "active": None,
+            "available": False,
+            "error": None,
+        }
+        if not service_name:
+            status["error"] = "No systemd service configured."
+            self._service_status_cache = status
+            self._service_status_updated_at = now
+            return dict(status)
+
+        try:
+            enabled_result = subprocess.run(
+                ["systemctl", "is-enabled", service_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+            active_result = subprocess.run(
+                ["systemctl", "is-active", service_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            status["error"] = str(exc)
+            self._service_status_cache = status
+            self._service_status_updated_at = now
+            return dict(status)
+
+        enabled_text = (enabled_result.stdout or enabled_result.stderr or "").strip().lower()
+        active_text = (active_result.stdout or active_result.stderr or "").strip().lower()
+        status["enabled"] = enabled_text == "enabled"
+        status["active"] = active_text == "active"
+        status["available"] = enabled_text not in {"", "not-found"} and active_text not in {"", "unknown"}
+        errors = []
+        if enabled_result.returncode not in {0, 1} and enabled_text not in {"disabled", "indirect", "static"}:
+            errors.append(enabled_text or f"is-enabled rc={enabled_result.returncode}")
+        if active_result.returncode not in {0, 3} and active_text not in {"inactive", "failed"}:
+            errors.append(active_text or f"is-active rc={active_result.returncode}")
+        if enabled_text == "not-found" or active_text == "unknown":
+            errors.append("systemd service not found")
+        if errors:
+            status["error"] = "; ".join(error for error in errors if error)
+        self._service_status_cache = status
+        self._service_status_updated_at = now
+        return dict(status)
 
     def _normalize_mode(self, mode: str) -> str:
         normalized = str(mode).strip().lower().replace("-", "_")
@@ -1137,6 +1240,98 @@ class RadioBackend:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(sorted(self._favorites), indent=2), encoding="utf-8")
 
+    def _load_runtime_state_locked(self) -> None:
+        path = self.config.runtime_state_file
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        mode = str(data.get("mode") or "").strip().lower()
+        if mode in MODE_DEFS:
+            self._current_mode = mode
+        if "volume" in data:
+            try:
+                self._current_volume = _clamp_int(int(data["volume"]), 0, 63)
+            except Exception:
+                pass
+        self._muted = bool(data.get("muted", self._muted))
+        self._amp_requested = bool(data.get("amp_requested", self._amp_requested))
+        self._oled_requested = bool(data.get("oled_requested", self._oled_requested))
+        station_id = str(data.get("station_id") or "").strip()
+        self._resume_station_id = station_id or None
+
+    def _save_runtime_state_locked(self) -> None:
+        path = self.config.runtime_state_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "mode": self._current_mode,
+            "volume": self._current_volume,
+            "muted": self._muted,
+            "amp_requested": self._amp_requested,
+            "oled_requested": self._oled_requested,
+            "station_id": (self._current_station or {}).get("station_id"),
+        }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _resume_runtime_state_locked(self) -> bool:
+        station_id = self._resume_station_id
+        if not station_id:
+            return False
+        station: Optional[Dict[str, Any]] = None
+        for scan_key in SCAN_KEYS:
+            for candidate in self._stations[scan_key]:
+                if candidate.get("station_id") == station_id:
+                    station = dict(candidate)
+                    break
+            if station is not None:
+                break
+        if station is None:
+            self._resume_station_id = None
+            return False
+        if station["mode"] != self._current_mode:
+            self._current_mode = station["mode"]
+        self._boot_locked(force=False)
+        if station["mode"] == "dab":
+            self._play_dab_locked(station)
+        else:
+            self._play_analog_locked(station)
+        self._resume_station_id = None
+        self._resume_attempts = 0
+        self._last_error = None
+        self._save_runtime_state_locked()
+        return True
+
+    def _cancel_resume_timer_locked(self) -> None:
+        timer = self._resume_timer
+        self._resume_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_runtime_resume_locked(self, delay_s: float = 2.0) -> None:
+        if self._closing or not self._resume_station_id or self._current_station is not None:
+            return
+        self._cancel_resume_timer_locked()
+        timer = threading.Timer(max(0.2, float(delay_s)), self._resume_runtime_timer_fired)
+        timer.daemon = True
+        self._resume_timer = timer
+        timer.start()
+
+    def _resume_runtime_timer_fired(self) -> None:
+        with self._lock:
+            self._resume_timer = None
+            if self._closing or not self._resume_station_id or self._current_station is not None:
+                return
+            self._resume_attempts += 1
+            try:
+                if self._resume_runtime_state_locked():
+                    return
+            except Exception as exc:
+                self._last_error = str(exc)
+            if self._resume_attempts < 4:
+                self._schedule_runtime_resume_locked(delay_s=2.0)
+
     def _status_payload_locked(self, refresh_signal: bool) -> Dict[str, Any]:
         self._refresh_recording_state_locked()
         if self._booted and self._current_station is not None and self._current_station.get("mode") == "dab":
@@ -1148,6 +1343,7 @@ class RadioBackend:
             except Exception as exc:
                 self._last_error = str(exc)
         scan_key = self._scan_key()
+        service_status = self._refresh_system_service_status_locked()
         return {
             "booted": self._booted,
             "transport": "spi",
@@ -1176,6 +1372,7 @@ class RadioBackend:
                 "i2c_addr": self.config.oled_i2c_addr,
                 "error": self._oled.error,
             },
+            "system_service": service_status,
             "current_station": self._decorate_station_locked(self._current_station) if self._current_station else None,
             "dab_media": self._dab_media_payload_locked(),
             "signal": dict(self._last_signal or {}),
@@ -1659,6 +1856,7 @@ class RadioBackend:
         self._muted = not self._muted
         self._apply_mute_locked()
         self._last_error = None
+        self._save_runtime_state_locked()
 
     def _step_volume_locked(self, delta: int) -> None:
         self._boot_locked(force=False)
@@ -1666,6 +1864,7 @@ class RadioBackend:
         next_level = _clamp_int(self._current_volume + int(delta), 0, 63)
         self._current_volume = radio.set_volume(next_level)
         self._last_error = None
+        self._save_runtime_state_locked()
 
     def _current_station_index_locked(self) -> Optional[int]:
         station = self._current_station
@@ -1698,6 +1897,7 @@ class RadioBackend:
         else:
             self._play_analog_locked(station)
         self._last_error = None
+        self._save_runtime_state_locked()
         return True
 
     def _cancel_nav_push_timer_locked(self) -> None:

@@ -99,6 +99,9 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/oled":
                 self._send_ok(self.server.backend.set_oled_enabled(bool(body.get("enabled", False))))
                 return
+            if parsed.path == "/api/system-autostart":
+                self._send_ok(self.server.backend.set_start_with_system(bool(body.get("enabled", False))))
+                return
             if parsed.path == "/api/favorite":
                 self._send_ok(
                     self.server.backend.set_favorite(
