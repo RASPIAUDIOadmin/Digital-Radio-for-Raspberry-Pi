@@ -145,6 +145,10 @@ function updateStatus(status) {
   ampButton.textContent = status.amp_enabled ? "Amplifier on" : "Amplifier off";
   ampButton.classList.toggle("is-on", Boolean(status.amp_enabled));
 
+  const muteButton = document.getElementById("muteButton");
+  muteButton.textContent = status.muted ? "Muted" : "Mute";
+  muteButton.classList.toggle("is-on", Boolean(status.muted));
+
   const recordButton = document.getElementById("recordButton");
   recordButton.textContent = recording.active ? "STOP" : "REC";
   recordButton.title = recording.active ? "Stop recording" : "Start recording";
@@ -419,6 +423,18 @@ async function toggleAmplifier() {
   }
 }
 
+async function toggleMute() {
+  try {
+    const status = await api("/api/mute", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    updateStatus(status);
+  } catch (error) {
+    setError(error.message);
+  }
+}
+
 async function toggleRecord() {
   try {
     const action = state.status?.recording?.active ? "stop" : "start";
@@ -556,6 +572,7 @@ function wireEvents() {
   document.getElementById("stopServerButton").addEventListener("click", stopServer);
   document.getElementById("volumeDownButton").addEventListener("click", () => updateVolume({ delta: -2 }));
   document.getElementById("volumeUpButton").addEventListener("click", () => updateVolume({ delta: 2 }));
+  document.getElementById("muteButton").addEventListener("click", toggleMute);
   document.getElementById("ampButton").addEventListener("click", toggleAmplifier);
   document.getElementById("recordButton").addEventListener("click", toggleRecord);
   document.getElementById("oledToggle").addEventListener("change", (event) => {

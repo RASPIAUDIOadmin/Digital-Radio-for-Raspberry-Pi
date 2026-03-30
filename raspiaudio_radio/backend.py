@@ -957,6 +957,15 @@ class RadioBackend:
             self._save_runtime_state_locked()
             return self._status_payload_locked(refresh_signal=False)
 
+    def set_muted(self, enabled: Optional[bool] = None) -> Dict[str, Any]:
+        with self._lock:
+            self._boot_locked(force=False)
+            self._muted = (not self._muted) if enabled is None else bool(enabled)
+            self._apply_mute_locked()
+            self._last_error = None
+            self._save_runtime_state_locked()
+            return self._status_payload_locked(refresh_signal=False)
+
     def set_oled_enabled(self, enabled: bool) -> Dict[str, Any]:
         with self._lock:
             self._oled_requested = bool(enabled)

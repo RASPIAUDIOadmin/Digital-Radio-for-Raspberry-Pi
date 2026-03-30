@@ -275,6 +275,9 @@ def build_parser() -> argparse.ArgumentParser:
     amp = subparsers.add_parser("amp", help="Turn the speaker amplifier on or off.")
     amp.add_argument("state", choices=["on", "off"])
 
+    mute = subparsers.add_parser("mute", help="Mute, unmute, or toggle audio.")
+    mute.add_argument("state", choices=["on", "off", "toggle"], nargs="?", default="toggle")
+
     favorite = subparsers.add_parser("favorite", help="Toggle or set favorite on a station.")
     favorite.add_argument("target", help="Station index in current mode, or station_id")
     favorite.add_argument("--off", action="store_true", help="Remove from favorites instead of toggling")
@@ -408,6 +411,12 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.command == "amp":
         status = _request(args.url, "POST", "/api/amplifier", {"enabled": args.state == "on"})
+        _print_status(status)
+        return
+
+    if args.command == "mute":
+        payload = {} if args.state == "toggle" else {"enabled": args.state == "on"}
+        status = _request(args.url, "POST", "/api/mute", payload)
         _print_status(status)
         return
 

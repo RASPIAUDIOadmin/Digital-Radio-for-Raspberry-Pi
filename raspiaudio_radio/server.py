@@ -96,6 +96,9 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/amplifier":
                 self._send_ok(self.server.backend.set_amplifier(bool(body.get("enabled", False))))
                 return
+            if parsed.path == "/api/mute":
+                self._send_ok(self.server.backend.set_muted(body.get("enabled")))
+                return
             if parsed.path == "/api/oled":
                 self._send_ok(self.server.backend.set_oled_enabled(bool(body.get("enabled", False))))
                 return
