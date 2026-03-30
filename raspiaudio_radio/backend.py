@@ -945,6 +945,9 @@ class RadioBackend:
             next_level = self._current_volume if level is None else int(level)
             if delta is not None:
                 next_level += int(delta)
+            if self._muted:
+                self._muted = False
+                self._apply_mute_locked(radio)
             self._current_volume = radio.set_volume(_clamp_int(next_level, 0, 63))
             self._save_runtime_state_locked()
             return self._status_payload_locked(refresh_signal=False)
@@ -1871,6 +1874,9 @@ class RadioBackend:
         self._boot_locked(force=False)
         radio = self._require_radio_locked()
         next_level = _clamp_int(self._current_volume + int(delta), 0, 63)
+        if self._muted:
+            self._muted = False
+            self._apply_mute_locked(radio)
         self._current_volume = radio.set_volume(next_level)
         self._last_error = None
         self._save_runtime_state_locked()
