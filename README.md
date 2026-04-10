@@ -234,6 +234,32 @@ The current radio backend is intentionally kept simple:
 - local browser control
 - I2S recording workflow
 
+## Flash boot notes
+
+Boot from external flash is now validated on the Raspberry Pi with the SI4689.
+
+In practice, flash boot is especially interesting when the host talks to the tuner over a slower control link such as I2C. With fast SPI host-load, the gain is smaller, because SPI host-load is already quite fast. With I2C, flash boot should save much more startup time.
+
+Validated flash programming sequence:
+- host-load `rom00_patch.016.bin`
+- erase chip with `0x05 0xFF 0xDE 0xC0`
+- write flash using `FLASH_WRITE_BLOCK` `0x05 0xF0 0x0C 0xED ...`
+
+Validation method:
+- tune to DAB multiplex `199360 kHz`
+- wait for `acq=true` and `valid=true`
+- confirm that the service list is readable after boot
+
+Benchmark measured on the Raspberry Pi on DAB `199360 kHz`, from reset to a valid DAB lock (`acq=true`, `valid=true`):
+
+| Control speed | Host-load over SPI | Flash boot mini | Flash boot full |
+| --- | ---: | ---: | ---: |
+| `30 MHz` | `2.37 s` | `1.14 s` | `2.40 s` |
+| `1 MHz` | `7.10 s` | `1.07 s` | `1.00 s` |
+| `500 kHz` | `12.57 s` | `1.16 s` | `0.99 s` |
+
+So, with the default fast SPI setup, host-load is already usable. The flash path becomes much more compelling when the host side is intentionally slowed down for debug, or when using a slower control interface such as I2C.
+
 ## Hardware notes
 
 Current shield-oriented defaults:
