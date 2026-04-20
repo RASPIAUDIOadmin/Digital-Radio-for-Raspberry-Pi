@@ -167,6 +167,81 @@ If you want to keep the full raw capture without trimming the first seconds:
 python radio.py serve --port 8686 --record-trim-seconds 0
 ```
 
+## Music Assistant integration
+
+The server can expose the shield as a live radio source for Music Assistant.
+
+The important endpoints are:
+
+```text
+http://piradio.local:8686/audio/live.mp3
+http://piradio.local:8686/audio/stations/<station_id>.mp3
+http://piradio.local:8686/api/station-streams?mode=dab
+http://piradio.local:8686/playlists/dab.m3u
+http://piradio.local:8686/playlists/favorites.m3u
+http://piradio.local:8686/api/live-metadata
+```
+
+How it works:
+
+- `/audio/live.mp3`
+  streams the currently tuned station
+- `/audio/stations/<station_id>.mp3`
+  retunes the hardware to the requested station and streams it
+- `/api/station-streams?mode=dab`
+  returns the available DAB stations with ready-to-use stream URLs
+- `/playlists/dab.m3u`
+  exports all DAB stations as a playlist
+- `/playlists/favorites.m3u`
+  exports only favorites
+- `/api/live-metadata`
+  returns the current DAB now-playing text and artwork URL as JSON
+
+Important limitation:
+
+- the shield is a single hardware tuner
+- starting a different station retunes the hardware for everyone
+
+### Add the live source to Music Assistant
+
+The simplest approach is to add the station URLs to the Builtin provider in Music Assistant.
+
+For example:
+
+```text
+http://piradio.local:8686/audio/stations/dab%3A0000f21b%3A00000001%3A195936.mp3
+```
+
+Or import the generated playlist:
+
+```text
+http://piradio.local:8686/playlists/dab.m3u
+```
+
+Once imported, Music Assistant can redistribute that terrestrial radio source to all supported players on the network.
+
+### Live metadata in the MP3 stream
+
+When a client requests ICY metadata, the live stream injects:
+
+- station name in the ICY headers
+- current DAB text as `StreamTitle`
+- current DAB artwork URL as `StreamUrl` when the multiplex provides MOT artwork
+
+This works especially well with Music Assistant because it reads ICY `StreamTitle` from radio streams and can surface the current song in the UI and on compatible players.
+
+Note:
+
+- Music Assistant reliably consumes `StreamTitle`
+- artwork handling depends on the downstream client and current Music Assistant support for the source type
+
+Example:
+
+```text
+StreamTitle='THE WEEKND - In Your Eyes';
+StreamUrl='http://piradio.local:8686/api/dab/artwork?ts=...';
+```
+
 ## CLI mode
 
 The CLI uses the same backend as the Web UI.
