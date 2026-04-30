@@ -484,6 +484,37 @@ class RadioBackend:
                 "name": self._dab_artwork_name,
             }
 
+    def prepare_stream(self, station_id: str) -> Dict[str, Any]:
+        with self._lock:
+            if shutil.which("arecord") is None:
+                raise RuntimeError("arecord is not installed on the Raspberry Pi.")
+            station = self._resolve_station_locked(index=None, label=None, station_id=station_id)
+            self.play(station_id=station["station_id"])
+            if self._audio_out_mode not in {"i2s", "both"}:
+                self._audio_out_mode = "both"
+                self._apply_audio_config_locked(self._require_radio_locked())
+            device = self._resolve_record_device_locked()
+            command = [
+                "arecord",
+                "-q",
+                "-D",
+                device,
+                "-f",
+                self.config.record_format,
+                "-r",
+                str(self.config.sample_rate),
+                "-c",
+                str(self.config.record_channels),
+                "-t",
+                "wav",
+                "-",
+            ]
+            return {
+                "station": self._decorate_station_locked(station),
+                "device": device,
+                "command": command,
+            }
+
     def scan(self, force: bool = True) -> Dict[str, Any]:
         with self._lock:
             self._boot_locked(force=False)

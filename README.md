@@ -92,7 +92,7 @@ The recommended workflow is the local Web UI.
 
 It gives you:
 - source mode selection
-- station scan
+- station scan/cache loading
 - station selection
 - favorites
 - amplifier on / off
@@ -112,6 +112,8 @@ Then open:
 ```text
 http://piradio.local:8686/
 ```
+
+The Web UI loads the existing scan cache when stations are already known. A full hardware scan can take several minutes on DAB because the receiver has to tune and wait on each DAB Band III channel.
 
 ## I2S recording on Raspberry Pi
 
@@ -185,6 +187,28 @@ python radio.py amp off
 python radio.py record start
 python radio.py recordings
 ```
+
+## Music Assistant and M3U playlists
+
+The HTTP server also exposes M3U playlists that can be imported by local music servers such as Music Assistant:
+
+```text
+http://piradio.local:8686/playlists/dab.m3u
+http://piradio.local:8686/playlists/fm.m3u
+http://piradio.local:8686/playlists/hd.m3u
+http://piradio.local:8686/playlists/am.m3u
+http://piradio.local:8686/playlists/am_hd.m3u
+http://piradio.local:8686/playlists/favorites.m3u
+http://piradio.local:8686/playlists/all.m3u
+```
+
+Each playlist entry points to:
+
+```text
+http://piradio.local:8686/stream.wav?station_id=...
+```
+
+When a client opens a stream URL, the server tunes the requested station and streams the Raspberry Pi I2S capture as WAV through `arecord`. This requires the I2S capture overlay and ALSA capture device described above. Only one station can be active at a time because the radio shield has one tuner.
 
 ## Repository layout
 

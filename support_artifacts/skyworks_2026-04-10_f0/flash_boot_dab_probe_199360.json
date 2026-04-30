@@ -1,0 +1,50 @@
+{
+  "target_freq_khz": 199360,
+  "target_index": 14,
+  "host": {
+    "ok": true,
+    "status": {
+      "fic_error": false,
+      "acq": true,
+      "valid": true,
+      "rssi": 38,
+      "snr": 252,
+      "fic_quality": 100,
+      "cnr": 11,
+      "tune_freq_hz": 199360,
+      "tune_index": 14
+    },
+    "service_count": 13
+  },
+  "flash_mini": {
+    "ok": true,
+    "status": {
+      "fic_error": false,
+      "acq": true,
+      "valid": true,
+      "rssi": 37,
+      "snr": 235,
+      "fic_quality": 100,
+      "cnr": 9,
+      "tune_freq_hz": 199360,
+      "tune_index": 14
+    },
+    "service_count": 13
+  },
+  "flash_full": {
+    "ok": true,
+    "status": {
+      "fic_error": false,
+      "acq": true,
+      "valid": true,
+      "rssi": 38,
+      "snr": 235,
+      "fic_quality": 100,
+      "cnr": 8,
+      "tune_freq_hz": 199360,
+      "tune_index": 14
+    },
+    "service_count": 10
+  },
+  "note": "This probe was run on the Raspberry Pi after programming flash with rom00_patch.016.bin host-loaded as bootstrap, erase chip 05 FF DE C0, and FLASH_WRITE_BLOCK 0xF0 writes."
+}

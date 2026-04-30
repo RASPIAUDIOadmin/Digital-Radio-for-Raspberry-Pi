@@ -19,29 +19,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 class RadioHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], backend: RadioBackend) -> None:
         self.backend = backend
-        self.stream_lock = threading.RLock()
-        self.active_stream_process: subprocess.Popen[bytes] | None = None
         super().__init__(server_address, RadioRequestHandler)
-
-    def replace_active_stream(self, process: subprocess.Popen[bytes] | None) -> subprocess.Popen[bytes] | None:
-        with self.stream_lock:
-            previous = self.active_stream_process
-            if previous is not None and previous.poll() is None:
-                previous.terminate()
-                try:
-                    previous.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    previous.kill()
-            self.active_stream_process = process
-            return previous
-
-    def stop_active_stream(self) -> None:
-        self.replace_active_stream(None)
-
-    def clear_active_stream(self, process: subprocess.Popen[bytes]) -> None:
-        with self.stream_lock:
-            if self.active_stream_process is process:
-                self.active_stream_process = None
 
 
 class RadioRequestHandler(BaseHTTPRequestHandler):
@@ -258,39 +236,36 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             return
         headers_sent = False
         try:
-            with self.server.stream_lock:
-                self.server.stop_active_stream()
-                stream = self.server.backend.prepare_stream(station_id)
-                process = subprocess.Popen(  # noqa: S603
-                    stream["command"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                self.server.replace_active_stream(process)
-                first_chunk = b""
-                if process.stdout is not None:
-                    readable, _, _ = select.select([process.stdout], [], [], 5.0)
-                    if readable:
-                        first_chunk = process.stdout.read(64 * 1024)
-                if not first_chunk:
-                    stderr = ""
-                    try:
-                        process.terminate()
-                        _, err = process.communicate(timeout=1.0)
-                        stderr = err.decode("utf-8", errors="replace").strip() if err else ""
-                    except Exception:
-                        process.kill()
-                    message = f"Audio stream failed to start on ALSA device {stream['device']}."
-                    if stderr:
-                        message += f" Details: {stderr}"
-                    self._send_error_json(500, message, send_body=send_body)
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/wav")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                headers_sent = True
+            stream = self.server.backend.prepare_stream(station_id)
+            process = subprocess.Popen(  # noqa: S603
+                stream["command"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            first_chunk = b""
+            if process.stdout is not None:
+                readable, _, _ = select.select([process.stdout], [], [], 5.0)
+                if readable:
+                    first_chunk = process.stdout.read(64 * 1024)
+            if not first_chunk:
+                stderr = ""
+                try:
+                    process.terminate()
+                    _, err = process.communicate(timeout=1.0)
+                    stderr = err.decode("utf-8", errors="replace").strip() if err else ""
+                except Exception:
+                    process.kill()
+                message = f"Audio stream failed to start on ALSA device {stream['device']}."
+                if stderr:
+                    message += f" Details: {stderr}"
+                self._send_error_json(500, message, send_body=send_body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            headers_sent = True
             if not send_body:
                 process.terminate()
                 return
@@ -316,8 +291,6 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
                     process.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     process.kill()
-            if "process" in locals():
-                self.server.clear_active_stream(process)
 
     def _external_base_url(self) -> str:
         proto = self.headers.get("X-Forwarded-Proto", "http").split(",", 1)[0].strip() or "http"

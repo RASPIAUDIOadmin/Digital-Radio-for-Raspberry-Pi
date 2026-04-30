@@ -25,9 +25,11 @@ async function api(path, options = {}) {
 function setBusy(button, busy, label) {
   if (!button) return;
   button.disabled = busy;
-  if (label) {
+  if (busy && label) {
     button.dataset.originalLabel ||= button.textContent;
-    button.textContent = busy ? label : button.dataset.originalLabel;
+    button.textContent = label;
+  } else if (!busy && button.dataset.originalLabel) {
+    button.textContent = button.dataset.originalLabel;
   }
 }
 
