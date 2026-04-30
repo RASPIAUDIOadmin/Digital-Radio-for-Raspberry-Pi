@@ -171,6 +171,10 @@ python radio.py serve --port 8686 --record-trim-seconds 0
 
 The server can expose the shield as a live radio source for Music Assistant.
 
+Music Assistant stream URLs require the SI4689 I2S audio capture device to be installed on the Raspberry Pi.
+The server captures `si4689_i2s` through ALSA and uses `ffmpeg` to expose MP3 streams over HTTP.
+Install the I2S overlay described in [I2S recording on Raspberry Pi](#i2s-recording-on-raspberry-pi) before using `/audio/live.mp3`, station stream URLs, or generated playlists.
+
 The important endpoints are:
 
 ```text
@@ -353,7 +357,7 @@ Current shield-oriented defaults:
 On Raspberry Pi OS:
 
 ```bash
-sudo apt install python3-spidev python3-rpi.gpio python3-smbus2 alsa-utils
+sudo apt install python3-spidev python3-rpi.gpio python3-smbus2 alsa-utils ffmpeg
 ```
 
 ## Open source and reusable
