@@ -73,6 +73,7 @@ MAX_DAB_MOT_OBJECTS = 8
 MAX_DAB_MOT_AGE_S = 45.0
 _MOT_IMAGE_NAME_RE = re.compile(rb"([A-Za-z0-9_.-]+\.(?:jpe?g|png|gif|bmp))", re.IGNORECASE)
 _ARECORD_CARD_RE = re.compile(r"^card\s+\d+:\s+(?P<card>[^\s]+)\s+\[.*?\],\s+device\s+(?P<device>\d+):")
+_ALSA_DEVICE_CARD_RE = re.compile(r"(?:^|:)CARD=(?P<card>[^,]+)")
 _AUTO_RECORD_DEVICE_NAMES = (
     "plughw:CARD=si4689i2s,DEV=0",
     "plughw:CARD=si4689_i2s,DEV=0",
@@ -252,7 +253,7 @@ def _infer_artist_title(text: str) -> tuple[Optional[str], Optional[str]]:
         if separator in cleaned:
             left, right = [part.strip() for part in cleaned.split(separator, 1)]
             if left and right:
-                return right, left
+                return left, right
     match = re.match(r"^(?P<title>.+?)\s+by\s+(?P<artist>.+)$", cleaned, flags=re.IGNORECASE)
     if match:
         return match.group("artist").strip(), match.group("title").strip()
@@ -313,6 +314,42 @@ def _auto_detect_record_device() -> str:
         if any(hint in lowered for hint in _AUTO_RECORD_DEVICE_HINTS):
             return candidate
     return "default"
+
+
+def _extract_alsa_card_name(device: str) -> Optional[str]:
+    match = _ALSA_DEVICE_CARD_RE.search(str(device or ""))
+    if match is None:
+        return None
+    return match.group("card")
+
+
+def _resolve_shared_capture_device(device: str) -> str:
+    named_devices = _list_arecord_named_devices()
+    configured = str(device or "").strip()
+    if configured in named_devices and configured.startswith("dsnoop:"):
+        return configured
+
+    card_name = _extract_alsa_card_name(configured)
+    if card_name:
+        prefix = f"dsnoop:CARD={card_name},DEV="
+        for candidate in named_devices:
+            if candidate.startswith(prefix):
+                return candidate
+
+    hinted_dsnoop_devices = [
+        candidate
+        for candidate in named_devices
+        if candidate.startswith("dsnoop:")
+        and any(hint in candidate.casefold() for hint in _AUTO_RECORD_DEVICE_HINTS)
+    ]
+    if hinted_dsnoop_devices:
+        return hinted_dsnoop_devices[0]
+
+    dsnoop_devices = [candidate for candidate in named_devices if candidate.startswith("dsnoop:")]
+    if len(dsnoop_devices) == 1:
+        return dsnoop_devices[0]
+
+    return configured or "default"
 
 
 def _wav_duration_seconds(file_path: Path) -> Optional[float]:
@@ -905,6 +942,15 @@ class RadioBackend:
                 "name": self._dab_artwork_name,
             }
 
+    def get_live_stream_metadata(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._booted and self._current_station and self._current_station.get("mode") == "dab":
+                self._poll_dab_media_locked()
+            return {
+                "station": self._decorate_station_locked(self._current_station) if self._current_station else None,
+                "dab_media": self._dab_media_payload_locked(),
+            }
+
     def scan(self, force: bool = True) -> Dict[str, Any]:
         with self._lock:
             self._boot_locked(force=False)
@@ -925,17 +971,7 @@ class RadioBackend:
     ) -> Dict[str, Any]:
         with self._lock:
             station = self._resolve_station_locked(index=index, label=label, station_id=station_id)
-            if station["mode"] != self._current_mode:
-                self._set_mode_locked(station["mode"])
-            self._boot_locked(force=False)
-            if not self._stations_for_mode_locked():
-                self.scan(force=False)
-            if self._current_mode == "dab":
-                self._play_dab_locked(station)
-            else:
-                self._play_analog_locked(station)
-            self._last_error = None
-            self._save_runtime_state_locked()
+            self._ensure_station_playing_locked(station)
             return self._status_payload_locked(refresh_signal=True)
 
     def set_volume(self, *, level: Optional[int] = None, delta: Optional[int] = None) -> Dict[str, Any]:
@@ -1394,6 +1430,16 @@ class RadioBackend:
             "last_scan_count": self._last_scan_count[scan_key],
             "last_scan_time": _iso_or_none(self._last_scan_time[scan_key]),
             "recording": self._recording_payload_locked(),
+            "live_stream": {
+                "supported": shutil.which("ffmpeg") is not None,
+                "path": "/audio/live.mp3",
+                "ready": self._current_station is not None,
+                "station_path_template": "/audio/stations/{station_id}.mp3",
+                "playlist_paths": {
+                    "dab": "/playlists/dab.m3u",
+                    "favorites": "/playlists/favorites.m3u",
+                },
+            },
             "recordings_count": len(self._list_recordings_locked()),
             "last_error": self._last_error,
         }
@@ -2304,6 +2350,23 @@ class RadioBackend:
             raise ValueError(f"Station not found: {label}")
         raise ValueError("One of index, label or station_id is required.")
 
+    def _ensure_station_playing_locked(self, station: Dict[str, Any]) -> Dict[str, Any]:
+        if station["mode"] != self._current_mode:
+            self._set_mode_locked(station["mode"])
+        self._boot_locked(force=False)
+        if not self._stations_for_mode_locked():
+            self.scan(force=False)
+        current_station_id = str(self._current_station.get("station_id")) if self._current_station else None
+        if current_station_id == station["station_id"]:
+            return dict(self._current_station or station)
+        if self._current_mode == "dab":
+            self._play_dab_locked(station)
+        else:
+            self._play_analog_locked(station)
+        self._last_error = None
+        self._save_runtime_state_locked()
+        return dict(self._current_station or station)
+
     def _play_dab_locked(self, station: Dict[str, Any]) -> None:
         radio = self._require_radio_locked()
         if self._current_station and self._current_station.get("mode") == "dab":
@@ -2455,6 +2518,45 @@ class RadioBackend:
         if configured and configured.casefold() != "auto":
             return configured
         return _auto_detect_record_device()
+
+    def _resolve_live_stream_device_locked(self) -> str:
+        return _resolve_shared_capture_device(self._resolve_record_device_locked())
+
+    def prepare_live_stream(self, station_id: Optional[str] = None, auto_tune: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            return self._prepare_live_stream_locked(station_id=station_id, auto_tune=auto_tune)
+
+    def _prepare_live_stream_locked(
+        self,
+        *,
+        station_id: Optional[str] = None,
+        auto_tune: bool = False,
+    ) -> Dict[str, Any]:
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg is not installed on the Raspberry Pi.")
+        self._boot_locked(force=False)
+        selected_station: Optional[Dict[str, Any]] = None
+        if station_id:
+            selected_station = self._resolve_station_locked(index=None, label=None, station_id=station_id)
+            if auto_tune:
+                selected_station = self._ensure_station_playing_locked(selected_station)
+        elif self._current_station is not None:
+            selected_station = dict(self._current_station)
+        if selected_station is None:
+            raise RuntimeError("Tune a station before requesting the live stream.")
+        if self._audio_out_mode not in {"i2s", "both"}:
+            self._audio_out_mode = "both"
+            self._apply_audio_config_locked(self._require_radio_locked())
+        return {
+            "device": self._resolve_live_stream_device_locked(),
+            "sample_rate": self.config.sample_rate,
+            "channels": self.config.record_channels,
+            "format": self.config.record_format,
+            "ffmpeg_input_format": str(self.config.record_format).replace("_", "").lower(),
+            "station_label": selected_station["label"],
+            "station_id": selected_station["station_id"],
+            "mode": selected_station["mode"],
+        }
 
     def _stop_recording_locked(self) -> None:
         if self._recording_process is None:

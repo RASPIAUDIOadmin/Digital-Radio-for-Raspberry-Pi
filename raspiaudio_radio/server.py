@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import mimetypes
 import os
+import re
 import socket
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
 from typing import Any, Dict, List
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .backend import RadioBackend, RadioConfig
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+ICY_META_INTERVAL = 16 * 1024
+ICY_METADATA_POLL_INTERVAL_S = 1.0
+_ARECORD_AVAILABLE_FORMAT_RE = re.compile(r"^\s*-\s*(?P<format>[A-Z0-9_]+)\s*$")
 
 
 class RadioHTTPServer(ThreadingHTTPServer):
@@ -51,12 +57,28 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             favorites = self.server.backend.get_favorites()
             self._send_ok({"stations": favorites, "count": len(favorites)}, send_body=send_body)
             return
+        if parsed.path == "/api/station-streams":
+            self._serve_station_streams(query=query, send_body=send_body)
+            return
+        if parsed.path == "/api/live-metadata":
+            self._serve_live_metadata(send_body=send_body)
+            return
         if parsed.path == "/api/recordings":
             recordings = self.server.backend.get_recordings()
             self._send_ok({"recordings": recordings, "count": len(recordings)}, send_body=send_body)
             return
         if parsed.path == "/api/dab/artwork":
             self._serve_dab_artwork(send_body=send_body)
+            return
+        if parsed.path == "/audio/live.mp3":
+            station_id = query.get("station_id", [None])[0]
+            self._serve_live_audio(send_body=send_body, station_id=station_id)
+            return
+        if parsed.path.startswith("/audio/stations/") and parsed.path.endswith(".mp3"):
+            self._serve_station_audio(parsed.path, send_body=send_body)
+            return
+        if parsed.path.startswith("/playlists/") and parsed.path.endswith(".m3u"):
+            self._serve_m3u_playlist(parsed.path, send_body=send_body)
             return
         if parsed.path.startswith("/recordings/"):
             self._serve_recording(parsed.path, send_body=send_body)
@@ -197,6 +219,388 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             cache_control="no-store",
             send_body=send_body,
         )
+
+    def _request_base_url(self) -> str:
+        host = (self.headers.get("Host") or "").strip()
+        if host:
+            return f"http://{host}"
+        bind_host, port = self.server.server_address[:2]
+        host_name = str(bind_host or "127.0.0.1")
+        if host_name in {"0.0.0.0", "::"}:
+            host_name = "127.0.0.1"
+        return f"http://{host_name}:{port}"
+
+    def _absolute_url(self, path: str) -> str:
+        return f"{self._request_base_url()}{path if path.startswith('/') else '/' + path}"
+
+    def _station_stream_path(self, station_id: str) -> str:
+        return f"/audio/stations/{quote(str(station_id), safe='')}.mp3"
+
+    def _playlist_path(self, mode: str | None = None, favorites_only: bool = False) -> str:
+        if favorites_only:
+            return "/playlists/favorites.m3u"
+        playlist_mode = str(mode or "dab").strip().lower().replace("-", "_")
+        return f"/playlists/{playlist_mode}.m3u"
+
+    def _station_stream_entries(self, mode: str | None = None, favorites_only: bool = False) -> List[Dict[str, Any]]:
+        stations = self.server.backend.get_favorites() if favorites_only else self.server.backend.get_stations(mode=mode)
+        items: List[Dict[str, Any]] = []
+        for station in stations:
+            item = dict(station)
+            item["stream_path"] = self._station_stream_path(item["station_id"])
+            item["stream_url"] = self._absolute_url(item["stream_path"])
+            items.append(item)
+        return items
+
+    def _serve_station_streams(self, query: Dict[str, List[str]], send_body: bool = True) -> None:
+        favorites_only = query.get("favorites", ["0"])[0].lower() in {"1", "true", "yes"}
+        mode = query.get("mode", [None])[0]
+        items = self._station_stream_entries(mode=mode, favorites_only=favorites_only)
+        resolved_mode = "favorites" if favorites_only else str(mode or self.server.backend.get_status()["mode"])
+        playlist_path = self._playlist_path(mode=mode, favorites_only=favorites_only)
+        self._send_ok(
+            {
+                "mode": resolved_mode,
+                "favorites": favorites_only,
+                "count": len(items),
+                "single_tuner": True,
+                "playlist_path": playlist_path,
+                "playlist_url": self._absolute_url(playlist_path),
+                "stations": items,
+            },
+            send_body=send_body,
+        )
+
+    def _serve_live_metadata(self, send_body: bool = True) -> None:
+        payload = self.server.backend.get_live_stream_metadata()
+        dab_media = dict(payload.get("dab_media") or {})
+        artwork_url = dab_media.get("artwork_url")
+        if artwork_url:
+            dab_media["artwork_url"] = self._absolute_url(str(artwork_url))
+        payload["dab_media"] = dab_media
+        self._send_ok(payload, send_body=send_body)
+
+    def _serve_station_audio(self, request_path: str, send_body: bool = True) -> None:
+        encoded_station = Path(request_path).name
+        if not encoded_station.endswith(".mp3"):
+            self._send_error_json(404, "Station stream not found.", send_body=send_body)
+            return
+        station_id = unquote(encoded_station[:-4])
+        if not station_id:
+            self._send_error_json(400, "station_id is required.", send_body=send_body)
+            return
+        self._serve_live_audio(send_body=send_body, station_id=station_id, auto_tune=True)
+
+    def _serve_m3u_playlist(self, request_path: str, send_body: bool = True) -> None:
+        playlist_name = Path(request_path).name
+        if playlist_name == "favorites.m3u":
+            favorites_only = True
+            mode = None
+            title = "Raspiaudio Favorites"
+        else:
+            favorites_only = False
+            mode = playlist_name[:-4].strip().lower().replace("-", "_")
+            if mode not in {"dab", "fm", "hd", "am", "am_hd"}:
+                self._send_error_json(404, "Playlist not found.", send_body=send_body)
+                return
+            title = f"Raspiaudio {mode.upper()}"
+        stations = self._station_stream_entries(mode=mode, favorites_only=favorites_only)
+        lines = [
+            "#EXTM3U",
+            f"#PLAYLIST:{title}",
+            "# Raspiaudio uses a single tuner: starting a different station retunes the hardware.",
+        ]
+        for station in stations:
+            group_title = "Raspiaudio Favorites" if favorites_only else f"Raspiaudio {station['mode_label']}"
+            station_id = str(station["station_id"]).replace('"', "'")
+            station_label = str(station["label"]).replace("\n", " ").strip()
+            lines.append(f'#EXTINF:-1 tvg-id="{station_id}" group-title="{group_title}",{station_label}')
+            lines.append(station["stream_url"])
+        payload = ("\n".join(lines) + "\n").encode("utf-8")
+        self._serve_bytes(
+            payload,
+            "audio/x-mpegurl; charset=utf-8",
+            cache_control="no-store",
+            send_body=send_body,
+        )
+
+    def _compact_live_text(self, value: Any) -> str:
+        return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+
+    def _sanitize_icy_value(self, value: Any, limit: int = 512) -> str:
+        text = self._compact_live_text(value)
+        text = text.replace("\\", "/").replace("'", '"')
+        if len(text) > limit:
+            text = text[:limit].rstrip()
+        return text
+
+    def _build_icy_payload(self, metadata: Dict[str, Any], station_header: str) -> bytes:
+        dab_media = metadata.get("dab_media") or {}
+        stream_text = self._sanitize_icy_value(dab_media.get("text") or "")
+        title = self._sanitize_icy_value(dab_media.get("title") or "")
+        artist = self._sanitize_icy_value(dab_media.get("artist") or "")
+        stream_title = ""
+        if stream_text:
+            stream_title = stream_text
+        elif artist and title:
+            stream_title = f"{artist} - {title}"
+        elif title:
+            stream_title = title
+        elif artist:
+            stream_title = artist
+        else:
+            stream_title = station_header
+        artwork_url = dab_media.get("artwork_url")
+        if artwork_url:
+            artwork_url = self._absolute_url(str(artwork_url))
+        parts = [f"StreamTitle='{stream_title}';"]
+        if artwork_url:
+            parts.append(f"StreamUrl='{self._sanitize_icy_value(artwork_url, limit=1024)}';")
+        payload = "".join(parts).encode("utf-8", errors="ignore")
+        if len(payload) > (255 * 16):
+            payload = payload[: 255 * 16]
+        block_length = (len(payload) + 15) // 16
+        if block_length <= 0:
+            return b"\x00"
+        padded = payload.ljust(block_length * 16, b"\x00")
+        return bytes([block_length]) + padded
+
+    def _send_live_stream_headers(
+        self,
+        station_header: str,
+        station_id: str,
+        *,
+        icy_enabled: bool,
+        icy_logo_url: str | None = None,
+    ) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Radio-Station", station_header)
+        self.send_header("X-Radio-Station-Id", station_id)
+        self.send_header("X-Radio-Single-Tuner", "true")
+        if icy_enabled:
+            self.send_header("icy-name", station_header)
+            self.send_header("icy-description", "Raspiaudio Digital Radio live stream")
+            self.send_header("icy-br", "192")
+            self.send_header("icy-metaint", str(ICY_META_INTERVAL))
+            if icy_logo_url:
+                self.send_header("icy-logo", icy_logo_url)
+        self.end_headers()
+
+    def _serve_live_audio(
+        self,
+        send_body: bool = True,
+        station_id: str | None = None,
+        auto_tune: bool | None = None,
+    ) -> None:
+        try:
+            stream_info = self.server.backend.prepare_live_stream(
+                station_id=station_id,
+                auto_tune=((station_id is not None) if auto_tune is None else auto_tune),
+            )
+        except RuntimeError as exc:
+            self._send_error_json(503, str(exc), send_body=send_body)
+            return
+        except ValueError as exc:
+            self._send_error_json(400, str(exc), send_body=send_body)
+            return
+        icy_enabled = (self.headers.get("Icy-MetaData") or self.headers.get("icy-metadata") or "").strip() in {
+            "1",
+            "true",
+            "yes",
+        }
+        station_header = str(stream_info["station_label"]).encode("latin-1", errors="ignore").decode("latin-1") or "live"
+        station_id_header = str(stream_info["station_id"]).encode("latin-1", errors="ignore").decode("latin-1")
+        initial_metadata = self.server.backend.get_live_stream_metadata()
+        initial_artwork_url = initial_metadata.get("dab_media", {}).get("artwork_url")
+        if initial_artwork_url:
+            initial_artwork_url = self._absolute_url(str(initial_artwork_url))
+
+        if not send_body:
+            self._send_live_stream_headers(
+                station_header,
+                station_id_header,
+                icy_enabled=icy_enabled,
+                icy_logo_url=str(initial_artwork_url) if initial_artwork_url else None,
+            )
+            return
+
+        def _start_processes(capture_format: str) -> tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]:
+            arecord_command = [
+                "arecord",
+                "-q",
+                "-D",
+                str(stream_info["device"]),
+                "-f",
+                capture_format,
+                "-r",
+                str(stream_info["sample_rate"]),
+                "-c",
+                str(stream_info["channels"]),
+                "-t",
+                "raw",
+            ]
+            ffmpeg_command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-thread_queue_size",
+                "1024",
+                "-f",
+                capture_format.replace("_", "").lower(),
+                "-ar",
+                str(stream_info["sample_rate"]),
+                "-ac",
+                str(stream_info["channels"]),
+                "-i",
+                "pipe:0",
+                "-vn",
+                "-acodec",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                "-f",
+                "mp3",
+                "-",
+            ]
+            capture_process = subprocess.Popen(  # noqa: S603
+                arecord_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            process = subprocess.Popen(  # noqa: S603
+                ffmpeg_command,
+                stdin=capture_process.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if capture_process.stdout is not None:
+                capture_process.stdout.close()
+            return capture_process, process
+
+        def _collect_startup_error(
+            capture_process: subprocess.Popen[bytes], process: subprocess.Popen[bytes]
+        ) -> tuple[bytes, bytes]:
+            time.sleep(0.25)
+            if capture_process.poll() is None and process.poll() is None:
+                return b"", b""
+            capture_stderr = b""
+            ffmpeg_stderr = b""
+            with contextlib.suppress(Exception):
+                _, capture_stderr = capture_process.communicate(timeout=0.5)
+            with contextlib.suppress(Exception):
+                _, ffmpeg_stderr = process.communicate(timeout=0.5)
+            return capture_stderr, ffmpeg_stderr
+
+        def _extract_retry_format(capture_stderr: bytes, current_format: str) -> str | None:
+            seen_formats = False
+            for line in capture_stderr.decode("utf-8", errors="ignore").splitlines():
+                if "Available formats:" in line:
+                    seen_formats = True
+                    continue
+                if not seen_formats:
+                    continue
+                match = _ARECORD_AVAILABLE_FORMAT_RE.match(line)
+                if match is None:
+                    if line.strip():
+                        break
+                    continue
+                candidate = match.group("format")
+                if candidate and candidate != current_format:
+                    return candidate
+            return None
+
+        capture_format = str(stream_info["format"])
+        capture_process, process = _start_processes(capture_format)
+        capture_stderr, stderr = _collect_startup_error(capture_process, process)
+        if capture_stderr or stderr:
+            retry_format = _extract_retry_format(capture_stderr, capture_format)
+            if retry_format:
+                capture_format = retry_format
+                capture_process, process = _start_processes(capture_format)
+                capture_stderr, stderr = _collect_startup_error(capture_process, process)
+        if capture_stderr or stderr:
+            self._send_error_json(
+                503,
+                "Live stream failed to start on ALSA device "
+                f"{stream_info['device']}. "
+                + (
+                    capture_stderr.decode("utf-8", errors="ignore").strip()
+                    or stderr.decode("utf-8", errors="ignore").strip()
+                    or "Check the I2S capture path."
+                ),
+                send_body=True,
+            )
+            return
+
+        self._send_live_stream_headers(
+            station_header,
+            station_id_header,
+            icy_enabled=icy_enabled,
+            icy_logo_url=str(initial_artwork_url) if initial_artwork_url else None,
+        )
+        try:
+            assert process.stdout is not None
+            metadata_block = self._build_icy_payload(initial_metadata, station_header)
+            last_metadata_poll = time.monotonic()
+            bytes_until_metadata = ICY_META_INTERVAL
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                if not icy_enabled:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    continue
+                offset = 0
+                while offset < len(chunk):
+                    write_size = min(bytes_until_metadata, len(chunk) - offset)
+                    if write_size > 0:
+                        self.wfile.write(chunk[offset : offset + write_size])
+                        offset += write_size
+                        bytes_until_metadata -= write_size
+                    if bytes_until_metadata == 0:
+                        now = time.monotonic()
+                        if (now - last_metadata_poll) >= ICY_METADATA_POLL_INTERVAL_S:
+                            metadata_block = self._build_icy_payload(
+                                self.server.backend.get_live_stream_metadata(),
+                                station_header,
+                            )
+                            last_metadata_poll = now
+                        self.wfile.write(metadata_block)
+                        bytes_until_metadata = ICY_META_INTERVAL
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
+        finally:
+            if capture_process.poll() is None:
+                capture_process.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    capture_process.communicate(timeout=2.0)
+                if capture_process.poll() is None:
+                    capture_process.kill()
+                    with contextlib.suppress(Exception):
+                        capture_process.communicate(timeout=1.0)
+            if process.poll() is None:
+                process.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.communicate(timeout=2.0)
+                if process.poll() is None:
+                    process.kill()
+                    with contextlib.suppress(Exception):
+                        process.communicate(timeout=1.0)
+            with contextlib.suppress(Exception):
+                if process.stdout is not None:
+                    process.stdout.close()
+            with contextlib.suppress(Exception):
+                if process.stderr is not None:
+                    process.stderr.close()
+            with contextlib.suppress(Exception):
+                if capture_process.stderr is not None:
+                    capture_process.stderr.close()
 
     def _serve_file(
         self,
@@ -354,6 +758,9 @@ def _print_startup_banner(host: str, port: int, alias: str) -> None:
     print("Open one of these URLs:")
     for url in _startup_urls(host, port, alias):
         print(f"  {url}")
+    print("Live MPEG stream:")
+    for url in _startup_urls(host, port, alias):
+        print(f"  {url.rstrip('/')}/audio/live.mp3")
     if alias:
         print(f"Suggested network alias: {alias}")
         print(f"  If your hostname or mDNS alias is set to `{alias}`, try http://{alias}.local:{port}/")
