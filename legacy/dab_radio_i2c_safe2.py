@@ -439,6 +439,33 @@ class Si468xDabRadio:
                 self._i2c_recover_bus()
                 time.sleep(0.05)
 
+    def power_up_flash_utility(self) -> None:
+        """
+        Power up the ROM flash utility exactly as recommended by Skyworks.
+
+        This is intentionally separate from the normal POWER_UP helper because
+        Skyworks provided this byte sequence for external flash programming.
+        """
+        cmd = [
+            CMD_POWER_UP,
+            0x00,
+            0x17,
+            0x28,
+            0x00,
+            0xF8,
+            0x24,
+            0x01,
+            0x21,
+            0x10,
+            0x00,
+            0x00,
+            0x00,
+            0x18,
+            0x00,
+            0x00,
+        ]
+        self._write_command(cmd, timeout=0.1, skip_cts_before=True)
+
     def _send_load_init(self, allow_cmd_error: bool = False) -> None:
         self._write_command([CMD_LOAD_INIT, 0x00], allow_cmd_error_after=allow_cmd_error)
 
@@ -537,9 +564,9 @@ class Si468xDabRadio:
         """
         SDK FLASH_FULL flow after the full patch has already been host-loaded.
 
-        Do not send LOAD_INIT again here: the flow chart expects FLASH_LOAD
-        directly after the host-loaded patch, then BOOT.
+        The SDK sends LOAD_INIT before FLASH_LOAD(main image), then BOOT.
         """
+        self._send_load_init(allow_cmd_error=allow_cmd_error)
         self.flash_load_strict(start_addr, allow_cmd_error=allow_cmd_error)
         self._boot(allow_cmd_error=allow_cmd_error)
 
@@ -566,9 +593,10 @@ class Si468xDabRadio:
     ) -> None:
         """
         SDK OPTION__BOOT_FROM_FLASH_MINI flow:
-        HOST_LOAD(mini patch) -> wait -> FLASH_LOAD(full patch) ->
+        HOST_LOAD(mini patch) -> wait -> LOAD_INIT -> FLASH_LOAD(full patch) ->
         LOAD_INIT -> FLASH_LOAD(firmware) -> BOOT
         """
+        self._send_load_init(allow_cmd_error=allow_cmd_error)
         self.flash_load_strict(patch_addr, allow_cmd_error=allow_cmd_error)
         if full_patch_wait_ms > 0:
             time.sleep(full_patch_wait_ms / 1000.0)
@@ -580,56 +608,17 @@ class Si468xDabRadio:
 
     def flash_enter_program_mode(self) -> None:
         """
-        FIXED: Enter flash programming mode.
+        Deprecated compatibility no-op.
 
-        The original command [0xB2, 0x55, 0x55] was incorrect because:
-        - 0xB2 is CMD_DAB_DIGRAD_STATUS, causing a command conflict
-        - Flash operations should use CMD_FLASH_LOAD (0x05) with magic bytes
-
-        This method tries multiple known unlock sequences in order.
+        Skyworks confirmed that the previous unlock attempts such as
+        ``05 FF 55 55`` are invalid. After POWER_UP flash utility + LOAD_INIT
+        + host-loading ``rom00_patch.016.bin``, flash commands can be sent
+        directly.
         """
-        # Try method 1: CMD_FLASH_LOAD with 0xFF prefix + magic unlock
-        try:
-            self._write_command([CMD_FLASH_LOAD, 0xFF, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00], timeout=3.0)
-            print("[DEBUG] Flash program mode entered (method 1: CMD_FLASH_LOAD + 0xFF5555)")
-            return
-        except Exception as e1:
-            print(f"[DEBUG] Method 1 failed: {e1}")
+        return
 
-        # Try method 2: Extended magic sequence
-        try:
-            self._write_command([CMD_FLASH_LOAD, 0x55, 0x55, 0xAA, 0xAA, 0x00, 0x00, 0x00], timeout=3.0)
-            print("[DEBUG] Flash program mode entered (method 2: CMD_FLASH_LOAD + 5555AAAA)")
-            return
-        except Exception as e2:
-            print(f"[DEBUG] Method 2 failed: {e2}")
-
-        # Try method 3: Simple 2-byte sequence
-        try:
-            self._write_command([CMD_FLASH_LOAD, 0x55, 0x55], timeout=3.0)
-            print("[DEBUG] Flash program mode entered (method 3: CMD_FLASH_LOAD + 5555)")
-            return
-        except Exception as e3:
-            print(f"[DEBUG] Method 3 failed: {e3}")
-
-        # Try method 4: No explicit command (patch may already enable mode)
-        try:
-            print("[DEBUG] Attempting to proceed without explicit enter command (patch may enable mode)")
-            time.sleep(0.1)
-            return
-        except Exception as e4:
-            print(f"[DEBUG] Method 4 failed: {e4}")
-
-        # If all methods fail, raise an error with helpful diagnostics
-        raise RuntimeError(
-            "Failed to enter flash programming mode. "
-            "All known command sequences were rejected by Si468x. "
-            "Please check:\n"
-            "  1. Correct flash programming patch is loaded (rom00_patch_mini.003.bin)\n"
-            "  2. Flash CS pin is properly configured if using external flash\n"
-            "  3. Si468x firmware version supports flash programming\n"
-            "  4. Consult Si468x programming guide for your specific chip revision"
-        )
+    def flash_erase_chip(self) -> None:
+        self._write_command([CMD_FLASH_LOAD, 0xFF, 0xDE, 0xC0], timeout=20.0)
 
     def flash_erase_sector(self, start_addr: int) -> None:
         cmd = [
@@ -645,20 +634,19 @@ class Si468xDabRadio:
         if not data or len(data) > FLASH_WRITE_BLOCK:
             raise ValueError("Flash write block length invalid")
         addr_len = start_addr.to_bytes(4, "little") + len(data).to_bytes(4, "little")
-        crc = 0xFFFFFFFF
-        crc = _crc32_update(crc, addr_len)
-        crc = _crc32_update(crc, data)
-        crc ^= 0xFFFFFFFF
         cmd = [
             CMD_FLASH_LOAD,
-            0xF3,
+            0xF0,
             0x0C,
             0xED,
-            *list(crc.to_bytes(4, "little")),
+            0x00,
+            0x00,
+            0x00,
+            0x00,
             *list(addr_len),
             *list(data),
         ]
-        self._write_command(cmd, timeout=2.0)
+        self._write_command(cmd, timeout=0.5)
 
     # ------------------------------------------------------------------
     # Properties and configuration

@@ -18,7 +18,6 @@ from legacy.dab_radio_i2c_safe2 import (
     DAB_BAND_III,
     FLASH_ADDR_DAB,
     FLASH_ADDR_PATCH_FULL,
-    FLASH_SECTOR_SIZE,
     FLASH_WRITE_BLOCK,
     PROP_AUDIO_MUTE,
     Si468xDabRadio,
@@ -61,6 +60,7 @@ MODE_DEFS: Dict[str, Dict[str, Any]] = {
 }
 SCAN_KEYS = ("dab", "fm", "hd", "am", "am_hd")
 VALID_AUDIO_OUT = {"analog", "i2s", "both"}
+VALID_BOOT_SOURCES = {"host", "flash", "auto"}
 SCAN_FILE_HEADER = "Automatically generated and machine read file, do not change!\n"
 FLASH_ADDR_FMHD = 0x00006000
 FLASH_ADDR_AMHD = 0x0011E000
@@ -411,6 +411,7 @@ class RadioConfig:
     spi_dev: int = 0
     spi_speed_hz: int = 30_000_000
     flash_program_spi_hz: int = 1_000_000
+    boot_source: str = "host"
     rst_pin: int = 25
     int_pin: Optional[int] = None
     amp_pin: Optional[int] = 17
@@ -838,6 +839,7 @@ class RadioBackend:
         self._muted = False
         self._booted = False
         self._loaded_firmware: Optional[str] = None
+        self._boot_source_active: Optional[str] = None
         self._audio_out_mode = config.audio_out if config.audio_out in VALID_AUDIO_OUT else "both"
         self._current_mode = config.default_mode if config.default_mode in MODE_DEFS else "dab"
         self._current_station: Optional[Dict[str, Any]] = None
@@ -1399,6 +1401,8 @@ class RadioBackend:
             "mode_label": self._mode_info()["label"],
             "available_modes": [dict(MODE_DEFS[key]) for key in SCAN_KEYS],
             "firmware": self._loaded_firmware,
+            "boot_source": self.config.boot_source if self.config.boot_source in VALID_BOOT_SOURCES else "host",
+            "boot_source_active": self._boot_source_active,
             "audio_out": self._audio_out_mode,
             "volume": self._current_volume,
             "muted": self._muted,
@@ -1716,29 +1720,40 @@ class RadioBackend:
             if self._recording_active_locked():
                 self._stop_recording_locked()
             self._shutdown_locked(close_amp=False)
-            radio = self._create_radio()
-            try:
-                radio.reset()
-                radio.power_up(xtal_freq=self.config.xtal_freq, ctun=self.config.ctun, retries=2)
-                radio.load_patch_and_firmware(self.config.patch_path, self._firmware_path_for_mode())
-                if self._current_mode == "dab":
-                    radio.configure_dab_frontend()
-                    radio.set_dab_freq_list(self._dab_freqs)
-                elif self._mode_info()["band"] == "fm":
-                    radio.configure_fmhd_frontend()
-                elif self._mode_info()["band"] == "am":
-                    radio.configure_amhd_frontend()
-                self._radio = radio
-                self._booted = True
-                self._loaded_firmware = firmware_key
-            except Exception:
+            last_flash_error: Optional[Exception] = None
+            for source in self._boot_sources_to_try():
+                radio = self._create_radio()
                 try:
-                    radio.close()
-                except Exception:
-                    pass
-                self._radio = None
-                self._booted = False
-                raise
+                    radio.reset()
+                    radio.power_up(xtal_freq=self.config.xtal_freq, ctun=self.config.ctun, retries=2)
+                    if source == "flash":
+                        self._flash_boot_mini_locked(radio, self._current_mode)
+                    else:
+                        radio.load_patch_and_firmware(self.config.patch_path, self._firmware_path_for_mode())
+                    self._configure_loaded_radio_locked(radio)
+                    self._radio = radio
+                    self._booted = True
+                    self._loaded_firmware = firmware_key
+                    self._boot_source_active = source
+                    if last_flash_error is not None:
+                        self._last_error = f"Flash boot failed, fell back to host-load: {last_flash_error}"
+                    else:
+                        self._last_error = None
+                    break
+                except Exception as exc:
+                    try:
+                        radio.close()
+                    except Exception:
+                        pass
+                    self._radio = None
+                    self._booted = False
+                    self._boot_source_active = None
+                    if source == "flash" and self._boot_source_requested() == "auto":
+                        last_flash_error = exc
+                        continue
+                    raise
+            if self._radio is None or not self._booted:
+                raise RuntimeError("Radio boot failed.")
         radio = self._require_radio_locked()
         self._apply_audio_config_locked(radio)
         self._current_volume = radio.set_volume(self._current_volume)
@@ -1758,18 +1773,36 @@ class RadioBackend:
             spi_speed_hz=self.config.spi_speed_hz if spi_speed_hz is None else int(spi_speed_hz),
         )
 
+    def _boot_source_requested(self) -> str:
+        source = str(self.config.boot_source or "host").strip().lower()
+        return source if source in VALID_BOOT_SOURCES else "host"
+
+    def _boot_sources_to_try(self) -> List[str]:
+        source = self._boot_source_requested()
+        if source == "auto":
+            return ["flash", "host"]
+        return [source]
+
+    def _configure_loaded_radio_locked(self, radio: Si468xDabRadio) -> None:
+        if self._current_mode == "dab":
+            radio.configure_dab_frontend()
+            radio.set_dab_freq_list(self._dab_freqs)
+        elif self._mode_info()["band"] == "fm":
+            radio.configure_fmhd_frontend()
+        elif self._mode_info()["band"] == "am":
+            radio.configure_amhd_frontend()
+
     def _restore_runtime_locked(self) -> Dict[str, Any]:
         return self._boot_locked(force=True)
 
     def _flash_program_locked(self, mode: str, report: Dict[str, Any]) -> None:
-        radio = self._create_radio()
+        radio = self._create_radio(spi_speed_hz=self.config.flash_program_spi_hz)
         try:
             radio.reset()
-            radio.power_up(xtal_freq=self.config.xtal_freq, ctun=self.config.ctun, retries=2)
-            radio.load_patch_only(self.config.mini_patch_path)
-            if radio.use_spi and radio.spi is not None:
-                radio.spi.max_speed_hz = min(int(radio.spi.max_speed_hz), int(self.config.flash_program_spi_hz))
-            radio.flash_enter_program_mode()
+            radio.power_up_flash_utility()
+            radio._send_load_init()
+            radio._host_load_file(self.config.patch_path)
+            radio.flash_erase_chip()
             self._program_flash_image_locked(
                 radio,
                 self.config.patch_path,
@@ -1860,9 +1893,6 @@ class RadioBackend:
         label: str,
     ) -> None:
         image_size = image_path.stat().st_size
-        sectors = (image_size + FLASH_SECTOR_SIZE - 1) // FLASH_SECTOR_SIZE
-        for sector in range(sectors):
-            radio.flash_erase_sector(start_addr + (sector * FLASH_SECTOR_SIZE))
         written = 0
         with image_path.open("rb") as handle:
             while True:
@@ -1890,6 +1920,7 @@ class RadioBackend:
         self._radio = None
         self._booted = False
         self._loaded_firmware = None
+        self._boot_source_active = None
         self._reset_dab_media_locked(clear_artwork=True)
 
     def _require_radio_locked(self) -> Si468xDabRadio:

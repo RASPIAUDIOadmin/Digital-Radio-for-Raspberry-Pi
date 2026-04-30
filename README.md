@@ -324,6 +324,32 @@ Validated flash programming sequence:
 - erase chip with `0x05 0xFF 0xDE 0xC0`
 - write flash using `FLASH_WRITE_BLOCK` `0x05 0xF0 0x0C 0xED ...`
 
+Validated flash boot sequence:
+- host-load `rom00_patch_mini.003.bin`
+- send `LOAD_INIT`
+- `FLASH_LOAD` the full patch from `0x00004000`
+- send `LOAD_INIT`
+- `FLASH_LOAD` the DAB firmware from `0x00092000`
+- send `BOOT`
+
+Program the external flash from the normal CLI:
+
+```bash
+python radio.py flash dab
+```
+
+Start the web server by booting the firmware from flash:
+
+```bash
+python radio.py serve --port 8686 --boot-source flash
+```
+
+You can also ask the server to try flash first and fall back to normal SPI host-load if flash boot fails:
+
+```bash
+python radio.py serve --port 8686 --boot-source auto
+```
+
 Validation method:
 - tune to DAB multiplex `199360 kHz`
 - wait for `acq=true` and `valid=true`

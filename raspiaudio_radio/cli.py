@@ -196,6 +196,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--spi-dev", type=int, default=0)
     serve.add_argument("--spi-speed", type=int, default=30_000_000)
     serve.add_argument("--flash-program-spi-speed", type=int, default=1_000_000, help="Temporary SPI speed used for flash programming")
+    serve.add_argument(
+        "--boot-source",
+        choices=["host", "flash", "auto"],
+        default="host",
+        help="Firmware boot source: host-load, flash boot, or flash with host fallback (default: host)",
+    )
     serve.add_argument("--rst-pin", type=int, default=25)
     serve.add_argument("--amp-pin", type=int, default=17, help="BCM GPIO used to enable the speaker amplifier")
     serve.add_argument("--disable-amp", action="store_true", help="Disable amplifier GPIO control")
@@ -325,6 +331,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             spi_dev=args.spi_dev,
             spi_speed_hz=args.spi_speed,
             flash_program_spi_hz=args.flash_program_spi_speed,
+            boot_source=args.boot_source,
             rst_pin=args.rst_pin,
             amp_pin=None if args.disable_amp else args.amp_pin,
             amp_active_high=not args.amp_active_low,
