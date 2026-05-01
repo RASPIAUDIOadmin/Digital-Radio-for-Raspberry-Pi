@@ -64,6 +64,7 @@ If you are already on the Raspberry Pi, this is enough to get the Web UI and the
 - AM HD
 - local Web UI to scan, browse, tune, change volume, manage favorites, and handle recordings
 - CLI to control the backend from the terminal or integrate the radio into your own software
+- direct HTTP stream URLs for VLC, a browser, Music Assistant, or any compatible network player
 - analog audio output on the shield
 - I2S audio path for digital capture and recording
 - built-in `1 x 5 W` amplifier
@@ -167,11 +168,11 @@ If you want to keep the full raw capture without trimming the first seconds:
 python radio.py serve --port 8686 --record-trim-seconds 0
 ```
 
-## Music Assistant integration
+## Stream URLs and Music Assistant integration
 
-The server can expose the shield as a live radio source for Music Assistant.
+The server can expose the shield as a live radio source for Music Assistant, VLC, a browser, or any player that can open an HTTP MP3 stream.
 
-Music Assistant stream URLs require the SI4689 I2S audio capture device to be installed on the Raspberry Pi.
+Stream URLs require the SI4689 I2S audio capture device to be installed on the Raspberry Pi.
 The server captures `si4689_i2s` through ALSA and uses `ffmpeg` to expose MP3 streams over HTTP.
 Install the I2S overlay described in [I2S recording on Raspberry Pi](#i2s-recording-on-raspberry-pi) before using `/audio/live.mp3`, station stream URLs, or generated playlists.
 
@@ -200,6 +201,35 @@ How it works:
   exports only favorites
 - `/api/live-metadata`
   returns the current DAB now-playing text and artwork URL as JSON
+
+### Use your usual player instead of the Web UI
+
+You do not have to use the Raspiaudio Web UI if you prefer your usual player.
+
+For a quick test, paste the live stream URL directly into a browser:
+
+```text
+http://piradio.local:8686/audio/live.mp3
+```
+
+For a station browser, open the generated DAB playlist in VLC with `Media` -> `Open Network Stream`:
+
+```text
+http://piradio.local:8686/playlists/dab.m3u
+```
+
+If your network does not resolve `piradio.local`, use the Raspberry Pi IP address instead, for example:
+
+```text
+http://192.168.1.154:8686/playlists/dab.m3u
+```
+
+VLC will display the stations from the playlist. Selecting another item retunes the Raspberry Pi service to that station, so you can switch between DAB stations from VLC without opening the Web UI.
+
+<p align="center">
+  <img src="pic/vlc-open-network-playlist.svg" alt="Open the Raspiaudio DAB playlist URL in VLC" width="47%" />
+  <img src="pic/vlc-dab-playlist.svg" alt="Browse Raspiaudio DAB stations from the VLC playlist" width="47%" />
+</p>
 
 Important limitation:
 

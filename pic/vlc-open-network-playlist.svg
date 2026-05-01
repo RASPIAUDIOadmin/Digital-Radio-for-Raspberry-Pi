@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="680" viewBox="0 0 900 680" role="img" aria-labelledby="title desc">
+  <title id="title">Open the Raspiaudio DAB playlist in VLC</title>
+  <desc id="desc">VLC Open Media network tab with a local Raspiaudio playlist URL.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="14" flood-color="#0f172a" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+  <rect width="900" height="680" fill="#eef4ff"/>
+  <rect x="60" y="42" width="780" height="596" rx="14" fill="#fff" filter="url(#shadow)"/>
+  <rect x="60" y="42" width="780" height="54" rx="14" fill="#fbffcd"/>
+  <path d="M60 82h780v14H60z" fill="#fbffcd"/>
+  <polygon points="91,59 70,89 112,89" fill="#f97316"/>
+  <rect x="76" y="80" width="30" height="5" fill="#fff"/>
+  <rect x="81" y="70" width="20" height="5" fill="#fff"/>
+  <text x="125" y="76" font-family="Segoe UI, Arial, sans-serif" font-size="22" fill="#111827">Open Media</text>
+  <text x="773" y="75" font-family="Segoe UI, Arial, sans-serif" font-size="22" fill="#111827">X</text>
+  <rect x="82" y="122" width="102" height="42" fill="#fff" stroke="#cfd8e3"/>
+  <text x="112" y="149" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#111827">File</text>
+  <rect x="184" y="122" width="110" height="42" fill="#fff" stroke="#cfd8e3"/>
+  <text x="218" y="149" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#111827">Disc</text>
+  <rect x="294" y="112" width="150" height="52" fill="#f8fafc" stroke="#cfd8e3"/>
+  <text x="344" y="145" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#111827" font-weight="600">Network</text>
+  <rect x="444" y="122" width="178" height="42" fill="#fff" stroke="#cfd8e3"/>
+  <text x="492" y="149" font-family="Segoe UI, Arial, sans-serif" font-size="16" fill="#111827">Capture Device</text>
+  <rect x="96" y="188" width="708" height="286" fill="#fff" stroke="#cbd5e1"/>
+  <text x="112" y="214" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#111827">Network Protocol</text>
+  <text x="128" y="266" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#111827">Please enter a network URL:</text>
+  <rect x="128" y="290" width="640" height="34" fill="#fff" stroke="#94a3b8"/>
+  <rect x="132" y="294" width="512" height="26" fill="#2563eb"/>
+  <text x="140" y="315" font-family="Consolas, monospace" font-size="18" fill="#fff">http://piradio.local:8686/playlists/dab.m3u</text>
+  <path d="M744 304l8 8 8-8" fill="none" stroke="#334155" stroke-width="2"/>
+  <text x="148" y="367" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#94a3b8">http://www.example.com/stream.avi</text>
+  <text x="148" y="394" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#94a3b8">rtp://@:1234</text>
+  <text x="148" y="421" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#94a3b8">http://server.example.com:8080/test.sdp</text>
+  <rect x="96" y="526" width="24" height="24" rx="3" fill="#fff" stroke="#64748b"/>
+  <text x="136" y="545" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#111827">Show more options</text>
+  <rect x="588" y="566" width="112" height="44" rx="8" fill="#fff" stroke="#cbd5e1"/>
+  <text x="627" y="594" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#111827">Play</text>
+  <rect x="720" y="566" width="112" height="44" rx="8" fill="#fff" stroke="#cbd5e1"/>
+  <text x="756" y="594" font-family="Segoe UI, Arial, sans-serif" font-size="17" fill="#111827">Cancel</text>
+</svg>
