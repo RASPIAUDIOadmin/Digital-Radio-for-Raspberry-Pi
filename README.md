@@ -227,8 +227,7 @@ http://192.168.1.154:8686/playlists/dab.m3u
 VLC will display the stations from the playlist. Selecting another item retunes the Raspberry Pi service to that station, so you can switch between DAB stations from VLC without opening the Web UI.
 
 <p align="center">
-  <img src="pic/vlc-open-network-playlist.svg" alt="Open the Raspiaudio DAB playlist URL in VLC" width="47%" />
-  <img src="pic/vlc-dab-playlist.svg" alt="Browse Raspiaudio DAB stations from the VLC playlist" width="47%" />
+  <img src="pic/vlc.png" alt="Open the Raspiaudio DAB playlist URL in VLC and browse stations" width="72%" />
 </p>
 
 Important limitation:
