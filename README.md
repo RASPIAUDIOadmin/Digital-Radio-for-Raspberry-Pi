@@ -180,6 +180,7 @@ The important endpoints are:
 
 ```text
 http://piradio.local:8686/audio/live.mp3
+http://piradio.local:8686/audio/live.mp3?icy=1
 http://piradio.local:8686/audio/stations/<station_id>.mp3
 http://piradio.local:8686/api/station-streams?mode=dab
 http://piradio.local:8686/playlists/dab.m3u
@@ -191,6 +192,8 @@ How it works:
 
 - `/audio/live.mp3`
   streams the currently tuned station
+- `/audio/live.mp3?icy=1`
+  streams the currently tuned station with forced ICY metadata for compatible players
 - `/audio/stations/<station_id>.mp3`
   retunes the hardware to the requested station and streams it
 - `/api/station-streams?mode=dab`
@@ -225,6 +228,7 @@ http://192.168.1.154:8686/playlists/dab.m3u
 ```
 
 VLC will display the stations from the playlist. Selecting another item retunes the Raspberry Pi service to that station, so you can switch between DAB stations from VLC without opening the Web UI.
+Generated playlists use metadata-enabled station URLs automatically.
 
 <p align="center">
   <img src="pic/vlc.png" alt="Open the Raspiaudio DAB playlist URL in VLC and browse stations" width="72%" />
@@ -255,17 +259,21 @@ Once imported, Music Assistant can redistribute that terrestrial radio source to
 
 ### Live metadata in the MP3 stream
 
-When a client requests ICY metadata, the live stream injects:
+When a client requests ICY metadata, or when the URL includes `?icy=1`, the live stream injects:
 
 - station name in the ICY headers
 - current DAB text as `StreamTitle`
-- current DAB artwork URL as `StreamUrl` when the multiplex provides MOT artwork
+- artist/title fields when they can be parsed from DAB DLS text
+- current DAB artwork URL as `StreamUrl` and `StreamArtwork` when the multiplex provides MOT artwork
 
 This works especially well with Music Assistant because it reads ICY `StreamTitle` from radio streams and can surface the current song in the UI and on compatible players.
 
 Note:
 
+- a plain browser MP3 request usually does not request ICY metadata, so it may play audio without showing title or artwork
+- the generated M3U playlists include `?icy=1` station URLs for metadata-capable players
 - Music Assistant reliably consumes `StreamTitle`
+- artwork is exposed as a URL, not embedded as binary image data inside the MP3 stream
 - artwork handling depends on the downstream client and current Music Assistant support for the source type
 
 Example:
@@ -273,6 +281,7 @@ Example:
 ```text
 StreamTitle='THE WEEKND - In Your Eyes';
 StreamUrl='http://piradio.local:8686/api/dab/artwork?ts=...';
+StreamArtwork='http://piradio.local:8686/api/dab/artwork?ts=...';
 ```
 
 ## CLI mode

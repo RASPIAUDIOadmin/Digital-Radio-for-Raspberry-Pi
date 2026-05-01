@@ -72,10 +72,10 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/audio/live.mp3":
             station_id = query.get("station_id", [None])[0]
-            self._serve_live_audio(send_body=send_body, station_id=station_id)
+            self._serve_live_audio(send_body=send_body, station_id=station_id, query=query)
             return
         if parsed.path.startswith("/audio/stations/") and parsed.path.endswith(".mp3"):
-            self._serve_station_audio(parsed.path, send_body=send_body)
+            self._serve_station_audio(parsed.path, query=query, send_body=send_body)
             return
         if parsed.path.startswith("/playlists/") and parsed.path.endswith(".m3u"):
             self._serve_m3u_playlist(parsed.path, send_body=send_body)
@@ -233,8 +233,30 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
     def _absolute_url(self, path: str) -> str:
         return f"{self._request_base_url()}{path if path.startswith('/') else '/' + path}"
 
-    def _station_stream_path(self, station_id: str) -> str:
-        return f"/audio/stations/{quote(str(station_id), safe='')}.mp3"
+    def _station_stream_path(self, station_id: str, *, icy_metadata: bool = False) -> str:
+        path = f"/audio/stations/{quote(str(station_id), safe='')}.mp3"
+        if icy_metadata:
+            return f"{path}?icy=1"
+        return path
+
+    @staticmethod
+    def _truthy_token(value: Any) -> bool:
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _falsey_token(value: Any) -> bool:
+        return str(value or "").strip().lower() in {"0", "false", "no", "off"}
+
+    def _client_wants_icy_metadata(self, query: Dict[str, List[str]] | None = None) -> bool:
+        query = query or {}
+        for key in ("icy", "metadata", "icy-metadata"):
+            if key not in query:
+                continue
+            value = (query.get(key) or [""])[0]
+            if self._falsey_token(value):
+                return False
+            return self._truthy_token(value)
+        return self._truthy_token(self.headers.get("Icy-MetaData") or self.headers.get("icy-metadata"))
 
     def _playlist_path(self, mode: str | None = None, favorites_only: bool = False) -> str:
         if favorites_only:
@@ -249,6 +271,8 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             item = dict(station)
             item["stream_path"] = self._station_stream_path(item["station_id"])
             item["stream_url"] = self._absolute_url(item["stream_path"])
+            item["metadata_stream_path"] = self._station_stream_path(item["station_id"], icy_metadata=True)
+            item["metadata_stream_url"] = self._absolute_url(item["metadata_stream_path"])
             items.append(item)
         return items
 
@@ -280,7 +304,12 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         payload["dab_media"] = dab_media
         self._send_ok(payload, send_body=send_body)
 
-    def _serve_station_audio(self, request_path: str, send_body: bool = True) -> None:
+    def _serve_station_audio(
+        self,
+        request_path: str,
+        query: Dict[str, List[str]] | None = None,
+        send_body: bool = True,
+    ) -> None:
         encoded_station = Path(request_path).name
         if not encoded_station.endswith(".mp3"):
             self._send_error_json(404, "Station stream not found.", send_body=send_body)
@@ -289,7 +318,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         if not station_id:
             self._send_error_json(400, "station_id is required.", send_body=send_body)
             return
-        self._serve_live_audio(send_body=send_body, station_id=station_id, auto_tune=True)
+        self._serve_live_audio(send_body=send_body, station_id=station_id, auto_tune=True, query=query)
 
     def _serve_m3u_playlist(self, request_path: str, send_body: bool = True) -> None:
         playlist_name = Path(request_path).name
@@ -315,7 +344,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             station_id = str(station["station_id"]).replace('"', "'")
             station_label = str(station["label"]).replace("\n", " ").strip()
             lines.append(f'#EXTINF:-1 tvg-id="{station_id}" group-title="{group_title}",{station_label}')
-            lines.append(station["stream_url"])
+            lines.append(station["metadata_stream_url"])
         payload = ("\n".join(lines) + "\n").encode("utf-8")
         self._serve_bytes(
             payload,
@@ -354,8 +383,14 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         if artwork_url:
             artwork_url = self._absolute_url(str(artwork_url))
         parts = [f"StreamTitle='{stream_title}';"]
+        if artist:
+            parts.append(f"StreamArtist='{artist}';")
+        if title:
+            parts.append(f"StreamSong='{title}';")
         if artwork_url:
-            parts.append(f"StreamUrl='{self._sanitize_icy_value(artwork_url, limit=1024)}';")
+            safe_artwork_url = self._sanitize_icy_value(artwork_url, limit=1024)
+            parts.append(f"StreamUrl='{safe_artwork_url}';")
+            parts.append(f"StreamArtwork='{safe_artwork_url}';")
         payload = "".join(parts).encode("utf-8", errors="ignore")
         if len(payload) > (255 * 16):
             payload = payload[: 255 * 16]
@@ -393,6 +428,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         send_body: bool = True,
         station_id: str | None = None,
         auto_tune: bool | None = None,
+        query: Dict[str, List[str]] | None = None,
     ) -> None:
         try:
             stream_info = self.server.backend.prepare_live_stream(
@@ -405,11 +441,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_error_json(400, str(exc), send_body=send_body)
             return
-        icy_enabled = (self.headers.get("Icy-MetaData") or self.headers.get("icy-metadata") or "").strip() in {
-            "1",
-            "true",
-            "yes",
-        }
+        icy_enabled = self._client_wants_icy_metadata(query)
         station_header = str(stream_info["station_label"]).encode("latin-1", errors="ignore").decode("latin-1") or "live"
         station_id_header = str(stream_info["station_id"]).encode("latin-1", errors="ignore").decode("latin-1")
         initial_metadata = self.server.backend.get_live_stream_metadata()
