@@ -182,8 +182,10 @@ The important endpoints are:
 http://piradio.local:8686/audio/live.mp3
 http://piradio.local:8686/audio/live.mp3?icy=1
 http://piradio.local:8686/audio/stations/<station_id>.mp3
+http://piradio.local:8686/stream.wav?station_id=<station_id>
 http://piradio.local:8686/api/station-streams?mode=dab
 http://piradio.local:8686/playlists/dab.m3u
+http://piradio.local:8686/playlists/dab.m3u?format=wav
 http://piradio.local:8686/playlists/favorites.m3u
 http://piradio.local:8686/api/live-metadata
 ```
@@ -196,10 +198,14 @@ How it works:
   streams the currently tuned station with forced ICY metadata for compatible players
 - `/audio/stations/<station_id>.mp3`
   retunes the hardware to the requested station and streams it
+- `/stream.wav?station_id=<station_id>`
+  retunes the hardware to the requested station and streams direct WAV from the I2S capture device
 - `/api/station-streams?mode=dab`
-  returns the available DAB stations with ready-to-use stream URLs
+  returns the available DAB stations with MP3 and WAV stream URLs
 - `/playlists/dab.m3u`
-  exports all DAB stations as a playlist
+  exports all DAB stations as an MP3 playlist with ICY metadata
+- `/playlists/dab.m3u?format=wav`
+  exports all DAB stations as a direct WAV playlist, recommended for Music Assistant when reliability matters more than ICY metadata
 - `/playlists/favorites.m3u`
   exports only favorites
 - `/api/live-metadata`
@@ -241,18 +247,26 @@ Important limitation:
 
 ### Add the live source to Music Assistant
 
-The simplest approach is to add the station URLs to the Builtin provider in Music Assistant.
+The simplest approach is to add the generated WAV playlist to the Builtin provider in Music Assistant.
+
+```text
+http://piradio.local:8686/playlists/dab.m3u?format=wav
+```
+
+The WAV playlist uses direct I2S capture and the server keeps only one active stream at a time, which avoids unstable concurrent probes from Music Assistant retuning the single SI4689 tuner while another capture process is still running.
+
+If you prefer MP3 and ICY metadata, import the MP3 playlist instead:
+
+```text
+http://piradio.local:8686/playlists/dab.m3u
+```
+
+You can also add a single station URL manually.
 
 For example:
 
 ```text
 http://piradio.local:8686/audio/stations/dab%3A0000f21b%3A00000001%3A195936.mp3
-```
-
-Or import the generated playlist:
-
-```text
-http://piradio.local:8686/playlists/dab.m3u
 ```
 
 Once imported, Music Assistant can redistribute that terrestrial radio source to all supported players on the network.

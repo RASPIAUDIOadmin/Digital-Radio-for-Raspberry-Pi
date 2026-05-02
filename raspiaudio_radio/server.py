@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import re
+import select
 import socket
 import subprocess
 import threading
@@ -26,7 +27,47 @@ _ARECORD_AVAILABLE_FORMAT_RE = re.compile(r"^\s*-\s*(?P<format>[A-Z0-9_]+)\s*$")
 class RadioHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], backend: RadioBackend) -> None:
         self.backend = backend
+        self.stream_lock = threading.RLock()
+        self.active_stream_processes: tuple[subprocess.Popen[bytes], ...] = ()
         super().__init__(server_address, RadioRequestHandler)
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            with contextlib.suppress(Exception):
+                process.communicate(timeout=0.1)
+            return
+        process.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.communicate(timeout=1.0)
+        if process.poll() is None:
+            process.kill()
+            with contextlib.suppress(Exception):
+                process.communicate(timeout=1.0)
+
+    def stop_active_stream(self) -> None:
+        with self.stream_lock:
+            processes = self.active_stream_processes
+            self.active_stream_processes = ()
+        for process in reversed(processes):
+            self._stop_process(process)
+
+    def set_active_stream(self, processes: tuple[subprocess.Popen[bytes], ...]) -> None:
+        with self.stream_lock:
+            previous = self.active_stream_processes
+            self.active_stream_processes = tuple(process for process in processes if process is not None)
+        for process in reversed(previous):
+            self._stop_process(process)
+
+    def clear_active_stream(self, *processes: subprocess.Popen[bytes]) -> None:
+        process_set = {process for process in processes if process is not None}
+        if not process_set:
+            return
+        with self.stream_lock:
+            if process_set.intersection(self.active_stream_processes):
+                self.active_stream_processes = tuple(
+                    process for process in self.active_stream_processes if process not in process_set
+                )
 
 
 class RadioRequestHandler(BaseHTTPRequestHandler):
@@ -70,6 +111,10 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/dab/artwork":
             self._serve_dab_artwork(send_body=send_body)
             return
+        if parsed.path == "/stream.wav":
+            station_id = query.get("station_id", [""])[0]
+            self._serve_wav_stream(station_id=station_id, send_body=send_body)
+            return
         if parsed.path == "/audio/live.mp3":
             station_id = query.get("station_id", [None])[0]
             self._serve_live_audio(send_body=send_body, station_id=station_id, query=query)
@@ -78,7 +123,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             self._serve_station_audio(parsed.path, query=query, send_body=send_body)
             return
         if parsed.path.startswith("/playlists/") and parsed.path.endswith(".m3u"):
-            self._serve_m3u_playlist(parsed.path, send_body=send_body)
+            self._serve_m3u_playlist(parsed.path, query=query, send_body=send_body)
             return
         if parsed.path.startswith("/recordings/"):
             self._serve_recording(parsed.path, send_body=send_body)
@@ -239,6 +284,9 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             return f"{path}?icy=1"
         return path
 
+    def _station_wav_stream_path(self, station_id: str) -> str:
+        return f"/stream.wav?station_id={quote(str(station_id), safe='')}"
+
     @staticmethod
     def _truthy_token(value: Any) -> bool:
         return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -273,6 +321,8 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             item["stream_url"] = self._absolute_url(item["stream_path"])
             item["metadata_stream_path"] = self._station_stream_path(item["station_id"], icy_metadata=True)
             item["metadata_stream_url"] = self._absolute_url(item["metadata_stream_path"])
+            item["wav_stream_path"] = self._station_wav_stream_path(item["station_id"])
+            item["wav_stream_url"] = self._absolute_url(item["wav_stream_path"])
             items.append(item)
         return items
 
@@ -320,7 +370,13 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             return
         self._serve_live_audio(send_body=send_body, station_id=station_id, auto_tune=True, query=query)
 
-    def _serve_m3u_playlist(self, request_path: str, send_body: bool = True) -> None:
+    def _serve_m3u_playlist(
+        self,
+        request_path: str,
+        query: Dict[str, List[str]] | None = None,
+        send_body: bool = True,
+    ) -> None:
+        query = query or {}
         playlist_name = Path(request_path).name
         if playlist_name == "favorites.m3u":
             favorites_only = True
@@ -334,17 +390,23 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
                 return
             title = f"Raspiaudio {mode.upper()}"
         stations = self._station_stream_entries(mode=mode, favorites_only=favorites_only)
+        stream_format = str(query.get("format", ["mp3"])[0] or "mp3").strip().lower()
+        use_wav_streams = stream_format in {"wav", "wave", "pcm"}
         lines = [
             "#EXTM3U",
             f"#PLAYLIST:{title}",
             "# Raspiaudio uses a single tuner: starting a different station retunes the hardware.",
         ]
+        if use_wav_streams:
+            lines.append("# Stream format: WAV direct I2S capture, recommended for Music Assistant stability.")
+        else:
+            lines.append("# Stream format: MP3 with ICY metadata for compatible players.")
         for station in stations:
             group_title = "Raspiaudio Favorites" if favorites_only else f"Raspiaudio {station['mode_label']}"
             station_id = str(station["station_id"]).replace('"', "'")
             station_label = str(station["label"]).replace("\n", " ").strip()
             lines.append(f'#EXTINF:-1 tvg-id="{station_id}" group-title="{group_title}",{station_label}')
-            lines.append(station["metadata_stream_url"])
+            lines.append(station["wav_stream_url"] if use_wav_streams else station["metadata_stream_url"])
         payload = ("\n".join(lines) + "\n").encode("utf-8")
         self._serve_bytes(
             payload,
@@ -352,6 +414,135 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             cache_control="no-store",
             send_body=send_body,
         )
+
+    def _send_wav_stream_headers(self, stream_info: Dict[str, Any]) -> None:
+        station_header = str(stream_info["station_label"]).encode("latin-1", errors="ignore").decode("latin-1") or "live"
+        station_id_header = str(stream_info["station_id"]).encode("latin-1", errors="ignore").decode("latin-1")
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.send_header("X-Radio-Station", station_header)
+        self.send_header("X-Radio-Station-Id", station_id_header)
+        self.send_header("X-Radio-Single-Tuner", "true")
+        self.end_headers()
+
+    def _extract_arecord_retry_format(self, capture_stderr: bytes, current_format: str) -> str | None:
+        seen_formats = False
+        for line in capture_stderr.decode("utf-8", errors="ignore").splitlines():
+            if "Available formats:" in line:
+                seen_formats = True
+                continue
+            if not seen_formats:
+                continue
+            match = _ARECORD_AVAILABLE_FORMAT_RE.match(line)
+            if match is None:
+                if line.strip():
+                    break
+                continue
+            candidate = match.group("format")
+            if candidate and candidate != current_format:
+                return candidate
+        return None
+
+    def _serve_wav_stream(self, station_id: str, send_body: bool = True) -> None:
+        station_id = str(station_id or "").strip()
+        if not station_id:
+            self._send_error_json(400, "station_id is required.", send_body=send_body)
+            return
+        process: subprocess.Popen[bytes] | None = None
+        headers_sent = False
+        try:
+            if not send_body:
+                stream_info = self.server.backend.prepare_live_stream(station_id=station_id, auto_tune=True)
+                self._send_wav_stream_headers(stream_info)
+                return
+            with self.server.stream_lock:
+                self.server.stop_active_stream()
+                stream_info = self.server.backend.prepare_live_stream(station_id=station_id, auto_tune=True)
+                capture_format = str(stream_info["format"])
+
+                def _start_wav_process(active_format: str) -> subprocess.Popen[bytes]:
+                    command = [
+                        "arecord",
+                        "-q",
+                        "-D",
+                        str(stream_info["device"]),
+                        "-f",
+                        active_format,
+                        "-r",
+                        str(stream_info["sample_rate"]),
+                        "-c",
+                        str(stream_info["channels"]),
+                        "-t",
+                        "wav",
+                        "-",
+                    ]
+                    return subprocess.Popen(  # noqa: S603
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+
+                def _read_first_chunk(active_process: subprocess.Popen[bytes]) -> bytes:
+                    if active_process.stdout is None:
+                        return b""
+                    readable, _, _ = select.select([active_process.stdout], [], [], 5.0)
+                    if not readable:
+                        return b""
+                    return active_process.stdout.read(64 * 1024)
+
+                process = _start_wav_process(capture_format)
+                self.server.set_active_stream((process,))
+                first_chunk = _read_first_chunk(process)
+                if not first_chunk:
+                    stderr_bytes = b""
+                    with contextlib.suppress(Exception):
+                        process.terminate()
+                        _, stderr_bytes = process.communicate(timeout=1.0)
+                    retry_format = self._extract_arecord_retry_format(stderr_bytes, capture_format)
+                    self.server.clear_active_stream(process)
+                    if retry_format:
+                        capture_format = retry_format
+                        process = _start_wav_process(capture_format)
+                        self.server.set_active_stream((process,))
+                        first_chunk = _read_first_chunk(process)
+                    if not first_chunk:
+                        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+                        if process is not None and process.poll() is not None:
+                            with contextlib.suppress(Exception):
+                                _, retry_stderr = process.communicate(timeout=0.5)
+                                stderr = retry_stderr.decode("utf-8", errors="replace").strip() or stderr
+                        self.server.clear_active_stream(process)
+                        message = f"Audio stream failed to start on ALSA device {stream_info['device']}."
+                        if stderr:
+                            message += f" Details: {stderr}"
+                        self._send_error_json(503, message, send_body=send_body)
+                        return
+                self._send_wav_stream_headers(stream_info)
+                headers_sent = True
+            self.wfile.write(first_chunk)
+            self.wfile.flush()
+            assert process.stdout is not None
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
+        except RuntimeError as exc:
+            self._send_error_json(503, str(exc), send_body=send_body)
+        except ValueError as exc:
+            self._send_error_json(400, str(exc), send_body=send_body)
+        except Exception as exc:
+            if not headers_sent:
+                self._send_error_json(500, str(exc), send_body=send_body)
+        finally:
+            if process is not None:
+                self.server.clear_active_stream(process)
+                self.server._stop_process(process)
 
     def _compact_live_text(self, value: Any) -> str:
         return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
@@ -430,33 +621,34 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         auto_tune: bool | None = None,
         query: Dict[str, List[str]] | None = None,
     ) -> None:
-        try:
-            stream_info = self.server.backend.prepare_live_stream(
-                station_id=station_id,
-                auto_tune=((station_id is not None) if auto_tune is None else auto_tune),
-            )
-        except RuntimeError as exc:
-            self._send_error_json(503, str(exc), send_body=send_body)
-            return
-        except ValueError as exc:
-            self._send_error_json(400, str(exc), send_body=send_body)
-            return
         icy_enabled = self._client_wants_icy_metadata(query)
-        station_header = str(stream_info["station_label"]).encode("latin-1", errors="ignore").decode("latin-1") or "live"
-        station_id_header = str(stream_info["station_id"]).encode("latin-1", errors="ignore").decode("latin-1")
-        initial_metadata = self.server.backend.get_live_stream_metadata()
-        initial_artwork_url = initial_metadata.get("dab_media", {}).get("artwork_url")
-        if initial_artwork_url:
-            initial_artwork_url = self._absolute_url(str(initial_artwork_url))
-
         if not send_body:
-            self._send_live_stream_headers(
-                station_header,
-                station_id_header,
-                icy_enabled=icy_enabled,
-                icy_logo_url=str(initial_artwork_url) if initial_artwork_url else None,
-            )
+            try:
+                stream_info = self.server.backend.prepare_live_stream(
+                    station_id=station_id,
+                    auto_tune=((station_id is not None) if auto_tune is None else auto_tune),
+                )
+                station_header = (
+                    str(stream_info["station_label"]).encode("latin-1", errors="ignore").decode("latin-1") or "live"
+                )
+                station_id_header = str(stream_info["station_id"]).encode("latin-1", errors="ignore").decode("latin-1")
+                initial_metadata = self.server.backend.get_live_stream_metadata()
+                initial_artwork_url = initial_metadata.get("dab_media", {}).get("artwork_url")
+                if initial_artwork_url:
+                    initial_artwork_url = self._absolute_url(str(initial_artwork_url))
+                self._send_live_stream_headers(
+                    station_header,
+                    station_id_header,
+                    icy_enabled=icy_enabled,
+                    icy_logo_url=str(initial_artwork_url) if initial_artwork_url else None,
+                )
+            except RuntimeError as exc:
+                self._send_error_json(503, str(exc), send_body=send_body)
+            except ValueError as exc:
+                self._send_error_json(400, str(exc), send_body=send_body)
             return
+
+        stream_info: Dict[str, Any] = {}
 
         def _start_processes(capture_format: str) -> tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]:
             arecord_command = [
@@ -545,27 +737,67 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
                     return candidate
             return None
 
-        capture_format = str(stream_info["format"])
-        capture_process, process = _start_processes(capture_format)
-        capture_stderr, stderr = _collect_startup_error(capture_process, process)
-        if capture_stderr or stderr:
-            retry_format = _extract_retry_format(capture_stderr, capture_format)
-            if retry_format:
-                capture_format = retry_format
-                capture_process, process = _start_processes(capture_format)
-                capture_stderr, stderr = _collect_startup_error(capture_process, process)
-        if capture_stderr or stderr:
-            self._send_error_json(
-                503,
-                "Live stream failed to start on ALSA device "
-                f"{stream_info['device']}. "
-                + (
-                    capture_stderr.decode("utf-8", errors="ignore").strip()
-                    or stderr.decode("utf-8", errors="ignore").strip()
-                    or "Check the I2S capture path."
-                ),
-                send_body=True,
+        def _stop_capture_pair(
+            capture: subprocess.Popen[bytes] | None,
+            encoder: subprocess.Popen[bytes] | None,
+        ) -> None:
+            for child in (encoder, capture):
+                if child is not None:
+                    self.server._stop_process(child)
+
+        capture_process: subprocess.Popen[bytes] | None = None
+        process: subprocess.Popen[bytes] | None = None
+        with self.server.stream_lock:
+            self.server.stop_active_stream()
+            try:
+                stream_info = self.server.backend.prepare_live_stream(
+                    station_id=station_id,
+                    auto_tune=((station_id is not None) if auto_tune is None else auto_tune),
+                )
+            except RuntimeError as exc:
+                self._send_error_json(503, str(exc), send_body=send_body)
+                return
+            except ValueError as exc:
+                self._send_error_json(400, str(exc), send_body=send_body)
+                return
+
+            station_header = (
+                str(stream_info["station_label"]).encode("latin-1", errors="ignore").decode("latin-1") or "live"
             )
+            station_id_header = str(stream_info["station_id"]).encode("latin-1", errors="ignore").decode("latin-1")
+            initial_metadata = self.server.backend.get_live_stream_metadata()
+            initial_artwork_url = initial_metadata.get("dab_media", {}).get("artwork_url")
+            if initial_artwork_url:
+                initial_artwork_url = self._absolute_url(str(initial_artwork_url))
+
+            capture_format = str(stream_info["format"])
+            capture_process, process = _start_processes(capture_format)
+            capture_stderr, stderr = _collect_startup_error(capture_process, process)
+            if capture_stderr or stderr:
+                retry_format = _extract_retry_format(capture_stderr, capture_format)
+                _stop_capture_pair(capture_process, process)
+                if retry_format:
+                    capture_format = retry_format
+                    capture_process, process = _start_processes(capture_format)
+                    capture_stderr, stderr = _collect_startup_error(capture_process, process)
+            if capture_stderr or stderr:
+                _stop_capture_pair(capture_process, process)
+                self._send_error_json(
+                    503,
+                    "Live stream failed to start on ALSA device "
+                    f"{stream_info['device']}. "
+                    + (
+                        capture_stderr.decode("utf-8", errors="ignore").strip()
+                        or stderr.decode("utf-8", errors="ignore").strip()
+                        or "Check the I2S capture path."
+                    ),
+                    send_body=True,
+                )
+                return
+            self.server.set_active_stream((capture_process, process))
+
+        if capture_process is None or process is None:
+            self._send_error_json(503, "Live stream failed to start.", send_body=True)
             return
 
         self._send_live_stream_headers(
@@ -608,22 +840,8 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             return
         finally:
-            if capture_process.poll() is None:
-                capture_process.terminate()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    capture_process.communicate(timeout=2.0)
-                if capture_process.poll() is None:
-                    capture_process.kill()
-                    with contextlib.suppress(Exception):
-                        capture_process.communicate(timeout=1.0)
-            if process.poll() is None:
-                process.terminate()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.communicate(timeout=2.0)
-                if process.poll() is None:
-                    process.kill()
-                    with contextlib.suppress(Exception):
-                        process.communicate(timeout=1.0)
+            self.server.clear_active_stream(capture_process, process)
+            _stop_capture_pair(capture_process, process)
             with contextlib.suppress(Exception):
                 if process.stdout is not None:
                     process.stdout.close()
@@ -633,6 +851,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             with contextlib.suppress(Exception):
                 if capture_process.stderr is not None:
                     capture_process.stderr.close()
+            return
 
     def _serve_file(
         self,
