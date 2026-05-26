@@ -41,6 +41,27 @@ git clone https://github.com/RASPIAUDIOadmin/Digital-Radio-for-Raspberry-Pi.git
 cd Digital-Radio-for-Raspberry-Pi
 ```
 
+Enable SPI on the Raspberry Pi. The SI4689 radio chip is controlled over SPI, so the server can start but radio communication will fail if SPI is disabled.
+
+```bash
+sudo raspi-config
+```
+
+Then select:
+
+```text
+Interface Options -> SPI -> Enable
+```
+
+Reboot and check that SPI devices exist:
+
+```bash
+sudo reboot
+ls /dev/spidev*
+```
+
+You should see `/dev/spidev0.0` and `/dev/spidev0.1`.
+
 Start the local radio server:
 
 ```bash
@@ -434,9 +455,19 @@ Current shield-oriented defaults:
 
 On Raspberry Pi OS:
 
+Raspberry Pi Zero / 3 / 4:
+
 ```bash
 sudo apt install python3-spidev python3-rpi.gpio python3-smbus2 alsa-utils ffmpeg
 ```
+
+Raspberry Pi 5:
+
+```bash
+sudo apt install python3-spidev python3-rpi-lgpio python3-smbus2 alsa-utils ffmpeg
+```
+
+`python3-rpi-lgpio` provides the same `RPi.GPIO` Python import used by the code, but supports the newer Raspberry Pi 5 GPIO controller.
 
 ## Open source and reusable
 
