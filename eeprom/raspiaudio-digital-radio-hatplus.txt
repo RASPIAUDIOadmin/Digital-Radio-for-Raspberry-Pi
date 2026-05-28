@@ -1,0 +1,30 @@
+########################################################################
+# Raspberry Pi HAT+ EEPROM settings for Raspiaudio Digital Radio.
+#
+# This profile stores the overlay name only. The matching overlay file must
+# exist on the boot filesystem as:
+#
+#   /boot/firmware/overlays/raspiaudio-digital-radio.dtbo
+#
+# Build:
+#
+#   eepmake raspiaudio-digital-radio-hatplus.txt raspiaudio-digital-radio-hatplus.eep
+#
+########################################################################
+
+# Keep zero for development so eepmake generates a UUID.
+# For production, write a unique UUID per physical board and keep it stable.
+product_uuid 00000000-0000-0000-0000-000000000000
+
+# Draft IDs. Confirm before production.
+product_id 0x4689
+product_ver 0x0001
+
+vendor "Raspiaudio"
+product "Digital Radio Shield"
+
+# This shield does not power the Raspberry Pi from the HAT connector.
+current_supply 0
+
+# HAT+ stores the overlay name, not the overlay file contents.
+dt_blob "raspiaudio-digital-radio"

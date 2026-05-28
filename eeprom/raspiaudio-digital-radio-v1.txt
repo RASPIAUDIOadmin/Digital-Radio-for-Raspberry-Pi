@@ -1,0 +1,47 @@
+########################################################################
+# Legacy Raspberry Pi HAT v1 EEPROM settings for Raspiaudio Digital Radio.
+#
+# This profile is useful for immediate plug-and-play testing because eepmake
+# can embed the compiled .dtbo into the EEPROM image.
+#
+# Build:
+#
+#   dtc -@ -H epapr -O dtb -o raspiaudio-digital-radio.dtbo raspiaudio-digital-radio-overlay.dts
+#   eepmake -v1 raspiaudio-digital-radio-v1.txt raspiaudio-digital-radio.eep raspiaudio-digital-radio.dtbo
+#
+########################################################################
+
+# Keep zero for development so eepmake generates a UUID.
+# For production, write a unique UUID per physical board and keep it stable.
+product_uuid 00000000-0000-0000-0000-000000000000
+
+# Draft IDs. Confirm before production.
+product_id 0x4689
+product_ver 0x0001
+
+vendor "Raspiaudio"
+product "Digital Radio Shield"
+
+# GPIO bank settings.
+gpio_drive 0
+gpio_slew 0
+gpio_hysteresis 0
+
+# This shield does not power the Raspberry Pi from the HAT connector.
+back_power 0
+
+# GPIOs used by the shield.
+# SPI pins are marked as used with their standard alternate function.
+setgpio 5 INPUT UP
+setgpio 6 INPUT UP
+setgpio 8 ALT0 NONE
+setgpio 9 ALT0 NONE
+setgpio 10 ALT0 NONE
+setgpio 11 ALT0 NONE
+setgpio 13 INPUT UP
+setgpio 17 OUTPUT NONE
+setgpio 18 ALT0 NONE
+setgpio 19 ALT0 NONE
+setgpio 20 ALT0 NONE
+setgpio 23 INPUT NONE
+setgpio 25 OUTPUT NONE

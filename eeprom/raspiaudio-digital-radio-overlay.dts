@@ -1,0 +1,89 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	/*
+	 * SPI0 CE0 controls the SI4689 command interface.
+	 * This mirrors the Raspberry Pi spi0-1cs overlay for the pins used by
+	 * the Digital Radio Shield.
+	 */
+	fragment@0 {
+		target = <&spi0_cs_pins>;
+		__overlay__ {
+			brcm,pins = <8>;
+		};
+	};
+
+	fragment@1 {
+		target = <&spi0>;
+		__overlay__ {
+			cs-gpios = <&gpio 8 1>;
+			status = "okay";
+		};
+	};
+
+	/*
+	 * I2S capture path. The Raspberry Pi produces BCLK/LRCLK and the
+	 * SI4689 is configured by the userspace backend as I2S slave.
+	 */
+	fragment@2 {
+		target = <&i2s_clk_producer>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target-path = "/";
+		__overlay__ {
+			si4689_i2s_codec: si4689-i2s-codec {
+				#sound-dai-cells = <0>;
+				compatible = "adi,adau7002";
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@4 {
+		target = <&sound>;
+		sound_overlay: __overlay__ {
+			compatible = "simple-audio-card";
+			simple-audio-card,format = "i2s";
+			simple-audio-card,name = "si4689_i2s";
+			simple-audio-card,bitclock-slave = <&dailink0_slave>;
+			simple-audio-card,frame-slave = <&dailink0_slave>;
+			simple-audio-card,widgets = "Microphone", "SI4689 I2S";
+			simple-audio-card,routing = "PDM_DAT", "SI4689 I2S";
+			status = "okay";
+
+			simple-audio-card,cpu {
+				sound-dai = <&i2s_clk_producer>;
+			};
+
+			dailink0_slave: simple-audio-card,codec {
+				sound-dai = <&si4689_i2s_codec>;
+			};
+		};
+	};
+
+	/*
+	 * Non-kernel-controlled GPIOs are marked here for documentation and
+	 * default pin state. Userspace still drives reset/amplifier through GPIO.
+	 */
+	fragment@5 {
+		target = <&gpio>;
+		__overlay__ {
+			raspiaudio_radio_pins: raspiaudio_radio_pins {
+				brcm,pins = <5 6 13 17 23 25>;
+				brcm,function = <0 0 0 1 0 1>;
+				brcm,pull = <2 2 2 0 0 0>;
+			};
+		};
+	};
+
+	__overrides__ {
+		card-name = <&sound_overlay>,"simple-audio-card,name";
+	};
+};

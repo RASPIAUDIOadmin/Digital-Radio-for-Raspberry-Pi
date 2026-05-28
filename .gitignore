@@ -7,3 +7,6 @@ fm_scan.txt
 hd_scan.txt
 am_scan.txt
 am_hd_scan.txt
+eeprom/build/
+eeprom/*.dtbo
+eeprom/*.eep
