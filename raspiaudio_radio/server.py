@@ -22,6 +22,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 ICY_META_INTERVAL = 16 * 1024
 ICY_METADATA_POLL_INTERVAL_S = 1.0
 _ARECORD_AVAILABLE_FORMAT_RE = re.compile(r"^\s*-\s*(?P<format>[A-Z0-9_]+)\s*$")
+_UTF8_TEXT_SUFFIXES = {".css", ".html", ".js", ".json", ".mjs", ".svg", ".txt", ".xml"}
 
 
 class RadioHTTPServer(ThreadingHTTPServer):
@@ -224,7 +225,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         self._send_json(status_code, {"ok": False, "error": message}, send_body=send_body)
 
     def _send_json(self, status_code: int, payload: Dict[str, Any], send_body: bool = True) -> None:
-        data = json.dumps(payload).encode("utf-8")
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -881,7 +882,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             status_code = 206
         content_length = max(0, end - start + 1)
         self.send_response(status_code)
-        self.send_header("Content-Type", content_type or "application/octet-stream")
+        self.send_header("Content-Type", self._content_type_for_file(file_path, content_type))
         self.send_header("Content-Length", str(content_length))
         self.send_header("Cache-Control", cache_control)
         if allow_ranges:
@@ -900,6 +901,15 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
+
+    @staticmethod
+    def _content_type_for_file(file_path: Path, guessed_type: str | None) -> str:
+        content_type = guessed_type or "application/octet-stream"
+        if "charset=" in content_type.lower():
+            return content_type
+        if content_type.startswith("text/") or file_path.suffix.lower() in _UTF8_TEXT_SUFFIXES:
+            return f"{content_type}; charset=utf-8"
+        return content_type
 
     def _serve_bytes(
         self,

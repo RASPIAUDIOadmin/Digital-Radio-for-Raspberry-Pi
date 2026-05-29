@@ -174,6 +174,252 @@ AM_BAND_DEFAULT_STEP_KHZ = 9
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
+_EBU_LATIN_CONTROL = {
+    0x00: "",
+    0x0A: " ",
+    0x0B: " ",
+    0x1F: "-",
+}
+_EBU_LATIN_OVERRIDES = {
+    0x01: 0x0118,
+    0x02: 0x012E,
+    0x03: 0x0172,
+    0x04: 0x0102,
+    0x05: 0x0116,
+    0x06: 0x010E,
+    0x07: 0x0218,
+    0x08: 0x021A,
+    0x09: 0x010A,
+    0x0C: 0x0120,
+    0x0D: 0x0139,
+    0x0E: 0x017B,
+    0x0F: 0x0143,
+    0x10: 0x0105,
+    0x11: 0x0119,
+    0x12: 0x012F,
+    0x13: 0x0173,
+    0x14: 0x0103,
+    0x15: 0x0117,
+    0x16: 0x010F,
+    0x17: 0x0219,
+    0x18: 0x021B,
+    0x19: 0x010B,
+    0x1A: 0x0147,
+    0x1B: 0x011A,
+    0x1C: 0x0121,
+    0x1D: 0x013A,
+    0x1E: 0x017C,
+    0x24: 0x0142,
+    0x5C: 0x016E,
+    0x5E: 0x0141,
+    0x60: 0x0104,
+    0x7B: 0x00AB,
+    0x7C: 0x016F,
+    0x7D: 0x00BB,
+    0x7E: 0x013D,
+    0x7F: 0x0126,
+}
+_EBU_LATIN_EXTENDED = (
+    0x00E1,
+    0x00E0,
+    0x00E9,
+    0x00E8,
+    0x00ED,
+    0x00EC,
+    0x00F3,
+    0x00F2,
+    0x00FA,
+    0x00F9,
+    0x00D1,
+    0x00C7,
+    0x015E,
+    0x00DF,
+    0x00A1,
+    0x0178,
+    0x00E2,
+    0x00E4,
+    0x00EA,
+    0x00EB,
+    0x00EE,
+    0x00EF,
+    0x00F4,
+    0x00F6,
+    0x00FB,
+    0x00FC,
+    0x00F1,
+    0x00E7,
+    0x015F,
+    0x011F,
+    0x0131,
+    0x00FF,
+    0x0136,
+    0x0145,
+    0x00A9,
+    0x0122,
+    0x011E,
+    0x011B,
+    0x0148,
+    0x0151,
+    0x0150,
+    0x20AC,
+    0x00A3,
+    0x0024,
+    0x0100,
+    0x0112,
+    0x012A,
+    0x016A,
+    0x0137,
+    0x0146,
+    0x013B,
+    0x0123,
+    0x013C,
+    0x0130,
+    0x0144,
+    0x0171,
+    0x0170,
+    0x00BF,
+    0x013E,
+    0x00B0,
+    0x0101,
+    0x0113,
+    0x012B,
+    0x016B,
+    0x00C1,
+    0x00C0,
+    0x00C9,
+    0x00C8,
+    0x00CD,
+    0x00CC,
+    0x00D3,
+    0x00D2,
+    0x00DA,
+    0x00D9,
+    0x0158,
+    0x010C,
+    0x0160,
+    0x017D,
+    0x00D0,
+    0x013F,
+    0x00C2,
+    0x00C4,
+    0x00CA,
+    0x00CB,
+    0x00CE,
+    0x00CF,
+    0x00D4,
+    0x00D6,
+    0x00DB,
+    0x00DC,
+    0x0159,
+    0x010D,
+    0x0161,
+    0x017E,
+    0x0111,
+    0x0140,
+    0x00C3,
+    0x00C5,
+    0x00C6,
+    0x0152,
+    0x0177,
+    0x00DD,
+    0x00D5,
+    0x00D8,
+    0x00DE,
+    0x014A,
+    0x0154,
+    0x0106,
+    0x015A,
+    0x0179,
+    0x0164,
+    0x00F0,
+    0x00E3,
+    0x00E5,
+    0x00E6,
+    0x0153,
+    0x0175,
+    0x00FD,
+    0x00F5,
+    0x00F8,
+    0x00FE,
+    0x014B,
+    0x0155,
+    0x0107,
+    0x015B,
+    0x017A,
+    0x0165,
+    0x0127,
+)
+for _offset, _codepoint in enumerate(_EBU_LATIN_EXTENDED, start=0x80):
+    _EBU_LATIN_OVERRIDES[_offset] = _codepoint
+_MOJIBAKE_MARKERS = ("\u00C3", "\u00C2", "\u00E2", "\ufffd")
+
+
+def _decode_ebu_latin(payload: bytes) -> str:
+    chars = []
+    for value in payload:
+        if value in _EBU_LATIN_CONTROL:
+            chars.append(_EBU_LATIN_CONTROL[value])
+        else:
+            chars.append(chr(_EBU_LATIN_OVERRIDES.get(value, value)))
+    return "".join(chars)
+
+
+def _mojibake_score(text: str) -> int:
+    return sum(text.count(marker) for marker in _MOJIBAKE_MARKERS)
+
+
+def _repair_utf8_mojibake(text: str) -> str:
+    if not text or not any(marker in text for marker in _MOJIBAKE_MARKERS):
+        return text
+    best = text
+    best_score = _mojibake_score(best)
+    for codec in ("latin-1", "cp1252"):
+        try:
+            candidate = text.encode(codec).decode("utf-8")
+        except UnicodeError:
+            continue
+        score = _mojibake_score(candidate)
+        if score < best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
+def normalize_broadcast_text(value: object) -> str:
+    text = str(value or "").replace("\x00", " ")
+    text = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    return _repair_utf8_mojibake(text)
+
+
+def decode_dab_text(payload: bytes, encoding: Optional[int] = None) -> str:
+    enc = int(encoding) if encoding is not None else 0
+    raw = bytes(payload or b"")
+    if enc in {0x04, 0x06}:
+        while raw.endswith(b"\x00\x00"):
+            raw = raw[:-2]
+        if len(raw) % 2:
+            raw = raw[:-1]
+    else:
+        raw = raw.rstrip(b"\x00")
+    if not raw:
+        return ""
+    if enc in {0x04, 0x06}:
+        candidates = ("utf-16-be", "utf-16-le", "utf-8")
+        for codec in candidates:
+            try:
+                return normalize_broadcast_text(raw.decode(codec, errors="strict"))
+            except UnicodeDecodeError:
+                continue
+        return normalize_broadcast_text(raw.decode("utf-16-be", errors="replace"))
+    if enc == 0x0F:
+        for codec in ("utf-8", "cp1252", "latin-1"):
+            try:
+                return normalize_broadcast_text(raw.decode(codec, errors="strict"))
+            except UnicodeDecodeError:
+                continue
+    return normalize_broadcast_text(_decode_ebu_latin(raw))
+
+
 def _signed_byte(value: int) -> int:
     return value - 256 if value & 0x80 else value
 
@@ -939,8 +1185,9 @@ class Si468xDabRadio:
             info1 = payload[offset + 4]
             info2 = payload[offset + 5]
             info3 = payload[offset + 6]
+            charset = info3 & 0x0F
             label_bytes = payload[offset + 8 : offset + 24]
-            label = label_bytes.split(b"\x00", 1)[0].decode("latin-1", errors="ignore").strip()
+            label = decode_dab_text(label_bytes, charset)
             num_components = info2 & 0x0F
             offset += 24
 
@@ -957,7 +1204,7 @@ class Si468xDabRadio:
                             "service_id": sid,
                             "component_id": comp_id,
                             "label": label or f"SID 0x{sid:08X}",
-                            "charset": info3 & 0x0F,
+                            "charset": charset,
                         }
                     )
                 offset += 4
@@ -1333,11 +1580,12 @@ def save_scan_file(path: Path, services: List[Dict[str, object]]) -> None:
                 "service_id": svc.get("service_id"),
                 "component_id": svc.get("component_id"),
                 "label": svc.get("label"),
+                "charset": svc.get("charset"),
                 "freq_index": svc.get("freq_index"),
                 "freq_khz": svc.get("freq_khz"),
             }
         )
-    json_text = json.dumps(payload, indent=2)
+    json_text = json.dumps(payload, indent=2, ensure_ascii=False)
     path.write_text("Automatically generated and machine read file, do not change!\n" + json_text, encoding="utf-8")
 
 

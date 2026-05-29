@@ -21,7 +21,9 @@ from legacy.dab_radio_i2c_safe2 import (
     FLASH_WRITE_BLOCK,
     PROP_AUDIO_MUTE,
     Si468xDabRadio,
+    decode_dab_text as decode_dab_broadcast_text,
     load_scan_file,
+    normalize_broadcast_text,
 )
 
 try:
@@ -128,7 +130,7 @@ def _iso_or_none(timestamp: Optional[float]) -> Optional[str]:
 
 
 def _compact_text(value: Any) -> str:
-    return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    return normalize_broadcast_text(value)
 
 
 def _truncate_text(value: Any, width: int) -> str:
@@ -137,7 +139,7 @@ def _truncate_text(value: Any, width: int) -> str:
         return text
     if width <= 1:
         return text[:width]
-    return text[: width - 1] + "…"
+    return text[: width - 1] + "\u2026"
 
 
 def _marquee_text(value: Any, width: int, tick: int) -> str:
@@ -225,31 +227,14 @@ def _parse_mot_segment(payload: bytes) -> Optional[Dict[str, Any]]:
 
 
 def _decode_dab_text(payload: bytes, encoding: Optional[int]) -> str:
-    raw = bytes(payload or b"").replace(b"\x00", b" ").strip()
-    if not raw:
-        return ""
-    enc = int(encoding) if encoding is not None else -1
-    candidates = ["latin-1"]
-    if enc in {6, 4}:
-        candidates = ["utf-16-be", "utf-16-le", "utf-8", "latin-1"]
-    elif enc == 0x0F:
-        candidates = ["utf-8", "latin-1"]
-    for codec in candidates:
-        try:
-            text = raw.decode(codec, errors="strict")
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        text = raw.decode("latin-1", errors="replace")
-    return " ".join(text.replace("\r", " ").replace("\n", " ").split())
+    return decode_dab_broadcast_text(payload, encoding)
 
 
 def _infer_artist_title(text: str) -> tuple[Optional[str], Optional[str]]:
-    cleaned = " ".join(str(text or "").split())
+    cleaned = normalize_broadcast_text(text)
     if not cleaned:
         return None, None
-    for separator in (" - ", " – ", " | ", " / "):
+    for separator in (" - ", " \u2013 ", " \u2014 ", " | ", " / "):
         if separator in cleaned:
             left, right = [part.strip() for part in cleaned.split(separator, 1)]
             if left and right:
@@ -1267,7 +1252,7 @@ class RadioBackend:
             item.pop("favorite", None)
             item.pop("is_current", None)
             payload.append(item)
-        path.write_text(SCAN_FILE_HEADER + json.dumps(payload, indent=2), encoding="utf-8")
+        path.write_text(SCAN_FILE_HEADER + json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         self._stations[scan_key] = payload
         self._last_scan_count[scan_key] = len(payload)
         self._last_scan_time[scan_key] = time.time()
@@ -1288,7 +1273,7 @@ class RadioBackend:
     def _save_favorites_locked(self) -> None:
         path = self.config.favorites_file
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(sorted(self._favorites), indent=2), encoding="utf-8")
+        path.write_text(json.dumps(sorted(self._favorites), indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _load_runtime_state_locked(self) -> None:
         path = self.config.runtime_state_file
@@ -1323,7 +1308,7 @@ class RadioBackend:
             "oled_requested": self._oled_requested,
             "station_id": (self._current_station or {}).get("station_id"),
         }
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _resume_runtime_state_locked(self) -> bool:
         station_id = self._resume_station_id
@@ -1692,7 +1677,7 @@ class RadioBackend:
             station["program_mask"] = int(station.get("program_mask", 0))
             station["program_id"] = int(station.get("program_id", 0))
             station["station_id"] = f"{scan_key}:{station['freq_khz']}"
-        label = str(station.get("label") or "").strip()
+        label = normalize_broadcast_text(station.get("label") or "")
         if not label:
             label = self._default_station_label(scan_key, station["freq_khz"], station.get("program_mask", 0), station.get("hd_available", False))
         station["label"] = label
@@ -2075,6 +2060,7 @@ class RadioBackend:
                         "service_id": service["service_id"],
                         "component_id": service["component_id"],
                         "label": service["label"],
+                        "charset": service.get("charset"),
                         "freq_index": freq_index,
                         "freq_khz": freq_khz,
                     },
@@ -2630,7 +2616,7 @@ class RadioBackend:
     def _write_recording_meta_locked(self, meta: Dict[str, Any]) -> None:
         payload = {key: value for key, value in meta.items() if not key.startswith("_")}
         meta_path = self.config.recordings_dir / str(meta["meta_name"])
-        meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        meta_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _list_recordings_locked(self) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
