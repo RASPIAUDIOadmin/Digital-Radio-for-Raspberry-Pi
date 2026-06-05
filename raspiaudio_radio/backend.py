@@ -62,6 +62,16 @@ MODE_DEFS: Dict[str, Dict[str, Any]] = {
 }
 SCAN_KEYS = ("dab", "fm", "hd", "am", "am_hd")
 VALID_AUDIO_OUT = {"analog", "i2s", "both"}
+AUDIO_OUTPUT_ALIASES = {
+    "analog": "analog",
+    "dac": "analog",
+    "jack": "analog",
+    "browser": "i2s",
+    "digital": "i2s",
+    "i2s": "i2s",
+    "stream": "i2s",
+    "both": "both",
+}
 VALID_BOOT_SOURCES = {"host", "flash", "auto"}
 SCAN_FILE_HEADER = "Automatically generated and machine read file, do not change!\n"
 FLASH_ADDR_FMHD = 0x00006000
@@ -85,6 +95,11 @@ _AUTO_RECORD_DEVICE_NAMES = (
     "hw:CARD=si4689_i2s,DEV=0",
 )
 _AUTO_RECORD_DEVICE_HINTS = ("si4689", "adau7002", "i2s")
+I2S_CAPTURE_CONFIG_MARKER = "# Raspiaudio Digital Radio I2S capture"
+I2S_CAPTURE_CONFIG_LINES = (
+    "dtparam=i2s=on",
+    "dtoverlay=adau7002-simple,card-name=si4689_i2s",
+)
 OLED_LINE_WIDTH = 12
 
 
@@ -285,7 +300,7 @@ def _list_arecord_capture_hardware() -> List[str]:
     return devices
 
 
-def _auto_detect_record_device() -> str:
+def _find_auto_record_device() -> Optional[str]:
     named_devices = _list_arecord_named_devices()
     for candidate in _AUTO_RECORD_DEVICE_NAMES:
         if candidate in named_devices:
@@ -298,7 +313,39 @@ def _auto_detect_record_device() -> str:
         lowered = candidate.casefold()
         if any(hint in lowered for hint in _AUTO_RECORD_DEVICE_HINTS):
             return candidate
-    return "default"
+    return None
+
+
+def _auto_detect_record_device() -> str:
+    return _find_auto_record_device() or "default"
+
+
+def _raspberry_config_path() -> Path:
+    for candidate in (Path("/boot/firmware/config.txt"), Path("/boot/config.txt")):
+        if candidate.exists():
+            return candidate
+    return Path("/boot/firmware/config.txt")
+
+
+def _has_i2s_capture_line(config_text: str, required_line: str) -> bool:
+    normalized = required_line.strip()
+    return any(line.strip() == normalized for line in config_text.splitlines())
+
+
+def _read_i2s_config_flags(config_path: Path) -> Dict[str, bool]:
+    try:
+        config_text = config_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        config_text = ""
+    return {line: _has_i2s_capture_line(config_text, line) for line in I2S_CAPTURE_CONFIG_LINES}
+
+
+def _normalize_audio_output(value: object, *, default: str = "both") -> str:
+    token = str(value or "").strip().lower()
+    normalized = AUDIO_OUTPUT_ALIASES.get(token)
+    if normalized in VALID_AUDIO_OUT:
+        return normalized
+    return default
 
 
 def _extract_alsa_card_name(device: str) -> Optional[str]:
@@ -825,7 +872,7 @@ class RadioBackend:
         self._booted = False
         self._loaded_firmware: Optional[str] = None
         self._boot_source_active: Optional[str] = None
-        self._audio_out_mode = config.audio_out if config.audio_out in VALID_AUDIO_OUT else "both"
+        self._audio_out_mode = _normalize_audio_output(config.audio_out)
         self._current_mode = config.default_mode if config.default_mode in MODE_DEFS else "dab"
         self._current_station: Optional[Dict[str, Any]] = None
         self._current_volume = _clamp_int(config.default_volume, 0, 63)
@@ -992,6 +1039,28 @@ class RadioBackend:
             self._save_runtime_state_locked()
             return self._status_payload_locked(refresh_signal=False)
 
+    def set_audio_output(self, output: str) -> Dict[str, Any]:
+        with self._lock:
+            next_mode = _normalize_audio_output(output, default="")
+            if not next_mode:
+                raise ValueError("audio output must be analog, browser, i2s or both.")
+            if next_mode == "analog" and self._recording_active_locked():
+                raise RuntimeError("Stop the current recording before disabling the I2S output.")
+            previous_mode = self._audio_out_mode
+            self._audio_out_mode = next_mode
+            was_muted = self._muted
+            if was_muted:
+                self._muted = False
+            if self._booted:
+                radio = self._require_radio_locked()
+                self._apply_audio_config_locked(radio)
+                self._apply_mute_locked(radio)
+                if previous_mode != next_mode and self._current_station is not None:
+                    self._retune_station_locked(dict(self._current_station))
+            self._last_error = None
+            self._save_runtime_state_locked()
+            return self._status_payload_locked(refresh_signal=False)
+
     def set_oled_enabled(self, enabled: bool) -> Dict[str, Any]:
         with self._lock:
             self._oled_requested = bool(enabled)
@@ -1026,6 +1095,29 @@ class RadioBackend:
         with self._lock:
             self._refresh_system_service_status_locked(force=True)
             return self._status_payload_locked(refresh_signal=False)
+
+    def install_i2s_capture_config(
+        self,
+        *,
+        confirm: bool = False,
+        enable_autostart: bool = True,
+    ) -> Dict[str, Any]:
+        if not confirm:
+            raise ValueError("Confirmation is required before modifying the Raspberry Pi boot config.")
+        config_path = _raspberry_config_path()
+        install_result = self._write_i2s_capture_config(config_path)
+        autostart_result = {"requested": bool(enable_autostart), "enabled": None, "error": None}
+        if enable_autostart:
+            autostart_result = self._enable_system_autostart_best_effort()
+        with self._lock:
+            self._refresh_system_service_status_locked(force=True)
+            return {
+                "config": install_result,
+                "autostart": autostart_result,
+                "reboot_required": True,
+                "i2s_setup": self._i2s_capture_setup_status_locked(),
+                "status": self._status_payload_locked(refresh_signal=False),
+            }
 
     def set_favorite(self, station_id: str, favorite: Optional[bool] = None) -> Dict[str, Any]:
         with self._lock:
@@ -1124,6 +1216,122 @@ class RadioBackend:
             update_interval_s=self.config.oled_update_interval_s,
             status_supplier=self._oled_snapshot,
         )
+
+    def _i2s_capture_setup_status_locked(self) -> Dict[str, Any]:
+        arecord_path = shutil.which("arecord")
+        configured_device = str(self.config.record_device or "").strip() or "auto"
+        explicit_device = configured_device.casefold() != "auto"
+        detected_device = _find_auto_record_device() if arecord_path else None
+        device = configured_device if explicit_device else detected_device
+        config_path = _raspberry_config_path()
+        config_lines_present = _read_i2s_config_flags(config_path)
+        installed = bool(arecord_path and device)
+        if not arecord_path:
+            message = "arecord is not installed. Install alsa-utils before using browser output or recording."
+        elif installed:
+            message = "I2S capture is available."
+        else:
+            message = "The si4689_i2s capture device was not found. Add the I2S overlay config and reboot."
+        return {
+            "installed": installed,
+            "arecord_available": bool(arecord_path),
+            "arecord_path": arecord_path,
+            "device": device,
+            "auto_detected": bool(detected_device and not explicit_device),
+            "configured_device": configured_device,
+            "config_path": str(config_path),
+            "required_lines": list(I2S_CAPTURE_CONFIG_LINES),
+            "config_lines_present": config_lines_present,
+            "config_ready": all(config_lines_present.values()),
+            "install_available": shutil.which("sudo") is not None and shutil.which("python3") is not None,
+            "reboot_required": False,
+            "message": message,
+        }
+
+    def _write_i2s_capture_config(self, config_path: Path) -> Dict[str, Any]:
+        script = r"""
+import json
+import sys
+import time
+from pathlib import Path
+
+path = Path(sys.argv[1])
+required = json.loads(sys.argv[2])
+marker = sys.argv[3]
+if not path.parent.exists():
+    raise FileNotFoundError(f"{path.parent} does not exist")
+text = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
+present = {line: any(raw.strip() == line for raw in text.splitlines()) for line in required}
+missing = [line for line in required if not present[line]]
+backup = None
+changed = False
+if missing:
+    if path.exists():
+        backup_path = path.with_name(path.name + ".raspiaudio-radio-" + time.strftime("%Y%m%d-%H%M%S") + ".bak")
+        backup_path.write_text(text, encoding="utf-8")
+        backup = str(backup_path)
+    separator = "" if not text else ("\n" if text.endswith("\n") else "\n\n")
+    addition = separator + marker + "\n" + "\n".join(missing) + "\n"
+    path.write_text(text + addition, encoding="utf-8")
+    changed = True
+print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup, "path": str(path)}))
+"""
+        try:
+            result = subprocess.run(
+                [
+                    "sudo",
+                    "-n",
+                    "python3",
+                    "-c",
+                    script,
+                    str(config_path),
+                    json.dumps(list(I2S_CAPTURE_CONFIG_LINES)),
+                    I2S_CAPTURE_CONFIG_MARKER,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Unable to update {config_path}: {exc}") from exc
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or f"sudo python3 exited with {result.returncode}").strip()
+            raise RuntimeError(f"Unable to update {config_path}: {message}")
+        try:
+            payload = json.loads((result.stdout or "").strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Unable to parse I2S install result: {(result.stdout or '').strip()}") from exc
+        payload["required_lines"] = list(I2S_CAPTURE_CONFIG_LINES)
+        payload["reboot_required"] = True
+        return payload
+
+    def _enable_system_autostart_best_effort(self) -> Dict[str, Any]:
+        service_name = str(self.config.system_service_name or "").strip()
+        payload: Dict[str, Any] = {
+            "requested": True,
+            "service": service_name,
+            "enabled": None,
+            "error": None,
+        }
+        if not service_name:
+            payload["error"] = "No systemd service is configured for autostart."
+            return payload
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "systemctl", "enable", service_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            payload["error"] = str(exc)
+            return payload
+        payload["enabled"] = result.returncode == 0
+        if result.returncode != 0:
+            payload["error"] = (result.stderr or result.stdout or f"systemctl exited with {result.returncode}").strip()
+        return payload
 
     def _refresh_system_service_status_locked(self, *, force: bool = False) -> Dict[str, Any]:
         now = time.monotonic()
@@ -1294,6 +1502,7 @@ class RadioBackend:
         self._muted = bool(data.get("muted", self._muted))
         self._amp_requested = bool(data.get("amp_requested", self._amp_requested))
         self._oled_requested = bool(data.get("oled_requested", self._oled_requested))
+        self._audio_out_mode = _normalize_audio_output(data.get("audio_out"), default=self._audio_out_mode)
         station_id = str(data.get("station_id") or "").strip()
         self._resume_station_id = station_id or None
 
@@ -1306,6 +1515,7 @@ class RadioBackend:
             "muted": self._muted,
             "amp_requested": self._amp_requested,
             "oled_requested": self._oled_requested,
+            "audio_out": self._audio_out_mode,
             "station_id": (self._current_station or {}).get("station_id"),
         }
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1379,6 +1589,7 @@ class RadioBackend:
                 self._last_error = str(exc)
         scan_key = self._scan_key()
         service_status = self._refresh_system_service_status_locked()
+        i2s_setup = self._i2s_capture_setup_status_locked()
         return {
             "booted": self._booted,
             "transport": "spi",
@@ -1420,14 +1631,17 @@ class RadioBackend:
             "last_scan_time": _iso_or_none(self._last_scan_time[scan_key]),
             "recording": self._recording_payload_locked(),
             "live_stream": {
-                "supported": shutil.which("ffmpeg") is not None,
-                "path": "/audio/live.mp3",
+                "supported": bool(i2s_setup["installed"]),
+                "path": "/audio/live.wav",
+                "mp3_path": "/audio/live.mp3",
                 "ready": self._current_station is not None,
                 "station_path_template": "/audio/stations/{station_id}.mp3",
+                "wav_path": "/audio/live.wav",
                 "playlist_paths": {
                     "dab": "/playlists/dab.m3u",
                     "favorites": "/playlists/favorites.m3u",
                 },
+                "i2s_setup": i2s_setup,
             },
             "recordings_count": len(self._list_recordings_locked()),
             "last_error": self._last_error,
@@ -2384,6 +2598,19 @@ class RadioBackend:
         self._save_runtime_state_locked()
         return dict(self._current_station or station)
 
+    def _retune_station_locked(self, station: Dict[str, Any]) -> Dict[str, Any]:
+        if station["mode"] != self._current_mode:
+            self._set_mode_locked(station["mode"])
+        self._boot_locked(force=False)
+        station = dict(station)
+        if self._current_mode == "dab":
+            self._play_dab_locked(station)
+        else:
+            self._play_analog_locked(station)
+        self._last_error = None
+        self._save_runtime_state_locked()
+        return dict(self._current_station or station)
+
     def _play_dab_locked(self, station: Dict[str, Any]) -> None:
         radio = self._require_radio_locked()
         if self._current_station and self._current_station.get("mode") == "dab":
@@ -2467,14 +2694,20 @@ class RadioBackend:
     def _start_recording_locked(self) -> None:
         if self._recording_active_locked():
             return
-        if shutil.which("arecord") is None:
+        i2s_setup = self._i2s_capture_setup_status_locked()
+        if not i2s_setup["arecord_available"]:
             raise RuntimeError("arecord is not installed on the Raspberry Pi.")
+        if not i2s_setup["installed"]:
+            raise RuntimeError(
+                "I2S capture device was not found. Install the si4689_i2s overlay config and reboot before recording."
+            )
         self._boot_locked(force=False)
         if self._current_station is None:
             raise RuntimeError("Tune a station before starting a recording.")
         if self._audio_out_mode not in {"i2s", "both"}:
             self._audio_out_mode = "both"
             self._apply_audio_config_locked(self._require_radio_locked())
+            self._save_runtime_state_locked()
         timestamp = datetime.now()
         station_label = self._current_station["label"]
         base_name = f"{timestamp.strftime('%Y%m%d-%H%M%S')}_{self._current_mode}_{_sanitize_filename(station_label)}"
@@ -2549,8 +2782,13 @@ class RadioBackend:
         station_id: Optional[str] = None,
         auto_tune: bool = False,
     ) -> Dict[str, Any]:
-        if shutil.which("ffmpeg") is None:
-            raise RuntimeError("ffmpeg is not installed on the Raspberry Pi.")
+        i2s_setup = self._i2s_capture_setup_status_locked()
+        if not i2s_setup["arecord_available"]:
+            raise RuntimeError("arecord is not installed on the Raspberry Pi.")
+        if not i2s_setup["installed"]:
+            raise RuntimeError(
+                "I2S capture device was not found. Install the si4689_i2s overlay config and reboot before streaming."
+            )
         self._boot_locked(force=False)
         selected_station: Optional[Dict[str, Any]] = None
         if station_id:
@@ -2562,8 +2800,11 @@ class RadioBackend:
         if selected_station is None:
             raise RuntimeError("Tune a station before requesting the live stream.")
         if self._audio_out_mode not in {"i2s", "both"}:
-            self._audio_out_mode = "both"
+            self._audio_out_mode = "i2s"
             self._apply_audio_config_locked(self._require_radio_locked())
+            self._apply_mute_locked()
+            selected_station = self._retune_station_locked(selected_station)
+            self._save_runtime_state_locked()
         return {
             "device": self._resolve_live_stream_device_locked(),
             "sample_rate": self.config.sample_rate,

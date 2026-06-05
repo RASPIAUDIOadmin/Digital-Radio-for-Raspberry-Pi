@@ -38,11 +38,13 @@ class RadioHTTPServer(ThreadingHTTPServer):
             with contextlib.suppress(Exception):
                 process.communicate(timeout=0.1)
             return
-        process.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
+        with contextlib.suppress(Exception):
+            process.terminate()
+        with contextlib.suppress(Exception):
             process.communicate(timeout=1.0)
         if process.poll() is None:
-            process.kill()
+            with contextlib.suppress(Exception):
+                process.kill()
             with contextlib.suppress(Exception):
                 process.communicate(timeout=1.0)
 
@@ -116,6 +118,10 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             station_id = query.get("station_id", [""])[0]
             self._serve_wav_stream(station_id=station_id, send_body=send_body)
             return
+        if parsed.path == "/audio/live.wav":
+            station_id = query.get("station_id", [None])[0]
+            self._serve_wav_stream(station_id=station_id, send_body=send_body)
+            return
         if parsed.path == "/audio/live.mp3":
             station_id = query.get("station_id", [None])[0]
             self._serve_live_audio(send_body=send_body, station_id=station_id, query=query)
@@ -167,11 +173,28 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/mute":
                 self._send_ok(self.server.backend.set_muted(body.get("enabled")))
                 return
+            if parsed.path == "/api/audio-output":
+                requested_output = str(body.get("mode") or body.get("audio_out") or "")
+                if requested_output.strip().lower() in {"analog", "dac", "jack"}:
+                    self.server.stop_active_stream()
+                status = self.server.backend.set_audio_output(requested_output)
+                if status.get("audio_out") == "analog":
+                    self.server.stop_active_stream()
+                self._send_ok(status)
+                return
             if parsed.path == "/api/oled":
                 self._send_ok(self.server.backend.set_oled_enabled(bool(body.get("enabled", False))))
                 return
             if parsed.path == "/api/system-autostart":
                 self._send_ok(self.server.backend.set_start_with_system(bool(body.get("enabled", False))))
+                return
+            if parsed.path == "/api/i2s/install":
+                self._send_ok(
+                    self.server.backend.install_i2s_capture_config(
+                        confirm=bool(body.get("confirm", False)),
+                        enable_autostart=bool(body.get("enable_autostart", True)),
+                    )
+                )
                 return
             if parsed.path == "/api/favorite":
                 self._send_ok(
@@ -446,21 +469,24 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
                 return candidate
         return None
 
-    def _serve_wav_stream(self, station_id: str, send_body: bool = True) -> None:
+    def _serve_wav_stream(self, station_id: str | None = None, send_body: bool = True) -> None:
         station_id = str(station_id or "").strip()
-        if not station_id:
-            self._send_error_json(400, "station_id is required.", send_body=send_body)
-            return
         process: subprocess.Popen[bytes] | None = None
         headers_sent = False
         try:
             if not send_body:
-                stream_info = self.server.backend.prepare_live_stream(station_id=station_id, auto_tune=True)
+                stream_info = self.server.backend.prepare_live_stream(
+                    station_id=station_id or None,
+                    auto_tune=bool(station_id),
+                )
                 self._send_wav_stream_headers(stream_info)
                 return
             with self.server.stream_lock:
                 self.server.stop_active_stream()
-                stream_info = self.server.backend.prepare_live_stream(station_id=station_id, auto_tune=True)
+                stream_info = self.server.backend.prepare_live_stream(
+                    station_id=station_id or None,
+                    auto_tune=bool(station_id),
+                )
                 capture_format = str(stream_info["format"])
 
                 def _start_wav_process(active_format: str) -> subprocess.Popen[bytes]:
@@ -1019,9 +1045,9 @@ def _print_startup_banner(host: str, port: int, alias: str) -> None:
     print("Open one of these URLs:")
     for url in _startup_urls(host, port, alias):
         print(f"  {url}")
-    print("Live MPEG stream:")
+    print("Live PCM WAV stream:")
     for url in _startup_urls(host, port, alias):
-        print(f"  {url.rstrip('/')}/audio/live.mp3")
+        print(f"  {url.rstrip('/')}/audio/live.wav")
     if alias:
         print(f"Suggested network alias: {alias}")
         print(f"  If your hostname or mDNS alias is set to `{alias}`, try http://{alias}.local:{port}/")

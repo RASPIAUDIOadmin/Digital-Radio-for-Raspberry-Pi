@@ -65,7 +65,7 @@ You should see `/dev/spidev0.0` and `/dev/spidev0.1`.
 Start the local radio server:
 
 ```bash
-python radio.py serve --port 8686
+sudo python3 radio.py serve --port 8686
 ```
 
 Then open:
@@ -76,6 +76,8 @@ http://piradio.local:8686/
 
 If you are already on the Raspberry Pi, this is enough to get the Web UI and the CLI backend running.
 
+Run the server with `sudo`. The backend talks directly to Raspberry Pi hardware devices such as SPI, GPIO, I2C, and ALSA capture devices. `sudo` is also required if you use the Web UI helper that edits `/boot/firmware/config.txt` for I2S recording/browser streaming or enables the `raspiaudio-radio.service` system service.
+
 ## Main features
 
 - DAB / DAB+
@@ -84,6 +86,7 @@ If you are already on the Raspberry Pi, this is enough to get the Web UI and the
 - AM
 - AM HD
 - local Web UI to scan, browse, tune, change volume, manage favorites, and handle recordings
+- selectable audio output from the Web UI: analog output on the shield or direct browser playback
 - CLI to control the backend from the terminal or integrate the radio into your own software
 - direct HTTP stream URLs for VLC, a browser, Music Assistant, or any compatible network player
 - analog audio output on the shield
@@ -117,6 +120,7 @@ The recommended workflow is the local Web UI.
 
 It gives you:
 - source mode selection
+- audio output selection between `Analog output` and `Browser output`
 - station scan
 - station selection
 - favorites
@@ -129,7 +133,7 @@ It gives you:
 Start the server on the Raspberry Pi:
 
 ```bash
-python radio.py serve --port 8686
+sudo python3 radio.py serve --port 8686
 ```
 
 Then open:
@@ -164,7 +168,7 @@ card 2: si4689i2s [si4689_i2s], device 0: ...
 The server now auto-detects this ALSA capture device for recordings, so the normal command stays:
 
 ```bash
-python radio.py serve --port 8686
+sudo python3 radio.py serve --port 8686
 ```
 
 The default backend uses the Raspberry Pi as the I2S clock master and the SI4689 as I2S slave, which matches the Skyworks SDK example and the `adau7002-simple` capture overlay.
@@ -174,34 +178,57 @@ By default, the backend also trims the first `3` seconds of each WAV recording t
 If needed, you can still force a device manually:
 
 ```bash
-python radio.py serve --port 8686 --record-device plughw:CARD=si4689i2s,DEV=0
+sudo python3 radio.py serve --port 8686 --record-device plughw:CARD=si4689i2s,DEV=0
 ```
 
 If your hardware is wired for the opposite clock direction, you can override it:
 
 ```bash
-python radio.py serve --port 8686 --i2s-master
+sudo python3 radio.py serve --port 8686 --i2s-master
 ```
 
 If you want to keep the full raw capture without trimming the first seconds:
 
 ```bash
-python radio.py serve --port 8686 --record-trim-seconds 0
+sudo python3 radio.py serve --port 8686 --record-trim-seconds 0
 ```
 
 ## Stream URLs and Music Assistant integration
 
-The server can expose the shield as a live radio source for Music Assistant, VLC, a browser, or any player that can open an HTTP MP3 stream.
+The server can expose the shield as a live radio source for Music Assistant, VLC, a browser, or any player that can open an HTTP audio stream.
+
+### Browser Output mode
+
+The Web UI has two listening modes at the top of the page:
+
+- `Analog output`
+  plays audio through the shield DAC, jack output, and onboard amplifier.
+- `Browser output`
+  plays the currently tuned station directly in the web browser on the local network.
+
+Browser Output uses `/audio/live.wav`, a direct PCM WAV stream captured from the SI4689 I2S output through the Raspberry Pi ALSA capture device. It avoids MP3 compression, so it is the recommended mode for best quality on a local network.
+
+The blue volume slider is shared by both outputs. It controls the SI4689 analog volume and the browser player volume, so there is only one volume control in the Web UI.
+
+Browser Output requires the I2S capture overlay described in [I2S recording on Raspberry Pi](#i2s-recording-on-raspberry-pi). If the Web UI does not detect the `si4689_i2s` capture device, it shows an installation prompt. After confirmation, the server can add the required lines to `/boot/firmware/config.txt`, enable the system service at boot, and ask you to reboot.
+
+This helper requires the server to be started with `sudo`:
+
+```bash
+sudo python3 radio.py serve --port 8686
+```
 
 Stream URLs require the SI4689 I2S audio capture device to be installed on the Raspberry Pi.
-The server captures `si4689_i2s` through ALSA and uses `ffmpeg` to expose MP3 streams over HTTP.
-Install the I2S overlay described in [I2S recording on Raspberry Pi](#i2s-recording-on-raspberry-pi) before using `/audio/live.mp3`, station stream URLs, or generated playlists.
+The Web UI browser output uses direct PCM WAV from `si4689_i2s` through ALSA, with no MP3 compression.
+MP3 endpoints remain available for external players that need compressed audio or ICY metadata.
+Install the I2S overlay described in [I2S recording on Raspberry Pi](#i2s-recording-on-raspberry-pi) before using `/audio/live.wav`, `/audio/live.mp3`, station stream URLs, or generated playlists.
 
 The important endpoints are:
 
 ```text
 http://piradio.local:8686/audio/live.mp3
 http://piradio.local:8686/audio/live.mp3?icy=1
+http://piradio.local:8686/audio/live.wav
 http://piradio.local:8686/audio/stations/<station_id>.mp3
 http://piradio.local:8686/stream.wav?station_id=<station_id>
 http://piradio.local:8686/api/station-streams?mode=dab
@@ -217,6 +244,8 @@ How it works:
   streams the currently tuned station
 - `/audio/live.mp3?icy=1`
   streams the currently tuned station with forced ICY metadata for compatible players
+- `/audio/live.wav`
+  streams the currently tuned station as direct PCM WAV, recommended for browser output on a local network
 - `/audio/stations/<station_id>.mp3`
   retunes the hardware to the requested station and streams it
 - `/stream.wav?station_id=<station_id>`
@@ -239,7 +268,7 @@ You do not have to use the Raspiaudio Web UI if you prefer your usual player.
 For a quick test, paste the live stream URL directly into a browser:
 
 ```text
-http://piradio.local:8686/audio/live.mp3
+http://piradio.local:8686/audio/live.wav
 ```
 
 For a station browser, open the generated DAB playlist in VLC with `Media` -> `Open Network Stream`:
@@ -330,7 +359,7 @@ That means you can control the radio manually from the terminal, or use the comm
 Open a first terminal on the Raspberry Pi and start the local backend:
 
 ```bash
-python radio.py serve --port 8686
+sudo python3 radio.py serve --port 8686
 ```
 
 Then keep a second terminal open and send commands interactively, one by one:
@@ -414,13 +443,13 @@ python radio.py flash dab
 Start the web server by booting the firmware from flash:
 
 ```bash
-python radio.py serve --port 8686 --boot-source flash
+sudo python3 radio.py serve --port 8686 --boot-source flash
 ```
 
 You can also ask the server to try flash first and fall back to normal SPI host-load if flash boot fails:
 
 ```bash
-python radio.py serve --port 8686 --boot-source auto
+sudo python3 radio.py serve --port 8686 --boot-source auto
 ```
 
 Validation method:

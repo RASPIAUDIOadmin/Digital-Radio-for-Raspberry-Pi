@@ -72,7 +72,8 @@ body::after {
     "status status"
     "source source"
     "stations stations"
-    "recordings recordings";
+    "recordings recordings"
+    "configuration configuration";
   gap: 1rem;
   align-items: start;
 }
@@ -159,11 +160,79 @@ body::after {
   flex-wrap: wrap;
 }
 
-.hero-settings {
+.configuration-grid {
   margin-top: 0.85rem;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.85rem;
+}
+
+.audio-output-card {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid rgba(46, 102, 212, 0.18);
+  border-radius: 1.35rem;
+  background:
+    linear-gradient(135deg, rgba(255, 154, 62, 0.12), transparent 42%),
+    linear-gradient(155deg, rgba(46, 102, 212, 0.1), rgba(255, 255, 255, 0.94));
+  box-shadow: 0 18px 36px rgba(46, 102, 212, 0.1);
+}
+
+.audio-output-head,
+.audio-output-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.audio-output-head {
+  justify-content: space-between;
+}
+
+.audio-output-head h2 {
+  margin: 0;
+  color: var(--brand-ink);
+  font-size: clamp(1.2rem, 2vw, 1.55rem);
+}
+
+.audio-output-actions {
+  margin-top: 0.9rem;
+}
+
+.browser-audio-player {
+  display: none;
+}
+
+#browserOutputHint {
+  display: block;
+  margin-top: 0.6rem;
+  color: rgba(47, 53, 66, 0.68);
+  line-height: 1.35;
+}
+
+.i2s-setup-card {
+  margin-top: 0.85rem;
+  padding: 0.85rem;
+  display: grid;
+  gap: 0.55rem;
+  border: 1px solid rgba(215, 60, 60, 0.22);
+  border-radius: 1rem;
+  color: var(--brand-ink);
+  background: rgba(255, 246, 238, 0.82);
+}
+
+.i2s-setup-card[hidden] {
+  display: none;
+}
+
+.i2s-setup-card small {
+  color: rgba(47, 53, 66, 0.72);
+  line-height: 1.35;
+}
+
+.i2s-setup-card .btn {
+  justify-self: start;
 }
 
 .hero-control-bar {
@@ -335,6 +404,13 @@ body::after {
 .btn-ghost.is-on {
   border-color: rgba(20, 147, 108, 0.28);
   color: var(--status-green);
+}
+
+.audio-output-actions .btn.is-on {
+  color: var(--brand-white);
+  border-color: transparent;
+  background: linear-gradient(135deg, var(--status-green), #0f7658);
+  box-shadow: 0 14px 32px rgba(20, 147, 108, 0.22);
 }
 
 .signal-ring {
@@ -598,7 +674,8 @@ body::after {
 }
 
 .station-panel,
-.recordings-panel {
+.recordings-panel,
+.configuration-panel {
   grid-column: 1 / -1;
 }
 
@@ -608,6 +685,10 @@ body::after {
 
 .recordings-panel {
   grid-area: recordings;
+}
+
+.configuration-panel {
+  grid-area: configuration;
 }
 
 .station-toolbar {
@@ -758,7 +839,8 @@ body::after {
       "status"
       "source"
       "stations"
-      "recordings";
+      "recordings"
+      "configuration";
   }
 
   .mode-grid {
@@ -793,9 +875,10 @@ body::after {
   }
 
   .hero-actions,
+  .audio-output-head,
+  .audio-output-actions,
   .hero-control-bar,
   .hero-link-row,
-  .hero-settings,
   .status-line,
   .toggle-row,
   .volume-strip,
@@ -807,7 +890,7 @@ body::after {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .hero-settings {
+  .configuration-grid {
     grid-template-columns: 1fr;
   }
 

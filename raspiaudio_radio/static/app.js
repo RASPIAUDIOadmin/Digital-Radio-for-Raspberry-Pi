@@ -8,6 +8,9 @@ const state = {
   filter: "",
   pollingHandle: null,
   volumeDebounce: null,
+  browserOutputPlaying: false,
+  browserOutputStarting: false,
+  browserOutputMessage: "",
 };
 
 function sleep(ms) {
@@ -40,6 +43,15 @@ function setBusy(button, busy, label) {
 
 function setError(message = "") {
   document.getElementById("errorLine").textContent = message;
+}
+
+function setBrowserPlayFallback(message) {
+  state.browserOutputPlaying = false;
+  state.browserOutputMessage = `Browser output is enabled, but playback is paused. Click Browser output again or allow audio playback in this browser. ${message}`;
+  if (browserOutputSupported(state.status || {})) {
+    updateAudioOutputUi(state.status || {});
+  }
+  setError(state.browserOutputMessage);
 }
 
 function formatFrequency(station) {
@@ -102,7 +114,185 @@ function renderModes() {
   });
 }
 
-function updateStatus(status) {
+function audioOutputLabel(mode) {
+  if (mode === "analog") return "Analog";
+  if (mode === "i2s") return "Browser";
+  if (mode === "both") return "Both";
+  return "Unknown";
+}
+
+function browserOutputSupported(status) {
+  const audioOut = String(status?.audio_out || "").toLowerCase();
+  return audioOut === "i2s" || audioOut === "both";
+}
+
+function clampVolumeLevel(value) {
+  const level = Number(value);
+  if (!Number.isFinite(level)) return 0;
+  return Math.max(0, Math.min(63, Math.round(level)));
+}
+
+function browserVolumeFromLevel(level) {
+  return clampVolumeLevel(level) / 63;
+}
+
+function updateVolumeReadout(level) {
+  const normalized = clampVolumeLevel(level);
+  document.getElementById("volumeLabel").textContent = `${normalized} / 63`;
+  document.getElementById("volumeSlider").value = normalized;
+}
+
+function applyBrowserPlayerVolume(level, muted = state.status?.muted) {
+  const player = document.getElementById("browserAudioPlayer");
+  if (!player) return;
+  player.volume = browserVolumeFromLevel(level);
+  player.muted = Boolean(muted);
+}
+
+function streamUrlWithCacheBust(path) {
+  const separator = String(path || "").includes("?") ? "&" : "?";
+  return `${path}${separator}ts=${Date.now()}`;
+}
+
+function stopBrowserAudio({ clearSource = true } = {}) {
+  const player = document.getElementById("browserAudioPlayer");
+  if (!player) return;
+  player.pause();
+  player.loop = false;
+  if (clearSource) {
+    player.removeAttribute("src");
+    player.load();
+  }
+  state.browserOutputPlaying = false;
+  state.browserOutputMessage = "";
+}
+
+async function startBrowserAudio({ forceNewStream = false } = {}) {
+  const player = document.getElementById("browserAudioPlayer");
+  if (!player) return;
+  const streamPath = state.status?.live_stream?.path || "/audio/live.wav";
+  if (!state.status?.current_station) {
+    setError("Tune a station before starting browser output.");
+    return;
+  }
+  player.loop = false;
+  applyBrowserPlayerVolume(state.status?.volume ?? 0, state.status?.muted);
+  if (forceNewStream || !player.getAttribute("src")) {
+    player.src = streamUrlWithCacheBust(streamPath);
+    player.load();
+  }
+  try {
+    const playback = player.play();
+    await Promise.race([
+      playback,
+      sleep(15000).then(() => {
+        throw new Error("Playback did not start automatically.");
+      }),
+    ]);
+    await sleep(250);
+    if (player.paused) {
+      throw new Error("The browser kept the player paused.");
+    }
+    state.browserOutputPlaying = true;
+    state.browserOutputMessage = "";
+    setError("");
+  } catch (error) {
+    setBrowserPlayFallback(error.message);
+  }
+}
+
+function scheduleBrowserPlaybackWatchdog() {
+  const delays = [600, 1800, 3600];
+  delays.forEach((delay, index) => {
+    window.setTimeout(async () => {
+      const player = document.getElementById("browserAudioPlayer");
+      if (!player || !browserOutputSupported(state.status || {}) || !player.getAttribute("src") || !player.paused) {
+        return;
+      }
+      try {
+        await player.play();
+        await sleep(250);
+        if (!player.paused) {
+          state.browserOutputPlaying = true;
+          setError("");
+          updateAudioOutputUi(state.status || {});
+          return;
+        }
+      } catch (error) {
+        if (index === delays.length - 1) {
+          setBrowserPlayFallback(error.message);
+        }
+        return;
+      }
+      if (index === delays.length - 1) {
+        setBrowserPlayFallback("Playback is still paused.");
+      }
+    }, delay);
+  });
+}
+
+function i2sSetupText(setup) {
+  const configPath = setup?.config_path || "/boot/firmware/config.txt";
+  const lines = (setup?.required_lines || []).join(" and ");
+  if (!setup?.arecord_available) {
+    return "Browser output and recording need arecord. Install alsa-utils, then reload this page.";
+  }
+  if (setup?.config_ready && !setup?.installed) {
+    return `The I2S overlay is already in ${configPath}, but the capture device is not active yet. Reboot the Raspberry Pi.`;
+  }
+  return `Add ${lines} to ${configPath}. This modifies the boot config, enables start with the system, and requires a reboot.`;
+}
+
+function updateI2sSetupUi(liveStream) {
+  const setup = liveStream?.i2s_setup || {};
+  const card = document.getElementById("i2sSetupCard");
+  const text = document.getElementById("i2sSetupText");
+  const button = document.getElementById("i2sInstallButton");
+  if (!card || !text || !button) return;
+  const showSetup = Boolean(liveStream && !liveStream.supported);
+  card.hidden = !showSetup;
+  if (!showSetup) return;
+  text.textContent = i2sSetupText(setup);
+  button.disabled = setup.config_ready || setup.install_available === false;
+  button.textContent = setup.config_ready ? "Reboot required" : "Install I2S capture config";
+}
+
+function updateAudioOutputUi(status) {
+  const audioOut = String(status.audio_out || "both").toLowerCase();
+  const outputState = document.getElementById("browserOutputState");
+  const analogButton = document.getElementById("analogOutputButton");
+  const browserButton = document.getElementById("browserOutputButton");
+  const hint = document.getElementById("browserOutputHint");
+  const player = document.getElementById("browserAudioPlayer");
+  const liveStream = status.live_stream || {};
+  const browserReady = Boolean(liveStream.supported && liveStream.ready);
+  const browserHardware = browserOutputSupported(status);
+  updateI2sSetupUi(liveStream);
+
+  outputState.textContent = audioOutputLabel(audioOut);
+  analogButton.classList.toggle("is-on", audioOut === "analog");
+  browserButton.classList.toggle("is-on", browserHardware);
+  browserButton.disabled = !liveStream.supported;
+  player.classList.toggle("is-ready", browserHardware);
+
+  if (audioOut === "analog" && !state.browserOutputStarting) {
+    stopBrowserAudio();
+  }
+
+  if (!liveStream.supported) {
+    hint.textContent = liveStream.i2s_setup?.message || "Browser output needs the Raspberry Pi I2S capture device and arecord.";
+  } else if (!browserReady) {
+    hint.textContent = "Tune a station, then choose Browser output to listen from this page.";
+  } else if (browserHardware) {
+    hint.textContent = state.browserOutputPlaying
+      ? "Browser output is playing the local PCM WAV stream from the SI4689 I2S capture."
+      : "Browser output is enabled. If playback is paused, click Browser output again.";
+  } else {
+    hint.textContent = "Analog output uses the onboard DAC, jack and amplifier.";
+  }
+}
+
+function updateStatus(status, { preserveError = false } = {}) {
   state.status = status;
   const current = status.current_station || {};
   const signal = status.signal || {};
@@ -119,12 +309,13 @@ function updateStatus(status) {
   document.getElementById("snrValue").textContent = signal.snr ?? "-";
   document.getElementById("ficqValue").textContent = signal.fic_quality ?? "-";
   document.getElementById("cnrValue").textContent = signal.cnr ?? "-";
-  document.getElementById("volumeLabel").textContent = `${status.volume ?? 0} / 63`;
-  document.getElementById("volumeSlider").value = status.volume ?? 0;
+  updateVolumeReadout(status.volume ?? 0);
+  applyBrowserPlayerVolume(status.volume ?? 0, status.muted);
   document.getElementById("bootState").textContent = status.booted
     ? `${status.mode_label} backend ready.`
     : "Backend is not initialized.";
-  document.getElementById("audioOutLabel").textContent = `Audio out: ${status.audio_out || "both"}`;
+  document.getElementById("audioOutLabel").textContent = `Audio out: ${audioOutputLabel(status.audio_out || "both")}`;
+  updateAudioOutputUi(status);
   document.getElementById("scanMeta").textContent = status.last_scan_time
     ? `Last scan: ${formatTimestamp(status.last_scan_time)}`
     : "No scan yet";
@@ -174,7 +365,9 @@ function updateStatus(status) {
     badge.textContent = "Ready";
   }
 
-  setError(status.last_error || "");
+  if (!preserveError) {
+    setError(state.browserOutputMessage || status.last_error || "");
+  }
   updateDabMedia(status);
   renderModes();
   renderStations();
@@ -285,11 +478,11 @@ function recordingsSignature(recordings) {
   );
 }
 
-async function refreshStatus() {
+async function refreshStatus(options = {}) {
   try {
     const status = await api("/api/status");
     const modeChanged = state.loadedMode !== status.mode;
-    updateStatus(status);
+    updateStatus(status, options);
     if (modeChanged) {
       await refreshStations(status.mode);
     }
@@ -374,7 +567,11 @@ async function scanStations() {
 }
 
 async function playStation(stationId) {
+  const keepBrowserOutput = browserOutputSupported(state.status || {});
   try {
+    if (keepBrowserOutput) {
+      stopBrowserAudio();
+    }
     const status = await api("/api/play", {
       method: "POST",
       body: JSON.stringify({ station_id: stationId }),
@@ -382,6 +579,15 @@ async function playStation(stationId) {
     updateStatus(status);
     await refreshStations(status.mode);
     await refreshFavorites();
+    if (keepBrowserOutput) {
+      const outputStatus = await api("/api/audio-output", {
+        method: "POST",
+        body: JSON.stringify({ mode: "browser" }),
+      });
+      updateStatus(outputStatus, { preserveError: true });
+      await startBrowserAudio({ forceNewStream: true });
+      await refreshStatus({ preserveError: true });
+    }
   } catch (error) {
     setError(error.message);
   }
@@ -402,6 +608,10 @@ async function toggleFavorite(stationId, favorite) {
 }
 
 async function updateVolume(payload) {
+  if (payload && Object.prototype.hasOwnProperty.call(payload, "level")) {
+    updateVolumeReadout(payload.level);
+    applyBrowserPlayerVolume(payload.level, state.status?.muted);
+  }
   try {
     const status = await api("/api/volume", {
       method: "POST",
@@ -435,6 +645,51 @@ async function toggleMute() {
     updateStatus(status);
   } catch (error) {
     setError(error.message);
+  }
+}
+
+async function setAudioOutput(mode) {
+  const analogButton = document.getElementById("analogOutputButton");
+  const browserButton = document.getElementById("browserOutputButton");
+  const activeButton = mode === "analog" ? analogButton : browserButton;
+  setBusy(activeButton, true, mode === "analog" ? "Switching..." : "Starting...");
+  try {
+    if (mode === "browser") {
+      state.browserOutputStarting = true;
+      await startBrowserAudio({ forceNewStream: true });
+      const player = document.getElementById("browserAudioPlayer");
+      if (player?.paused) {
+        setBrowserPlayFallback("The browser kept the player paused.");
+      }
+      await refreshStatus({ preserveError: true });
+      scheduleBrowserPlaybackWatchdog();
+      return;
+    }
+    if (mode === "analog") {
+      state.browserOutputStarting = false;
+      stopBrowserAudio();
+      await sleep(120);
+    }
+    const status = await api("/api/audio-output", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    });
+    updateStatus(status, { preserveError: mode === "browser" });
+    if (mode === "analog") {
+      await sleep(150);
+      await refreshStatus();
+    }
+  } catch (error) {
+    if (mode === "browser") {
+      stopBrowserAudio();
+    }
+    setError(error.message);
+    await refreshStatus();
+  } finally {
+    if (mode === "browser") {
+      state.browserOutputStarting = false;
+    }
+    setBusy(activeButton, false);
   }
 }
 
@@ -483,6 +738,40 @@ async function setSystemAutostart(enabled) {
     await refreshStatus();
   } finally {
     toggle.disabled = false;
+  }
+}
+
+async function installI2sConfig() {
+  const button = document.getElementById("i2sInstallButton");
+  const setup = state.status?.live_stream?.i2s_setup || {};
+  const configPath = setup.config_path || "/boot/firmware/config.txt";
+  const confirmed = window.confirm(
+    `This will modify ${configPath}, enable raspiaudio-radio.service at boot, and require a Raspberry Pi reboot. Continue?`,
+  );
+  if (!confirmed) return;
+  setBusy(button, true, "Installing...");
+  try {
+    const result = await api("/api/i2s/install", {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, enable_autostart: true }),
+    });
+    if (result.status) {
+      updateStatus(result.status);
+    } else {
+      await refreshStatus();
+    }
+    const changed = Boolean(result.config?.changed);
+    const autostartError = result.autostart?.error ? ` Autostart warning: ${result.autostart.error}` : "";
+    setError(
+      changed
+        ? `I2S capture config added. Reboot the Raspberry Pi to activate browser output and recording.${autostartError}`
+        : `I2S capture config is already present. Reboot the Raspberry Pi if the device is still missing.${autostartError}`,
+    );
+  } catch (error) {
+    setError(error.message);
+    await refreshStatus();
+  } finally {
+    setBusy(button, false);
   }
 }
 
@@ -578,6 +867,21 @@ function wireEvents() {
   document.getElementById("muteButton").addEventListener("click", toggleMute);
   document.getElementById("ampButton").addEventListener("click", toggleAmplifier);
   document.getElementById("recordButton").addEventListener("click", toggleRecord);
+  document.getElementById("analogOutputButton").addEventListener("click", () => setAudioOutput("analog"));
+  document.getElementById("browserOutputButton").addEventListener("click", () => setAudioOutput("browser"));
+  document.getElementById("i2sInstallButton").addEventListener("click", installI2sConfig);
+  document.getElementById("browserAudioPlayer").addEventListener("play", () => {
+    state.browserOutputPlaying = true;
+    updateAudioOutputUi(state.status || {});
+  });
+  document.getElementById("browserAudioPlayer").addEventListener("pause", () => {
+    state.browserOutputPlaying = false;
+    updateAudioOutputUi(state.status || {});
+  });
+  document.getElementById("browserAudioPlayer").addEventListener("error", () => {
+    state.browserOutputPlaying = false;
+    setError("Browser audio stream failed. Check the I2S capture overlay and arecord.");
+  });
   document.getElementById("oledToggle").addEventListener("change", (event) => {
     setOledEnabled(Boolean(event.target.checked));
   });
@@ -585,9 +889,12 @@ function wireEvents() {
     setSystemAutostart(Boolean(event.target.checked));
   });
   document.getElementById("volumeSlider").addEventListener("input", (event) => {
+    const level = Number(event.target.value);
+    updateVolumeReadout(level);
+    applyBrowserPlayerVolume(level, state.status?.muted);
     clearTimeout(state.volumeDebounce);
     state.volumeDebounce = window.setTimeout(() => {
-      updateVolume({ level: Number(event.target.value) });
+      updateVolume({ level });
     }, 120);
   });
   document.getElementById("stationSearch").addEventListener("input", (event) => {
