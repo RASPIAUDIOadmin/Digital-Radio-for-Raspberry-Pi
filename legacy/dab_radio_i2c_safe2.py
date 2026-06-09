@@ -961,8 +961,10 @@ class Si468xDabRadio:
         self.set_property(PROP_FM_SEEK_BAND_BOTTOM, 8750)
         self.set_property(PROP_FM_SEEK_BAND_TOP, 10800)
         self.set_property(PROP_FM_SEEK_FREQUENCY_SPACING, 10)
-        self.set_property(PROP_FM_VALID_RSSI_THRESHOLD, 20)
-        self.set_property(PROP_FM_VALID_SNR_THRESHOLD, 10)
+        # Match the ESP32 FMHD field-tested thresholds; the defaults were too
+        # strict on several US HD Radio installs.
+        self.set_property(PROP_FM_VALID_RSSI_THRESHOLD, 18)
+        self.set_property(PROP_FM_VALID_SNR_THRESHOLD, 6)
         self.set_property(PROP_FM_VALID_SNR_TIME, 127)
         self.set_property(PROP_FM_VALID_HDLEVEL_THRESHOLD, 20)
 

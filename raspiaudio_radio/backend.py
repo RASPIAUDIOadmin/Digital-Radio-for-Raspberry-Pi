@@ -477,9 +477,9 @@ class RadioConfig:
     fm_min_khz: int = 87_500
     fm_max_khz: int = 108_000
     fm_step_khz: int = 100
-    fm_rssi_min: int = 20
-    fm_snr_min: int = 10
-    fm_hd_timeout_ms: int = 2500
+    fm_rssi_min: int = 18
+    fm_snr_min: int = 6
+    fm_hd_timeout_ms: int = 5000
     am_min_khz: int = 531
     am_max_khz: int = 1710
     am_step_khz: int = 9
@@ -562,6 +562,7 @@ class ButtonNavigator:
         self._ready = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.error: Optional[str] = None
         self._pressed: Dict[str, bool] = {name: False for name in self._pins}
         self._next_event_at: Dict[str, float] = {name: 0.0 for name in self._pins}
 
@@ -575,15 +576,29 @@ class ButtonNavigator:
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BCM)
         pull = GPIO.PUD_UP if self.active_low else GPIO.PUD_DOWN
-        for name, pin in self._pins.items():
-            assert pin is not None
-            GPIO.setup(pin, GPIO.IN, pull_up_down=pull)
-            self._pressed[name] = self._is_active(pin)
+        claimed: List[int] = []
+        try:
+            for name, pin in self._pins.items():
+                assert pin is not None
+                GPIO.setup(pin, GPIO.IN, pull_up_down=pull)
+                claimed.append(pin)
+                self._pressed[name] = self._is_active(pin)
+        except Exception as exc:
+            self.error = f"GPIO button navigation disabled: {exc}"
+            for pin in claimed:
+                try:
+                    GPIO.cleanup(pin)
+                except Exception:
+                    pass
+            self.enabled = False
+            self._ready = False
+            return False
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="button-nav", daemon=True)
         self._thread.start()
         self._ready = True
         self.enabled = True
+        self.error = None
         return True
 
     def _is_active(self, pin: int) -> bool:
@@ -621,6 +636,7 @@ class ButtonNavigator:
         self._thread = None
         self._ready = False
         self.enabled = False
+        self.error = None
 
 
 class OledStatusDisplay:
@@ -924,11 +940,14 @@ class RadioBackend:
         )
         if not self._button_nav.start() and all(
             pin is not None for pin in (config.nav_cw_pin, config.nav_push_pin, config.nav_ccw_pin)
-        ) and GPIO is None:
-            self._last_error = (
-                "GPIO button navigation requested, but RPi.GPIO is unavailable. "
-                f"Import failed with: {_GPIO_IMPORT_ERROR}"
-            )
+        ):
+            if self._button_nav.error:
+                self._last_error = self._button_nav.error
+            elif GPIO is None:
+                self._last_error = (
+                    "GPIO button navigation requested, but RPi.GPIO is unavailable. "
+                    f"Import failed with: {_GPIO_IMPORT_ERROR}"
+                )
         self._oled = self._new_oled_locked(enabled=self._oled_requested)
         self._oled.start()
         atexit.register(self.close)
@@ -1607,6 +1626,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             "amp_pin": self.config.amp_pin,
             "button_nav": {
                 "enabled": self._button_nav.enabled,
+                "error": self._button_nav.error,
                 "mode": "station" if self._nav_station_mode else "volume",
                 "pending_push": self._nav_pending_push,
                 "cw_pin": self.config.nav_cw_pin,
@@ -2314,6 +2334,8 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         require_hd = scan_key in {"hd", "am_hd"}
         if band == "fm" and not require_hd:
             return self._scan_fm_clusters_locked()
+        if band == "fm" and require_hd:
+            return self._scan_fm_hd_locked()
         if band == "am" and not require_hd:
             return self._scan_am_peaks_locked()
         found: Dict[int, Dict[str, Any]] = {}
@@ -2404,6 +2426,32 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         flush()
         return self._save_scan_file_locked("fm", stations)
 
+    def _scan_fm_hd_locked(self) -> List[Dict[str, Any]]:
+        if not self._stations["fm"]:
+            print("HD scan: no FM cache found; scanning FM first.", flush=True)
+            self._scan_fm_clusters_locked()
+
+        candidate_freqs = sorted(
+            {
+                int(station["freq_khz"])
+                for station in (self._stations["fm"] + self._stations["hd"])
+                if int(station.get("freq_khz", 0)) > 0
+            }
+        )
+        print(f"HD scan: probing {len(candidate_freqs)} FM candidate frequency(ies).", flush=True)
+
+        found: Dict[int, Dict[str, Any]] = {}
+        for freq_khz in candidate_freqs:
+            station = self._probe_analog_station_locked(freq_khz, "fm", require_hd=True)
+            if station is None:
+                continue
+            existing = found.get(station["freq_khz"])
+            if existing is None or int(station.get("score", 0)) > int(existing.get("score", 0)):
+                found[station["freq_khz"]] = station
+
+        print(f"HD scan: found {len(found)} HD-capable frequency(ies).", flush=True)
+        return self._save_scan_file_locked("hd", list(found.values()))
+
     def _analog_scan_frequencies_locked(self, band: str, require_hd: bool) -> List[int]:
         frequencies: List[int] = []
         if band == "fm":
@@ -2429,7 +2477,11 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         tune_mode = 3 if band == "fm" and require_hd else 2 if band == "am" and require_hd else 0
         if band == "fm":
             radio.fm_tune(freq_khz, antcap=self.config.antcap, tune_mode=tune_mode)
-            signal = self._wait_fm_signal_locked(require_hd=require_hd)
+            signal = self._wait_fm_signal_locked(
+                require_hd=require_hd,
+                freq_khz=freq_khz,
+                log_prefix="HD probe" if require_hd else None,
+            )
             if signal is None:
                 return None
             analog_ready = self._is_fm_analog_ready(signal)
@@ -2453,15 +2505,17 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
                 return None
             measured_freq = int(signal.get("freq_khz") or freq_khz)
             scan_key = "am_hd" if require_hd else "am"
+        program_mask = self._normalized_hd_program_mask(signal) if hd_ready else 0
+        program_id = self._normalized_hd_program_id(signal) if hd_ready else 0
         station = self._normalize_station(
             scan_key,
             {
                 "freq_khz": measured_freq,
-                "label": self._default_station_label(scan_key, measured_freq, int(signal.get("audio_program_available", 0)), hd_ready),
+                "label": self._default_station_label(scan_key, measured_freq, program_mask, hd_ready),
                 "analog_available": analog_ready,
                 "hd_available": hd_ready,
-                "program_mask": int(signal.get("audio_program_available", 0)),
-                "program_id": 0,
+                "program_mask": program_mask,
+                "program_id": program_id,
             },
         )
         station["score"] = _analog_score(signal)
@@ -2474,7 +2528,14 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         merged["score"] = _analog_score(merged)
         return merged
 
-    def _wait_fm_signal_locked(self, require_hd: bool) -> Optional[Dict[str, Any]]:
+    def _wait_fm_signal_locked(
+        self,
+        require_hd: bool,
+        *,
+        timeout_ms: Optional[int] = None,
+        freq_khz: Optional[int] = None,
+        log_prefix: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         radio = self._require_radio_locked()
         if not require_hd:
             time.sleep(0.2)
@@ -2487,16 +2548,19 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             if best and self._is_fm_analog_ready(best):
                 return best
             return None
-        deadline = time.time() + (self.config.fm_hd_timeout_ms / 1000.0)
+        deadline = time.time() + ((timeout_ms or self.config.fm_hd_timeout_ms) / 1000.0)
         best = None
         while time.time() < deadline:
             signal = self._merge_fmhd_status(radio.fm_rsq_status(attune=True), radio.hd_digrad_status())
             if best is None or signal["score"] > best["score"]:
                 best = signal
             if self._is_hd_digital_ready(signal):
+                self._log_fmhd_probe(log_prefix, freq_khz, signal, ready=True)
                 return signal
             time.sleep(0.08)
-        return best if best and self._is_hd_digital_ready(best) else None
+        ready = bool(best and self._is_hd_digital_ready(best))
+        self._log_fmhd_probe(log_prefix, freq_khz, best, ready=ready)
+        return best if ready else None
 
     def _wait_am_signal_locked(self, require_hd: bool) -> Optional[Dict[str, Any]]:
         radio = self._require_radio_locked()
@@ -2525,14 +2589,64 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         return best if best and self._is_am_hd_ready(best) else None
 
     def _is_fm_analog_ready(self, signal: Dict[str, Any]) -> bool:
-        return int(signal.get("rssi", 0)) >= self.config.fm_rssi_min and int(signal.get("snr", 0)) >= self.config.fm_snr_min
+        return bool(signal.get("valid")) or (
+            int(signal.get("rssi", 0)) >= self.config.fm_rssi_min
+            and int(signal.get("snr", 0)) >= self.config.fm_snr_min
+        )
 
     def _is_hd_digital_ready(self, signal: Dict[str, Any]) -> bool:
         return (
-            int(signal.get("hdlevel", 0)) >= 20
-            and bool(signal.get("acq"))
+            bool(signal.get("acq"))
             and bool(signal.get("digital_source"))
-            and int(signal.get("audio_program_available", 0)) > 0
+            and (
+                int(signal.get("hdlevel", 0)) >= 20
+                or bool(signal.get("hd_detected"))
+                or bool(signal.get("audio_acquired"))
+                or int(signal.get("digital_audio_available", 0)) > 0
+                or int(signal.get("audio_program_available", 0)) > 0
+                or self._normalized_hd_program_id(signal) > 0
+            )
+        )
+
+    def _normalized_hd_program_id(self, signal: Dict[str, Any]) -> int:
+        program_id = int(signal.get("audio_program_playing", 0) or 0)
+        return 0 if program_id == 0xFF or program_id < 0 else program_id
+
+    def _normalized_hd_program_mask(self, signal: Dict[str, Any]) -> int:
+        mask = int(signal.get("audio_program_available", 0) or 0)
+        if mask:
+            return mask
+        program_id = self._normalized_hd_program_id(signal)
+        if 0 <= program_id < 8:
+            return 1 << program_id
+        return 0
+
+    def _log_fmhd_probe(
+        self,
+        prefix: Optional[str],
+        freq_khz: Optional[int],
+        signal: Optional[Dict[str, Any]],
+        *,
+        ready: bool,
+    ) -> None:
+        if not prefix:
+            return
+        label = f"{freq_khz / 1000.0:.1f} MHz" if freq_khz else "unknown"
+        if signal is None:
+            print(f"{prefix}: {label} no status ready={int(ready)}", flush=True)
+            return
+        print(
+            (
+                f"{prefix}: {label} valid={int(bool(signal.get('valid')))} "
+                f"rssi={int(signal.get('rssi', 0))} snr={int(signal.get('snr', 0))} "
+                f"hdDet={int(bool(signal.get('hd_detected')))} hdLevel={int(signal.get('hdlevel', 0))} "
+                f"dig={int(bool(signal.get('digital_source')))} acq={int(bool(signal.get('acq')))} "
+                f"audioAcq={int(bool(signal.get('audio_acquired')))} "
+                f"audioAvail={int(signal.get('digital_audio_available', 0))} "
+                f"prog=0x{int(signal.get('audio_program_available', 0)):02X} "
+                f"playing={int(signal.get('audio_program_playing', 0))} ready={int(ready)}"
+            ),
+            flush=True,
         )
 
     def _is_am_analog_ready(self, signal: Dict[str, Any]) -> bool:
