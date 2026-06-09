@@ -51,7 +51,27 @@ git clone https://github.com/RASPIAUDIOadmin/Digital-Radio-for-Raspberry-Pi.git
 cd Digital-Radio-for-Raspberry-Pi
 ```
 
-Enable SPI on the Raspberry Pi. The SI4689 radio chip is controlled over SPI, so the server can start but radio communication will fail if SPI is disabled.
+Start the local radio server:
+
+```bash
+sudo python3 radio.py serve --port 8686
+```
+
+Then open:
+
+```text
+http://piradio.local:8686/
+```
+
+If SPI is not active yet, the Web UI shows an `Enable SPI` prompt. Confirm it, reboot the Raspberry Pi when requested, then start the server again.
+
+Use `sudo` so the backend can access Raspberry Pi hardware and, when needed, update the boot config for SPI or I2S setup.
+
+If you are already on the Raspberry Pi, this is enough to get the Web UI and the CLI backend running.
+
+## Manual SPI setup
+
+The Web UI can enable SPI automatically. Use this manual method only if you prefer to configure the Raspberry Pi yourself, or if the automatic helper cannot update the boot config.
 
 ```bash
 sudo raspi-config
@@ -71,24 +91,6 @@ ls /dev/spidev*
 ```
 
 You should see `/dev/spidev0.0` and `/dev/spidev0.1`.
-
-Alternative: start the Web UI with `sudo`. If SPI is not active, the page shows an `Enable SPI` prompt. After confirmation, the server adds `dtparam=spi=on` to the Raspberry Pi boot config and asks you to reboot.
-
-Start the local radio server:
-
-```bash
-sudo python3 radio.py serve --port 8686
-```
-
-Then open:
-
-```text
-http://piradio.local:8686/
-```
-
-If you are already on the Raspberry Pi, this is enough to get the Web UI and the CLI backend running.
-
-Run the server with `sudo`. The backend talks directly to Raspberry Pi hardware devices such as SPI, GPIO, I2C, and ALSA capture devices. `sudo` is also required if you use the Web UI helpers that edit `/boot/firmware/config.txt` for SPI setup or I2S recording/browser streaming, or if you enable the `raspiaudio-radio.service` system service.
 
 ## Main features
 
