@@ -26,6 +26,11 @@
             <button id="restartServerButton" class="btn btn-secondary">Restart server</button>
             <button id="stopServerButton" class="btn btn-danger">Stop server</button>
           </div>
+          <div id="spiSetupCard" class="i2s-setup-card" hidden>
+            <strong>SPI interface disabled</strong>
+            <small id="spiSetupText">The SI4689 radio chip needs SPI control. Enable SPI and reboot the Raspberry Pi.</small>
+            <button id="spiInstallButton" class="btn btn-secondary" type="button">Enable SPI</button>
+          </div>
           <section class="audio-output-card" aria-labelledby="audioOutputTitle">
             <div class="audio-output-head">
               <div>
@@ -276,6 +281,6 @@
       </article>
     </template>
 
-    <script src="/app.js?v=1.5.0-20260609" defer></script>
+    <script src="/app.js?v=1.5.1-20260609" defer></script>
   </body>
 </html>

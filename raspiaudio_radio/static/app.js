@@ -480,6 +480,29 @@ function i2sSetupText(setup) {
   return `Add ${lines} to ${configPath}. This modifies the boot config, enables start with the system, and requires a reboot.`;
 }
 
+function spiSetupText(setup) {
+  const configPath = setup?.config_path || "/boot/firmware/config.txt";
+  const lines = (setup?.required_lines || []).join(" and ") || "dtparam=spi=on";
+  if (setup?.config_ready && !setup?.enabled) {
+    return `SPI is already enabled in ${configPath}, but /dev/spidev0.* is not active yet. Reboot the Raspberry Pi.`;
+  }
+  return `Add ${lines} to ${configPath}. This modifies the boot config and requires a Raspberry Pi reboot.`;
+}
+
+function updateSpiSetupUi(status) {
+  const setup = status?.spi_setup || {};
+  const card = document.getElementById("spiSetupCard");
+  const text = document.getElementById("spiSetupText");
+  const button = document.getElementById("spiInstallButton");
+  if (!card || !text || !button) return;
+  const showSetup = Boolean(setup && !setup.enabled);
+  card.hidden = !showSetup;
+  if (!showSetup) return;
+  text.textContent = setup.message ? `${setup.message} ${spiSetupText(setup)}` : spiSetupText(setup);
+  button.disabled = setup.config_ready || setup.install_available === false;
+  button.textContent = setup.config_ready ? "Reboot required" : "Enable SPI";
+}
+
 function updateI2sSetupUi(liveStream) {
   const setup = liveStream?.i2s_setup || {};
   const card = document.getElementById("i2sSetupCard");
@@ -548,6 +571,7 @@ function updateStatus(status, { preserveError = false } = {}) {
   document.getElementById("cnrValue").textContent = signal.cnr ?? "-";
   updateVolumeReadout(status.volume ?? 0);
   applyBrowserPlayerVolume(status.volume ?? 0, status.muted);
+  updateSpiSetupUi(status);
   document.getElementById("bootState").textContent = status.booted
     ? `${status.mode_label} backend ready.`
     : "Backend is not initialized.";
@@ -1011,6 +1035,39 @@ async function setSystemAutostart(enabled) {
   }
 }
 
+async function installSpiConfig() {
+  const button = document.getElementById("spiInstallButton");
+  const setup = state.status?.spi_setup || {};
+  const configPath = setup.config_path || "/boot/firmware/config.txt";
+  const confirmed = window.confirm(
+    `This will add dtparam=spi=on to ${configPath} and require a Raspberry Pi reboot. Continue?`,
+  );
+  if (!confirmed) return;
+  setBusy(button, true, "Enabling...");
+  try {
+    const result = await api("/api/spi/install", {
+      method: "POST",
+      body: JSON.stringify({ confirm: true }),
+    });
+    if (result.status) {
+      updateStatus(result.status);
+    } else {
+      await refreshStatus();
+    }
+    const changed = Boolean(result.config?.changed);
+    setError(
+      changed
+        ? "SPI config added. Reboot the Raspberry Pi to activate /dev/spidev0.* and radio control."
+        : "SPI config is already present. Reboot the Raspberry Pi if /dev/spidev0.* is still missing.",
+    );
+  } catch (error) {
+    setError(error.message);
+    await refreshStatus();
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 async function installI2sConfig() {
   const button = document.getElementById("i2sInstallButton");
   const setup = state.status?.live_stream?.i2s_setup || {};
@@ -1141,6 +1198,7 @@ function wireEvents() {
   document.getElementById("recordButton").addEventListener("click", toggleRecord);
   document.getElementById("analogOutputButton").addEventListener("click", () => setAudioOutput("analog"));
   document.getElementById("browserOutputButton").addEventListener("click", () => setAudioOutput("browser"));
+  document.getElementById("spiInstallButton")?.addEventListener("click", installSpiConfig);
   document.getElementById("i2sInstallButton").addEventListener("click", installI2sConfig);
   document.getElementById("browserAudioPlayer").addEventListener("play", () => {
     state.browserOutputPlaying = true;

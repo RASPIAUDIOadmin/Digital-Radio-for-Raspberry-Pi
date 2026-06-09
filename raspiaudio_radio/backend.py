@@ -108,6 +108,9 @@ _AUTO_RECORD_DEVICE_NAMES = (
     "hw:CARD=si4689_i2s,DEV=0",
 )
 _AUTO_RECORD_DEVICE_HINTS = ("si4689", "adau7002", "i2s")
+SPI_CONFIG_MARKER = "# Raspiaudio Digital Radio SPI control"
+SPI_CONFIG_LINES = ("dtparam=spi=on",)
+SPI_DEVICE_PATHS = ("/dev/spidev0.0", "/dev/spidev0.1")
 I2S_CAPTURE_CONFIG_MARKER = "# Raspiaudio Digital Radio I2S capture"
 I2S_CAPTURE_CONFIG_LINES = (
     "dtparam=i2s=on",
@@ -346,6 +349,10 @@ def _find_auto_record_device() -> Optional[str]:
     return None
 
 
+def _list_spi_devices() -> List[str]:
+    return [path for path in SPI_DEVICE_PATHS if Path(path).exists()]
+
+
 def _auto_detect_record_device() -> str:
     return _find_auto_record_device() or "default"
 
@@ -357,9 +364,21 @@ def _raspberry_config_path() -> Path:
     return Path("/boot/firmware/config.txt")
 
 
-def _has_i2s_capture_line(config_text: str, required_line: str) -> bool:
+def _has_boot_config_line(config_text: str, required_line: str) -> bool:
     normalized = required_line.strip()
-    return any(line.strip() == normalized for line in config_text.splitlines())
+    for raw_line in config_text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if line == normalized:
+            return True
+    return False
+
+
+def _has_i2s_capture_line(config_text: str, required_line: str) -> bool:
+    return _has_boot_config_line(config_text, required_line)
+
+
+def _has_spi_config_line(config_text: str, required_line: str) -> bool:
+    return _has_boot_config_line(config_text, required_line)
 
 
 def _read_i2s_config_flags(config_path: Path) -> Dict[str, bool]:
@@ -368,6 +387,14 @@ def _read_i2s_config_flags(config_path: Path) -> Dict[str, bool]:
     except OSError:
         config_text = ""
     return {line: _has_i2s_capture_line(config_text, line) for line in I2S_CAPTURE_CONFIG_LINES}
+
+
+def _read_spi_config_flags(config_path: Path) -> Dict[str, bool]:
+    try:
+        config_text = config_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        config_text = ""
+    return {line: _has_spi_config_line(config_text, line) for line in SPI_CONFIG_LINES}
 
 
 def _normalize_audio_output(value: object, *, default: str = "both") -> str:
@@ -1199,6 +1226,19 @@ class RadioBackend:
                 "status": self._status_payload_locked(refresh_signal=False),
             }
 
+    def install_spi_config(self, *, confirm: bool = False) -> Dict[str, Any]:
+        if not confirm:
+            raise ValueError("Confirmation is required before modifying the Raspberry Pi boot config.")
+        config_path = _raspberry_config_path()
+        install_result = self._write_spi_config(config_path)
+        with self._lock:
+            return {
+                "config": install_result,
+                "reboot_required": True,
+                "spi_setup": self._spi_setup_status_locked(),
+                "status": self._status_payload_locked(refresh_signal=False),
+            }
+
     def set_favorite(self, station_id: str, favorite: Optional[bool] = None) -> Dict[str, Any]:
         with self._lock:
             station_id = str(station_id).strip()
@@ -1407,6 +1447,32 @@ class RadioBackend:
             status_supplier=self._oled_snapshot,
         )
 
+    def _spi_setup_status_locked(self) -> Dict[str, Any]:
+        config_path = _raspberry_config_path()
+        config_lines_present = _read_spi_config_flags(config_path)
+        devices = _list_spi_devices()
+        enabled = bool(devices)
+        config_ready = all(config_lines_present.values())
+        if enabled:
+            message = "SPI is available."
+        elif config_ready:
+            message = "SPI is enabled in the boot config, but /dev/spidev0.* is not active yet. Reboot the Raspberry Pi."
+        else:
+            message = "SPI is not enabled. The SI4689 radio chip needs SPI control."
+        return {
+            "enabled": enabled,
+            "installed": enabled,
+            "devices": devices,
+            "expected_devices": list(SPI_DEVICE_PATHS),
+            "config_path": str(config_path),
+            "required_lines": list(SPI_CONFIG_LINES),
+            "config_lines_present": config_lines_present,
+            "config_ready": config_ready,
+            "install_available": shutil.which("sudo") is not None and shutil.which("python3") is not None,
+            "reboot_required": config_ready and not enabled,
+            "message": message,
+        }
+
     def _i2s_capture_setup_status_locked(self) -> Dict[str, Any]:
         arecord_path = shutil.which("arecord")
         configured_device = str(self.config.record_device or "").strip() or "auto"
@@ -1438,7 +1504,14 @@ class RadioBackend:
             "message": message,
         }
 
-    def _write_i2s_capture_config(self, config_path: Path) -> Dict[str, Any]:
+    def _write_boot_config_lines(
+        self,
+        *,
+        config_path: Path,
+        required_lines: List[str],
+        marker: str,
+        label: str,
+    ) -> Dict[str, Any]:
         script = r"""
 import json
 import sys
@@ -1451,7 +1524,9 @@ marker = sys.argv[3]
 if not path.parent.exists():
     raise FileNotFoundError(f"{path.parent} does not exist")
 text = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
-present = {line: any(raw.strip() == line for raw in text.splitlines()) for line in required}
+present = {}
+for line in required:
+    present[line] = any(raw.split("#", 1)[0].strip() == line for raw in text.splitlines())
 missing = [line for line in required if not present[line]]
 backup = None
 changed = False
@@ -1475,8 +1550,8 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
                     "-c",
                     script,
                     str(config_path),
-                    json.dumps(list(I2S_CAPTURE_CONFIG_LINES)),
-                    I2S_CAPTURE_CONFIG_MARKER,
+                    json.dumps(list(required_lines)),
+                    marker,
                 ],
                 check=False,
                 capture_output=True,
@@ -1491,10 +1566,26 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         try:
             payload = json.loads((result.stdout or "").strip().splitlines()[-1])
         except (IndexError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Unable to parse I2S install result: {(result.stdout or '').strip()}") from exc
-        payload["required_lines"] = list(I2S_CAPTURE_CONFIG_LINES)
+            raise RuntimeError(f"Unable to parse {label} install result: {(result.stdout or '').strip()}") from exc
+        payload["required_lines"] = list(required_lines)
         payload["reboot_required"] = True
         return payload
+
+    def _write_i2s_capture_config(self, config_path: Path) -> Dict[str, Any]:
+        return self._write_boot_config_lines(
+            config_path=config_path,
+            required_lines=list(I2S_CAPTURE_CONFIG_LINES),
+            marker=I2S_CAPTURE_CONFIG_MARKER,
+            label="I2S",
+        )
+
+    def _write_spi_config(self, config_path: Path) -> Dict[str, Any]:
+        return self._write_boot_config_lines(
+            config_path=config_path,
+            required_lines=list(SPI_CONFIG_LINES),
+            marker=SPI_CONFIG_MARKER,
+            label="SPI",
+        )
 
     def _enable_system_autostart_best_effort(self) -> Dict[str, Any]:
         service_name = str(self.config.system_service_name or "").strip()
@@ -1781,10 +1872,12 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
                 self._last_error = str(exc)
         scan_key = self._scan_key()
         service_status = self._refresh_system_service_status_locked()
+        spi_setup = self._spi_setup_status_locked()
         i2s_setup = self._i2s_capture_setup_status_locked()
         return {
             "booted": self._booted,
             "transport": "spi",
+            "spi_setup": spi_setup,
             "mode": self._current_mode,
             "mode_label": self._mode_info()["label"],
             "available_modes": [dict(MODE_DEFS[key]) for key in PUBLIC_MODE_KEYS],

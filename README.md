@@ -30,11 +30,13 @@ The whole project is open source:
 - Product: [Raspiaudio Digital Radio Shield for Raspberry Pi](https://raspiaudio.com/product/digital-radio/)
 <li><a href="https://raspiaudio.com/product/digital-radio/" target="_blank" rel="noopener">Store </a></li>
 
-## Software release v1.5.0
+## Software release v1.5.1
 
-This release updates the Web UI source modes to `DAB`, `FM / HD`, and `AM / HD`.
+This release updates the Web UI source modes to `DAB`, `FM / HD`, and `AM / HD`, and adds a guided SPI setup prompt.
 
 For HD Radio testing in the United States, `FM / HD` now scans analog FM carriers first and then probes the detected FM frequencies for HD Radio. During long scans the Web UI shows backend-driven progress such as `FM 144/206 | 31 found` and `HD probe 20/45 | FM 45 found | HD 0`, so the scan should no longer look stuck while HD probing continues.
+
+If SPI is not enabled, the Web UI can now propose to add `dtparam=spi=on` to `/boot/firmware/config.txt` after confirmation. Reboot the Raspberry Pi after using this helper so `/dev/spidev0.*` appears.
 
 If HD Radio still does not lock in your area, run the server with logs and share the scan output so we can compare the SI4689 status during each HD probe.
 
@@ -70,6 +72,8 @@ ls /dev/spidev*
 
 You should see `/dev/spidev0.0` and `/dev/spidev0.1`.
 
+Alternative: start the Web UI with `sudo`. If SPI is not active, the page shows an `Enable SPI` prompt. After confirmation, the server adds `dtparam=spi=on` to the Raspberry Pi boot config and asks you to reboot.
+
 Start the local radio server:
 
 ```bash
@@ -84,7 +88,7 @@ http://piradio.local:8686/
 
 If you are already on the Raspberry Pi, this is enough to get the Web UI and the CLI backend running.
 
-Run the server with `sudo`. The backend talks directly to Raspberry Pi hardware devices such as SPI, GPIO, I2C, and ALSA capture devices. `sudo` is also required if you use the Web UI helper that edits `/boot/firmware/config.txt` for I2S recording/browser streaming or enables the `raspiaudio-radio.service` system service.
+Run the server with `sudo`. The backend talks directly to Raspberry Pi hardware devices such as SPI, GPIO, I2C, and ALSA capture devices. `sudo` is also required if you use the Web UI helpers that edit `/boot/firmware/config.txt` for SPI setup or I2S recording/browser streaming, or if you enable the `raspiaudio-radio.service` system service.
 
 ## Main features
 

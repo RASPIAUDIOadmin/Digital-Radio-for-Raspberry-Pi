@@ -200,6 +200,9 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
                     )
                 )
                 return
+            if parsed.path == "/api/spi/install":
+                self._send_ok(self.server.backend.install_spi_config(confirm=bool(body.get("confirm", False))))
+                return
             if parsed.path == "/api/favorite":
                 self._send_ok(
                     self.server.backend.set_favorite(
