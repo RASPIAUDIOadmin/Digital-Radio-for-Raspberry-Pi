@@ -16,7 +16,7 @@ import sys
 from typing import Any, Dict, List
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from .backend import RadioBackend, RadioConfig
+from .backend import RadioBackend, RadioConfig, _mode_token
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ICY_META_INTERVAL = 16 * 1024
@@ -88,12 +88,16 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/status":
             self._send_ok(self.server.backend.get_status(), send_body=send_body)
             return
+        if parsed.path == "/api/scan-progress":
+            self._send_ok(self.server.backend.get_scan_progress(), send_body=send_body)
+            return
         if parsed.path == "/api/stations":
             mode = query.get("mode", [None])[0]
             refresh = query.get("refresh", ["0"])[0].lower() in {"1", "true", "yes"}
             stations = self.server.backend.get_stations(mode=mode, refresh_from_disk=refresh)
+            resolved_mode = _mode_token(mode) if mode else self.server.backend.get_status()["mode"]
             self._send_ok(
-                {"stations": stations, "count": len(stations), "mode": mode or self.server.backend.get_status()["mode"]},
+                {"stations": stations, "count": len(stations), "mode": resolved_mode},
                 send_body=send_body,
             )
             return
@@ -409,7 +413,7 @@ class RadioRequestHandler(BaseHTTPRequestHandler):
         else:
             favorites_only = False
             mode = playlist_name[:-4].strip().lower().replace("-", "_")
-            if mode not in {"dab", "fm", "hd", "am", "am_hd"}:
+            if mode not in {"dab", "fmhd", "amhd", "fm", "hd", "am", "am_hd"}:
                 self._send_error_json(404, "Playlist not found.", send_body=send_body)
                 return
             title = f"Raspiaudio {mode.upper()}"

@@ -528,7 +528,7 @@ body::after {
 .mode-grid {
   margin-top: 1rem;
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.75rem;
 }
 
@@ -547,6 +547,27 @@ body::after {
   display: block;
   font-weight: 800;
   color: var(--brand-ink);
+}
+
+.station-name,
+.favorite-label {
+  display: flex;
+  align-items: center;
+  gap: 0.42rem;
+  flex-wrap: wrap;
+}
+
+.station-badge {
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  padding: 0.14rem 0.48rem;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  line-height: 1.1;
+  color: #fff;
+  background: linear-gradient(135deg, #093b75, #2e66d4);
+  box-shadow: 0 0.38rem 0.9rem rgba(46, 102, 212, 0.24);
 }
 
 .mode-card small,
@@ -705,6 +726,41 @@ body::after {
   padding: 0.95rem 1rem;
   font: inherit;
   background: rgba(255, 255, 255, 0.88);
+}
+
+.scan-progress {
+  margin-top: 0.75rem;
+  border: 1px solid rgba(46, 102, 212, 0.18);
+  border-radius: 1rem;
+  padding: 0.82rem 0.95rem;
+  background: linear-gradient(145deg, rgba(46, 102, 212, 0.08), rgba(255, 255, 255, 0.92));
+}
+
+.scan-progress-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  color: rgba(47, 53, 66, 0.72);
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.scan-progress-track {
+  margin-top: 0.62rem;
+  height: 0.72rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(46, 102, 212, 0.13);
+}
+
+.scan-progress-track span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--brand-blue), #14a078);
+  transition: width 500ms ease;
 }
 
 .station-list,

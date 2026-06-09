@@ -155,21 +155,13 @@
               <span>DAB</span>
               <small>Digital Audio Broadcasting</small>
             </button>
-            <button class="mode-card" data-mode="fm">
-              <span>FM</span>
-              <small>Analog FM reception</small>
+            <button class="mode-card" data-mode="fmhd">
+              <span>FM / HD</span>
+              <small>FM with HD auto-detection</small>
             </button>
-            <button class="mode-card" data-mode="hd">
-              <span>HD Radio</span>
-              <small>Digital FM hybrid mode</small>
-            </button>
-            <button class="mode-card" data-mode="am">
-              <span>AM</span>
-              <small>Analog AM reception</small>
-            </button>
-            <button class="mode-card" data-mode="am_hd">
-              <span>AM HD</span>
-              <small>Digital AM hybrid mode</small>
+            <button class="mode-card" data-mode="amhd">
+              <span>AM / HD</span>
+              <small>AM with HD auto-detection</small>
             </button>
           </div>
         </section>
@@ -196,6 +188,22 @@
           <div class="station-toolbar">
             <input id="stationSearch" type="search" placeholder="Filter by station or frequency..." />
             <span id="scanMeta" class="toolbar-note">No scan yet</span>
+          </div>
+          <div id="scanProgress" class="scan-progress" hidden aria-live="polite">
+            <div class="scan-progress-head">
+              <span id="scanProgressLabel">Scanning stations...</span>
+              <span id="scanProgressTime">0:00</span>
+            </div>
+            <div
+              id="scanProgressTrack"
+              class="scan-progress-track"
+              role="progressbar"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <span id="scanProgressFill"></span>
+            </div>
           </div>
           <div id="stationList" class="station-list"></div>
         </section>
@@ -268,6 +276,6 @@
       </article>
     </template>
 
-    <script src="/app.js" defer></script>
+    <script src="/app.js?v=1.5.0-20260609" defer></script>
   </body>
 </html>

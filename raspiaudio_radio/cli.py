@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 DEFAULT_URL = os.environ.get("RASPIAUDIO_RADIO_URL", "http://127.0.0.1:8686")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FW_ROOT = REPO_ROOT / "firmwares"
-MODE_CHOICES = ["dab", "fm", "hd", "am", "am_hd"]
+MODE_CHOICES = ["dab", "fmhd", "amhd", "fm", "hd", "am", "am_hd"]
 
 
 def _request(

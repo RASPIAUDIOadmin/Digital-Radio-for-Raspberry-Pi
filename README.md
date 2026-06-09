@@ -30,6 +30,14 @@ The whole project is open source:
 - Product: [Raspiaudio Digital Radio Shield for Raspberry Pi](https://raspiaudio.com/product/digital-radio/)
 <li><a href="https://raspiaudio.com/product/digital-radio/" target="_blank" rel="noopener">Store </a></li>
 
+## Software release v1.5.0
+
+This release updates the Web UI source modes to `DAB`, `FM / HD`, and `AM / HD`.
+
+For HD Radio testing in the United States, `FM / HD` now scans analog FM carriers first and then probes the detected FM frequencies for HD Radio. During long scans the Web UI shows backend-driven progress such as `FM 144/206 | 31 found` and `HD probe 20/45 | FM 45 found | HD 0`, so the scan should no longer look stuck while HD probing continues.
+
+If HD Radio still does not lock in your area, run the server with logs and share the scan output so we can compare the SI4689 status during each HD probe.
+
 ## Quickstart
 
 Because we understand that you might be busy with your job or family, here is how to have instant fun.

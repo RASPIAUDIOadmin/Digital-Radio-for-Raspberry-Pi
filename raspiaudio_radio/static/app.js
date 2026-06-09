@@ -8,6 +8,12 @@ const state = {
   filter: "",
   pollingHandle: null,
   volumeDebounce: null,
+  scanProgressHandle: null,
+  scanProgressWatcherHandle: null,
+  scanProgressToken: 0,
+  scanProgressSeenActive: false,
+  scanProgressSyncing: false,
+  backendScanActive: false,
   browserOutputPlaying: false,
   browserOutputStarting: false,
   browserOutputMessage: "",
@@ -29,6 +35,19 @@ async function api(path, options = {}) {
   return payload.data;
 }
 
+async function apiWithTimeout(path, options = {}, timeoutMs = 2500) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await api(path, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 function setBusy(button, busy, label) {
   if (!button) return;
   button.disabled = busy;
@@ -43,6 +62,224 @@ function setBusy(button, busy, label) {
 
 function setError(message = "") {
   document.getElementById("errorLine").textContent = message;
+}
+
+function sourceModeLabel(mode) {
+  if (mode === "fmhd") return "FM / HD";
+  if (mode === "amhd") return "AM / HD";
+  if (mode === "dab") return "DAB";
+  return String(mode || "radio").toUpperCase();
+}
+
+function setStatusMessage(message, badgeText = "Working", badgeClass = "status-ready") {
+  document.getElementById("bootState").textContent = message;
+  const badge = document.getElementById("statusBadge");
+  badge.className = `status-badge ${badgeClass}`;
+  badge.textContent = badgeText;
+}
+
+function setModeCardsDisabled(disabled) {
+  document.querySelectorAll(".mode-card").forEach((button) => {
+    button.disabled = Boolean(disabled);
+  });
+}
+
+function scanProgressSummary(progress = {}) {
+  const current = Number(progress.current || 0);
+  const total = Number(progress.total || 0);
+  const found = Number(progress.found || 0);
+  const hdFound = Number(progress.hd_found || 0);
+  const stage = String(progress.stage || "");
+  const parts = [];
+  if (stage === "hd_probe") {
+    if (total > 0) parts.push(`HD probe ${Math.min(current, total)}/${total}`);
+    parts.push(`FM ${found} found`);
+    parts.push(`HD ${hdFound}`);
+    return parts.join(" | ");
+  }
+  if (stage === "fm_scan") {
+    if (total > 0) parts.push(`FM ${Math.min(current, total)}/${total}`);
+    parts.push(`${found} found`);
+    return parts.join(" | ");
+  }
+  if (stage === "am_hd_probe") {
+    if (total > 0) parts.push(`AM HD probe ${Math.min(current, total)}/${total}`);
+    parts.push(`AM ${found} found`);
+    parts.push(`HD ${hdFound}`);
+    return parts.join(" | ");
+  }
+  if (stage === "am_scan" || stage === "am_confirm") {
+    if (total > 0) parts.push(`AM ${Math.min(current, total)}/${total}`);
+    parts.push(`${found} found`);
+    return parts.join(" | ");
+  }
+  if (stage === "dab_scan") {
+    if (total > 0) parts.push(`DAB ${Math.min(current, total)}/${total}`);
+    parts.push(`${found} found`);
+    return parts.join(" | ");
+  }
+  if (hdFound > 0) parts.push(`HD ${hdFound}`);
+  if (found > 0) parts.push(`${found} found`);
+  if (total > 0) parts.push(`${Math.min(current, total)}/${total}`);
+  return parts.join(" | ") || "Working";
+}
+
+function renderScanProgress(progress = {}, fallbackMode = state.status?.mode || "dab") {
+  const mode = progress.mode || fallbackMode;
+  const label = progress.message || `${sourceModeLabel(mode)} scan in progress.`;
+  let percent = Number(progress.percent || 0);
+  if (progress.active && percent <= 0) {
+    percent = 1;
+  }
+  percent = Math.max(0, Math.min(100, Math.round(percent)));
+  document.getElementById("scanProgressLabel").textContent = label;
+  document.getElementById("scanProgressTime").textContent = scanProgressSummary(progress);
+  document.getElementById("scanProgressFill").style.width = `${percent}%`;
+  const track = document.getElementById("scanProgressTrack");
+  track.setAttribute("aria-valuenow", String(percent));
+  track.setAttribute("aria-label", `${sourceModeLabel(mode)} scan progress`);
+}
+
+async function refreshScanProgress(token, mode) {
+  if (token !== state.scanProgressToken) return;
+  try {
+    const progress = await apiWithTimeout("/api/scan-progress", { cache: "no-store" }, 1800);
+    if (token !== state.scanProgressToken) return;
+    renderScanProgress(progress, mode);
+  } catch (error) {
+    if (token !== state.scanProgressToken) return;
+    renderScanProgress(
+      {
+        active: true,
+        mode,
+        message: `Waiting for ${sourceModeLabel(mode)} scan progress...`,
+        percent: 1,
+      },
+      mode,
+    );
+  }
+}
+
+function startScanProgress(mode) {
+  stopScanProgress({ hide: true });
+  state.scanProgressToken += 1;
+  const token = state.scanProgressToken;
+  state.scanProgressSeenActive = true;
+  state.backendScanActive = true;
+  document.getElementById("scanProgress").hidden = false;
+  renderScanProgress(
+    {
+      active: true,
+      mode,
+      message: `Starting ${sourceModeLabel(mode)} scan...`,
+      percent: 1,
+    },
+    mode,
+  );
+  refreshScanProgress(token, mode);
+  state.scanProgressHandle = window.setInterval(() => refreshScanProgress(token, mode), 500);
+}
+
+function stopScanProgress({ completed = false, failed = false, hide = false, message = "", count = null } = {}) {
+  if (state.scanProgressHandle) {
+    window.clearInterval(state.scanProgressHandle);
+    state.scanProgressHandle = null;
+  }
+  if (hide) {
+    document.getElementById("scanProgress").hidden = true;
+    return;
+  }
+  const token = state.scanProgressToken;
+  const progress = document.getElementById("scanProgress");
+  if (completed) {
+    const stationCount = count === null ? null : Number(count);
+    renderScanProgress({
+      active: false,
+      mode: state.status?.mode,
+      stage: "complete",
+      message: message || "Scan complete.",
+      current: Number.isFinite(stationCount) ? stationCount : 1,
+      total: Number.isFinite(stationCount) ? stationCount : 1,
+      found: Number.isFinite(stationCount) ? stationCount : 0,
+      percent: 100,
+    });
+  } else if (failed) {
+    renderScanProgress({
+      active: false,
+      mode: state.status?.mode,
+      stage: "failed",
+      message: message || "Scan failed.",
+      percent: 100,
+    });
+  }
+  window.setTimeout(() => {
+    if (token === state.scanProgressToken) {
+      progress.hidden = true;
+    }
+  }, completed ? 1800 : 3500);
+}
+
+async function refreshAfterBackendScan(progress = {}) {
+  const mode = progress.mode || state.status?.mode;
+  await refreshStatus();
+  await refreshStations(mode);
+  await refreshFavorites();
+}
+
+async function syncBackendScanProgress() {
+  if (state.scanProgressSyncing) return;
+  state.scanProgressSyncing = true;
+  try {
+    const progress = await api("/api/scan-progress", { cache: "no-store" });
+    const active = Boolean(progress.active);
+    const mode = progress.mode || state.status?.mode || "dab";
+    const scanButton = document.getElementById("scanButton");
+
+    if (active) {
+      state.scanProgressSeenActive = true;
+      state.backendScanActive = true;
+      document.getElementById("scanProgress").hidden = false;
+      renderScanProgress(progress, mode);
+      setBusy(scanButton, true, "Scanning...");
+      setModeCardsDisabled(true);
+      document.getElementById("scanMeta").textContent = "Scanning...";
+      setStatusMessage(progress.message || `Scanning ${sourceModeLabel(mode)} stations...`, "Scanning");
+      return;
+    }
+
+    state.backendScanActive = false;
+    if (!state.scanProgressSeenActive) return;
+    state.scanProgressSeenActive = false;
+    setBusy(scanButton, false);
+    setModeCardsDisabled(false);
+    renderScanProgress(progress, mode);
+    if (progress.error) {
+      setStatusMessage(`Scan failed for ${sourceModeLabel(mode)}.`, "Error", "status-idle");
+      setError(progress.error);
+    } else {
+      setStatusMessage(`${sourceModeLabel(mode)} backend ready.`, "Ready");
+      setError("");
+      await refreshAfterBackendScan(progress);
+    }
+    window.setTimeout(() => {
+      if (!state.backendScanActive) {
+        document.getElementById("scanProgress").hidden = true;
+      }
+    }, progress.error ? 3500 : 1800);
+  } catch (error) {
+    if (state.backendScanActive) {
+      setError(`Waiting for scan progress: ${error.message}`);
+    }
+  } finally {
+    state.scanProgressSyncing = false;
+  }
+}
+
+function startBackendScanWatcher() {
+  if (state.scanProgressWatcherHandle) {
+    window.clearInterval(state.scanProgressWatcherHandle);
+  }
+  state.scanProgressWatcherHandle = window.setInterval(syncBackendScanProgress, 1000);
 }
 
 function setBrowserPlayFallback(message) {
@@ -400,7 +637,7 @@ function renderStations() {
   filtered.forEach((station) => {
     const node = template.content.firstElementChild.cloneNode(true);
     node.classList.toggle("is-active", Boolean(station.is_current));
-    node.querySelector(".station-name").textContent = station.label;
+    renderStationName(node.querySelector(".station-name"), station);
     node.querySelector(".station-meta").textContent = `${formatFrequency(station)} | ${station.mode_label}`;
 
     const playButton = node.querySelector(".station-main");
@@ -418,6 +655,15 @@ function renderStations() {
   });
 }
 
+function renderStationName(target, station) {
+  target.textContent = station.label;
+  if (!station.hd_available) return;
+  const badge = document.createElement("span");
+  badge.className = "station-badge station-badge-hd";
+  badge.textContent = "HD";
+  target.appendChild(badge);
+}
+
 function renderFavorites() {
   const list = document.getElementById("favoriteList");
   const template = document.getElementById("favoriteTemplate");
@@ -433,7 +679,7 @@ function renderFavorites() {
 
   state.favorites.forEach((station) => {
     const node = template.content.firstElementChild.cloneNode(true);
-    node.querySelector(".favorite-label").textContent = station.label;
+    renderStationName(node.querySelector(".favorite-label"), station);
     node.querySelector(".favorite-mode").textContent = `${station.mode_label} | ${formatFrequency(station)}`;
     node.addEventListener("click", () => playStation(station.station_id));
     list.appendChild(node);
@@ -535,6 +781,11 @@ async function refreshAll() {
 }
 
 async function setMode(mode) {
+  const scanButton = document.getElementById("scanButton");
+  setModeCardsDisabled(true);
+  setBusy(scanButton, true, "Loading...");
+  setStatusMessage(`Loading ${sourceModeLabel(mode)} firmware...`, "Loading");
+  setError("");
   try {
     const status = await api("/api/mode", {
       method: "POST",
@@ -543,13 +794,24 @@ async function setMode(mode) {
     updateStatus(status);
     await refreshStations(mode);
   } catch (error) {
+    setStatusMessage(`Failed to load ${sourceModeLabel(mode)} firmware.`, "Error", "status-idle");
     setError(error.message);
+  } finally {
+    setBusy(scanButton, false);
+    setModeCardsDisabled(false);
   }
 }
 
 async function scanStations() {
   const button = document.getElementById("scanButton");
   setBusy(button, true, "Scanning...");
+  setModeCardsDisabled(true);
+  const scanMode = state.status?.mode || "dab";
+  const label = sourceModeLabel(scanMode);
+  setStatusMessage(`Scanning ${label} stations. Loading firmware if needed...`, "Scanning");
+  document.getElementById("scanMeta").textContent = "Scanning...";
+  startScanProgress(scanMode);
+  setError("");
   try {
     const data = await api("/api/scan", {
       method: "POST",
@@ -559,10 +821,18 @@ async function scanStations() {
     renderStations();
     await refreshStatus();
     await refreshFavorites();
+    stopScanProgress({
+      completed: true,
+      message: `Scan complete: ${data.count || 0} stations found.`,
+      count: data.count || 0,
+    });
   } catch (error) {
+    setStatusMessage(`Scan failed for ${label}.`, "Error", "status-idle");
+    stopScanProgress({ failed: true, message: `Scan failed for ${label}.` });
     setError(error.message);
   } finally {
     setBusy(button, false);
+    setModeCardsDisabled(false);
   }
 }
 
@@ -803,6 +1073,8 @@ function startPolling() {
     window.clearInterval(state.pollingHandle);
   }
   state.pollingHandle = window.setInterval(async () => {
+    await syncBackendScanProgress();
+    if (state.backendScanActive) return;
     await refreshStatus();
     if (state.status?.recording?.active) {
       await refreshRecordings();
@@ -908,7 +1180,11 @@ function wireEvents() {
 
 async function init() {
   wireEvents();
-  await refreshAll();
+  startBackendScanWatcher();
+  await syncBackendScanProgress();
+  if (!state.backendScanActive) {
+    await refreshAll();
+  }
   startPolling();
 }
 

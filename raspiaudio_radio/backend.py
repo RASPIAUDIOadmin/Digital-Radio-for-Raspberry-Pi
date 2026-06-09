@@ -55,11 +55,24 @@ else:
 
 MODE_DEFS: Dict[str, Dict[str, Any]] = {
     "dab": {"id": "dab", "label": "DAB", "band": "dab", "firmware": "dab", "scan_key": "dab", "tune_mode": None},
-    "fm": {"id": "fm", "label": "FM", "band": "fm", "firmware": "fmhd", "scan_key": "fm", "tune_mode": 0},
-    "hd": {"id": "hd", "label": "HD Radio", "band": "fm", "firmware": "fmhd", "scan_key": "hd", "tune_mode": 3},
-    "am": {"id": "am", "label": "AM", "band": "am", "firmware": "amhd", "scan_key": "am", "tune_mode": 0},
-    "am_hd": {"id": "am_hd", "label": "AM HD", "band": "am", "firmware": "amhd", "scan_key": "am_hd", "tune_mode": 2},
+    "fmhd": {"id": "fmhd", "label": "FM / HD Radio", "band": "fm", "firmware": "fmhd", "scan_key": "fm", "tune_mode": 0},
+    "amhd": {"id": "amhd", "label": "AM / AM HD", "band": "am", "firmware": "amhd", "scan_key": "am", "tune_mode": 0},
 }
+PUBLIC_MODE_KEYS = ("dab", "fmhd", "amhd")
+MODE_ALIASES = {
+    "fm": "fmhd",
+    "hd": "fmhd",
+    "fm_hd": "fmhd",
+    "fm/hd": "fmhd",
+    "fm_hd_radio": "fmhd",
+    "hd_radio": "fmhd",
+    "am": "amhd",
+    "am_hd": "amhd",
+    "am/hd": "amhd",
+    "am_hd_radio": "amhd",
+}
+SCAN_KEY_TO_MODE = {"dab": "dab", "fm": "fmhd", "hd": "fmhd", "am": "amhd", "am_hd": "amhd"}
+SCAN_KEY_BAND = {"dab": "dab", "fm": "fm", "hd": "fm", "am": "am", "am_hd": "am"}
 SCAN_KEYS = ("dab", "fm", "hd", "am", "am_hd")
 VALID_AUDIO_OUT = {"analog", "i2s", "both"}
 AUDIO_OUTPUT_ALIASES = {
@@ -131,6 +144,15 @@ def _station_sort_key(station: Dict[str, Any]) -> tuple[str, int, str]:
     return (band, 0, f"{label}\t{freq_khz}\t{station_id}")
 
 
+def _mode_token(value: Any) -> str:
+    token = str(value or "").strip().lower().replace("-", "_")
+    return MODE_ALIASES.get(token, token)
+
+
+def _scan_mode(scan_key: str) -> str:
+    return SCAN_KEY_TO_MODE.get(scan_key, scan_key)
+
+
 def _sanitize_filename(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in value.strip())
     while "--" in cleaned:
@@ -142,6 +164,14 @@ def _iso_or_none(timestamp: Optional[float]) -> Optional[str]:
     if timestamp is None:
         return None
     return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
+
+
+def _frequency_label(freq_khz: Optional[int], band: Optional[str]) -> Optional[str]:
+    if freq_khz is None:
+        return None
+    if band == "fm":
+        return f"{freq_khz / 1000.0:.1f} MHz"
+    return f"{freq_khz} kHz"
 
 
 def _compact_text(value: Any) -> str:
@@ -889,7 +919,8 @@ class RadioBackend:
         self._loaded_firmware: Optional[str] = None
         self._boot_source_active: Optional[str] = None
         self._audio_out_mode = _normalize_audio_output(config.audio_out)
-        self._current_mode = config.default_mode if config.default_mode in MODE_DEFS else "dab"
+        default_mode = _mode_token(config.default_mode)
+        self._current_mode = default_mode if default_mode in PUBLIC_MODE_KEYS else "dab"
         self._current_station: Optional[Dict[str, Any]] = None
         self._current_volume = _clamp_int(config.default_volume, 0, 63)
         self._last_signal: Optional[Dict[str, Any]] = None
@@ -910,6 +941,8 @@ class RadioBackend:
         self._stations: Dict[str, List[Dict[str, Any]]] = {key: [] for key in SCAN_KEYS}
         self._last_scan_count: Dict[str, int] = {key: 0 for key in SCAN_KEYS}
         self._last_scan_time: Dict[str, Optional[float]] = {key: None for key in SCAN_KEYS}
+        self._scan_progress_lock = threading.Lock()
+        self._scan_progress: Dict[str, Any] = self._empty_scan_progress()
         self._favorites: set[str] = set()
         self._recording_process: Optional[subprocess.Popen[str]] = None
         self._recording_meta: Optional[Dict[str, Any]] = None
@@ -970,6 +1003,10 @@ class RadioBackend:
         with self._lock:
             return self._status_payload_locked(refresh_signal=True)
 
+    def get_scan_progress(self) -> Dict[str, Any]:
+        with self._scan_progress_lock:
+            return dict(self._scan_progress)
+
     def get_stations(self, mode: Optional[str] = None, refresh_from_disk: bool = False) -> List[Dict[str, Any]]:
         with self._lock:
             scan_key = self._scan_key(mode)
@@ -1005,15 +1042,39 @@ class RadioBackend:
             }
 
     def scan(self, force: bool = True) -> Dict[str, Any]:
-        with self._lock:
-            self._boot_locked(force=False)
-            scan_key = self._scan_key()
-            if self._stations[scan_key] and not force:
-                stations = self.get_stations()
+        reserved_mode = self._current_mode if self._current_mode in PUBLIC_MODE_KEYS else "dab"
+        reserved_scan_key = MODE_DEFS[reserved_mode]["scan_key"]
+        self._begin_scan_progress_locked(reserved_mode, reserved_scan_key)
+        try:
+            with self._lock:
+                current_mode = self._current_mode
+                scan_key = self._scan_key()
+                if current_mode != reserved_mode or scan_key != reserved_scan_key:
+                    mode_label = self._mode_info()["label"]
+                    self._update_scan_progress_locked(
+                        stage="boot",
+                        message=f"Loading {mode_label} firmware...",
+                    )
+                self._boot_locked(force=False)
+                if self._stations[scan_key] and not force:
+                    stations = self.get_stations()
+                    self._update_scan_progress_locked(
+                        stage="cached",
+                        message=f"Using cached scan results: {len(stations)} stations.",
+                        current=len(stations),
+                        total=len(stations),
+                        found=len(stations),
+                    )
+                    self._finish_scan_progress_locked(count=len(stations))
+                    return {"stations": stations, "count": len(stations), "scan_key": scan_key}
+                self._update_scan_progress_locked(stage="scan", message="Starting scan...", current=0, total=0)
+                stations = self._scan_dab_locked() if self._current_mode == "dab" else self._scan_analog_locked()
+                self._last_error = None
+                self._finish_scan_progress_locked(count=len(stations))
                 return {"stations": stations, "count": len(stations), "scan_key": scan_key}
-            stations = self._scan_dab_locked() if self._current_mode == "dab" else self._scan_analog_locked()
-            self._last_error = None
-            return {"stations": stations, "count": len(stations), "scan_key": scan_key}
+        except Exception as exc:
+            self._finish_scan_progress_locked(error=str(exc))
+            raise
 
     def play(
         self,
@@ -1227,6 +1288,116 @@ class RadioBackend:
         button_nav.close()
         oled.close()
 
+    @staticmethod
+    def _empty_scan_progress() -> Dict[str, Any]:
+        return {
+            "active": False,
+            "mode": None,
+            "mode_label": None,
+            "scan_key": None,
+            "stage": "idle",
+            "message": "No scan running.",
+            "current": 0,
+            "total": 0,
+            "percent": 0,
+            "frequency_khz": None,
+            "frequency_label": None,
+            "found": 0,
+            "hd_found": 0,
+            "started_at": None,
+            "updated_at": None,
+            "completed_at": None,
+            "error": None,
+        }
+
+    def _begin_scan_progress_locked(self, mode: str, scan_key: str) -> None:
+        now = time.time()
+        mode_label = MODE_DEFS.get(mode, {}).get("label", mode.upper())
+        progress = self._empty_scan_progress()
+        progress.update(
+            {
+                "active": True,
+                "mode": mode,
+                "mode_label": mode_label,
+                "scan_key": scan_key,
+                "stage": "boot",
+                "message": f"Loading {mode_label} firmware...",
+                "started_at": _iso_or_none(now),
+                "updated_at": _iso_or_none(now),
+            }
+        )
+        with self._scan_progress_lock:
+            if self._scan_progress.get("active"):
+                raise RuntimeError("A scan is already running. Wait for it to finish before starting another scan.")
+            self._scan_progress = progress
+
+    def _update_scan_progress_locked(
+        self,
+        *,
+        stage: Optional[str] = None,
+        message: Optional[str] = None,
+        current: Optional[int] = None,
+        total: Optional[int] = None,
+        frequency_khz: Optional[int] = None,
+        band: Optional[str] = None,
+        found: Optional[int] = None,
+        hd_found: Optional[int] = None,
+        percent: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        now = time.time()
+        with self._scan_progress_lock:
+            progress = dict(self._scan_progress)
+            if stage is not None:
+                progress["stage"] = stage
+            if message is not None:
+                progress["message"] = message
+            if current is not None:
+                progress["current"] = max(0, int(current))
+            if total is not None:
+                progress["total"] = max(0, int(total))
+            if frequency_khz is not None:
+                progress["frequency_khz"] = int(frequency_khz)
+                progress["frequency_label"] = _frequency_label(int(frequency_khz), band)
+            if found is not None:
+                progress["found"] = max(0, int(found))
+            if hd_found is not None:
+                progress["hd_found"] = max(0, int(hd_found))
+            if error is not None:
+                progress["error"] = error
+            progress["updated_at"] = _iso_or_none(now)
+
+            progress_total = int(progress.get("total") or 0)
+            progress_current = int(progress.get("current") or 0)
+            if percent is not None:
+                progress["percent"] = _clamp_int(int(percent), 0, 99 if progress.get("active") else 100)
+            elif progress_total > 0 and (current is not None or total is not None):
+                upper = 99 if progress.get("active") else 100
+                progress["percent"] = _clamp_int(round((progress_current / progress_total) * 100), 0, upper)
+            elif progress.get("active"):
+                progress["percent"] = max(1, int(progress.get("percent") or 0))
+            self._scan_progress = progress
+
+    def _finish_scan_progress_locked(self, *, count: int = 0, error: Optional[str] = None) -> None:
+        now = time.time()
+        with self._scan_progress_lock:
+            progress = dict(self._scan_progress)
+            progress["active"] = False
+            progress["completed_at"] = _iso_or_none(now)
+            progress["updated_at"] = _iso_or_none(now)
+            if error:
+                progress["stage"] = "failed"
+                progress["message"] = f"Scan failed: {error}"
+                progress["error"] = error
+            else:
+                progress["stage"] = "complete"
+                progress["message"] = f"Scan complete: {count} station{'s' if count != 1 else ''} found."
+                progress["error"] = None
+                progress["found"] = max(int(progress.get("found") or 0), int(count))
+                progress["current"] = max(int(progress.get("current") or 0), int(progress.get("total") or 0))
+                progress["percent"] = 100
+            self._scan_progress = progress
+
     def _new_oled_locked(self, *, enabled: bool) -> OledStatusDisplay:
         return OledStatusDisplay(
             enabled=enabled,
@@ -1410,8 +1581,8 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         return dict(status)
 
     def _normalize_mode(self, mode: str) -> str:
-        normalized = str(mode).strip().lower().replace("-", "_")
-        if normalized not in MODE_DEFS:
+        normalized = _mode_token(mode)
+        if normalized not in PUBLIC_MODE_KEYS:
             raise ValueError(f"Unsupported mode: {mode}")
         return normalized
 
@@ -1427,7 +1598,8 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         self._reset_dab_media_locked(clear_artwork=True)
 
     def _mode_info(self, mode: Optional[str] = None) -> Dict[str, Any]:
-        return MODE_DEFS[mode or self._current_mode]
+        key = self._current_mode if mode is None else self._normalize_mode(mode)
+        return MODE_DEFS[key]
 
     def _scan_key(self, mode: Optional[str] = None) -> str:
         return self._mode_info(mode)["scan_key"]
@@ -1474,7 +1646,8 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         path = self._scan_file_for_key(scan_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = []
-        for station in sorted(stations, key=_station_sort_key):
+        normalized_stations = [self._normalize_station(scan_key, station) for station in stations]
+        for station in sorted(normalized_stations, key=_station_sort_key):
             item = dict(station)
             item.pop("favorite", None)
             item.pop("is_current", None)
@@ -1510,8 +1683,8 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return
-        mode = str(data.get("mode") or "").strip().lower()
-        if mode in MODE_DEFS:
+        mode = _mode_token(data.get("mode"))
+        if mode in PUBLIC_MODE_KEYS:
             self._current_mode = mode
         if "volume" in data:
             try:
@@ -1614,7 +1787,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             "transport": "spi",
             "mode": self._current_mode,
             "mode_label": self._mode_info()["label"],
-            "available_modes": [dict(MODE_DEFS[key]) for key in SCAN_KEYS],
+            "available_modes": [dict(MODE_DEFS[key]) for key in PUBLIC_MODE_KEYS],
             "firmware": self._loaded_firmware,
             "boot_source": self.config.boot_source if self.config.boot_source in VALID_BOOT_SOURCES else "host",
             "boot_source_active": self._boot_source_active,
@@ -1659,6 +1832,8 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
                 "wav_path": "/audio/live.wav",
                 "playlist_paths": {
                     "dab": "/playlists/dab.m3u",
+                    "fmhd": "/playlists/fmhd.m3u",
+                    "amhd": "/playlists/amhd.m3u",
                     "favorites": "/playlists/favorites.m3u",
                 },
                 "i2s_setup": i2s_setup,
@@ -1716,6 +1891,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         if station is None:
             return None
         item = dict(station)
+        item["mode"] = _mode_token(item.get("mode"))
         item["favorite"] = item["station_id"] in self._favorites
         item["is_current"] = self._current_station is not None and item["station_id"] == self._current_station.get("station_id")
         item["mode_label"] = MODE_DEFS[item["mode"]]["label"]
@@ -1892,11 +2068,12 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             self._dab_mot_objects.pop(object_id, None)
 
     def _normalize_station(self, scan_key: str, raw: Dict[str, Any]) -> Dict[str, Any]:
-        mode_info = MODE_DEFS[scan_key]
+        mode_info = MODE_DEFS[_scan_mode(scan_key)]
+        band = SCAN_KEY_BAND.get(scan_key, mode_info["band"])
         station = dict(raw)
         station["mode"] = mode_info["id"]
-        station["band"] = mode_info["band"]
-        if mode_info["band"] == "dab":
+        station["band"] = band
+        if band == "dab":
             station["service_id"] = int(station.get("service_id", 0))
             station["component_id"] = int(station.get("component_id", 0))
             station["freq_index"] = int(station.get("freq_index", self._dab_freq_index.get(int(station.get("freq_khz", 0)), 0)))
@@ -2281,7 +2458,19 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
     def _scan_dab_locked(self) -> List[Dict[str, Any]]:
         radio = self._require_radio_locked()
         found: Dict[str, Dict[str, Any]] = {}
+        total = len(self._dab_freqs)
         for freq_index, freq_khz in enumerate(self._dab_freqs):
+            step = freq_index + 1
+            freq_label = _frequency_label(freq_khz, "dab")
+            self._update_scan_progress_locked(
+                stage="dab_scan",
+                message=f"Scanning DAB {freq_label} ({step}/{total})",
+                current=step,
+                total=total,
+                frequency_khz=freq_khz,
+                band="dab",
+                found=len(found),
+            )
             radio.dab_tune(freq_index, antcap=self.config.antcap)
             status = self._wait_dab_ready_locked()
             if status is None:
@@ -2301,6 +2490,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
                 )
                 station["score"] = _dab_score(status)
                 found[station["station_id"]] = station
+            self._update_scan_progress_locked(found=len(found))
         return self._save_scan_file_locked("dab", list(found.values()))
 
     def _wait_dab_ready_locked(self, timeout_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -2331,6 +2521,10 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
     def _scan_analog_locked(self) -> List[Dict[str, Any]]:
         scan_key = self._scan_key()
         band = self._mode_info()["band"]
+        if self._current_mode == "fmhd":
+            return self._scan_fmhd_combined_locked()
+        if self._current_mode == "amhd":
+            return self._scan_amhd_combined_locked()
         require_hd = scan_key in {"hd", "am_hd"}
         if band == "fm" and not require_hd:
             return self._scan_fm_clusters_locked()
@@ -2339,19 +2533,49 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         if band == "am" and not require_hd:
             return self._scan_am_peaks_locked()
         found: Dict[int, Dict[str, Any]] = {}
-        for freq_khz in self._analog_scan_frequencies_locked(band, require_hd):
+        frequencies = self._analog_scan_frequencies_locked(band, require_hd)
+        total = len(frequencies)
+        stage = f"{band}_{'hd_' if require_hd else ''}scan"
+        for index, freq_khz in enumerate(frequencies):
+            step = index + 1
+            freq_label = _frequency_label(freq_khz, band)
+            label = f"{band.upper()} HD" if require_hd else band.upper()
+            self._update_scan_progress_locked(
+                stage=stage,
+                message=f"Scanning {label} {freq_label} ({step}/{total})",
+                current=step,
+                total=total,
+                frequency_khz=freq_khz,
+                band=band,
+                found=len(found),
+            )
             station = self._probe_analog_station_locked(freq_khz, band, require_hd)
             if station is None:
                 continue
             existing = found.get(station["freq_khz"])
             if existing is None or int(station.get("score", 0)) > int(existing.get("score", 0)):
                 found[station["freq_khz"]] = station
+            self._update_scan_progress_locked(found=len(found), hd_found=len(found) if require_hd else None)
         return self._save_scan_file_locked(scan_key, list(found.values()))
 
     def _scan_am_peaks_locked(self) -> List[Dict[str, Any]]:
         radio = self._require_radio_locked()
         samples: List[Dict[str, Any]] = []
-        for freq_khz in self._analog_scan_frequencies_locked("am", require_hd=False):
+        frequencies = self._analog_scan_frequencies_locked("am", require_hd=False)
+        sample_total = len(frequencies)
+        total = sample_total * 2
+        for index, freq_khz in enumerate(frequencies):
+            step = index + 1
+            freq_label = _frequency_label(freq_khz, "am")
+            self._update_scan_progress_locked(
+                stage="am_scan",
+                message=f"Scanning AM {freq_label} ({step}/{sample_total})",
+                current=step,
+                total=total,
+                frequency_khz=freq_khz,
+                band="am",
+                found=len(samples),
+            )
             radio.am_tune(freq_khz, antcap=self.config.antcap, tune_mode=0)
             time.sleep(0.25)
             signal = self._merge_fmhd_status(radio.am_rsq_status(attune=True), radio.hd_digrad_status())
@@ -2361,6 +2585,17 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         stations: List[Dict[str, Any]] = []
         window = max(1, int(self.config.am_peak_window_channels))
         for index, signal in enumerate(samples):
+            freq_khz = int(signal.get("freq_khz") or 0)
+            freq_label = _frequency_label(freq_khz, "am")
+            self._update_scan_progress_locked(
+                stage="am_confirm",
+                message=f"Confirming AM peak {freq_label} ({index + 1}/{len(samples)})",
+                current=sample_total + index + 1,
+                total=total,
+                frequency_khz=freq_khz,
+                band="am",
+                found=len(stations),
+            )
             rssi = int(signal.get("rssi", 0))
             if rssi < int(self.config.am_peak_rssi_min):
                 continue
@@ -2373,7 +2608,6 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             prominence = rssi - (sum(neighbor_rssi) / len(neighbor_rssi))
             if prominence < float(self.config.am_peak_prominence):
                 continue
-            freq_khz = int(signal.get("freq_khz") or 0)
             radio.am_tune(freq_khz, antcap=self.config.antcap, tune_mode=0)
             confirmed = self._wait_am_signal_locked(require_hd=False)
             if confirmed is None:
@@ -2391,9 +2625,10 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             )
             station["score"] = _analog_score(confirmed)
             stations.append(station)
+            self._update_scan_progress_locked(found=len(stations))
         return self._save_scan_file_locked("am", stations)
 
-    def _scan_fm_clusters_locked(self) -> List[Dict[str, Any]]:
+    def _scan_fm_clusters_locked(self, *, percent_start: Optional[int] = None, percent_end: Optional[int] = None) -> List[Dict[str, Any]]:
         cluster_window_khz = 200
         stations: List[Dict[str, Any]] = []
         best_station: Optional[Dict[str, Any]] = None
@@ -2406,7 +2641,26 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             best_station = None
             last_success_freq = None
 
-        for freq_khz in self._analog_scan_frequencies_locked("fm", require_hd=False):
+        frequencies = self._analog_scan_frequencies_locked("fm", require_hd=False)
+        total = len(frequencies)
+        for index, freq_khz in enumerate(frequencies):
+            step = index + 1
+            freq_label = _frequency_label(freq_khz, "fm")
+            found_count = len(stations) + (1 if best_station is not None else 0)
+            percent = None
+            if percent_start is not None and percent_end is not None and total > 0:
+                span = max(0, int(percent_end) - int(percent_start))
+                percent = int(percent_start) + round((step / total) * span)
+            self._update_scan_progress_locked(
+                stage="fm_scan",
+                message=f"Scanning FM {freq_label} ({step}/{total})",
+                current=step,
+                total=total,
+                frequency_khz=freq_khz,
+                band="fm",
+                found=found_count,
+                percent=percent,
+            )
             station = self._probe_analog_station_locked(freq_khz, "fm", require_hd=False)
             if station is None:
                 flush()
@@ -2423,8 +2677,61 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             if int(station.get("score", 0)) > int(best_station.get("score", 0)):
                 best_station = station
             last_success_freq = freq_khz
+            found_count = len(stations) + (1 if best_station is not None else 0)
+            self._update_scan_progress_locked(found=found_count)
         flush()
+        self._update_scan_progress_locked(found=len(stations))
         return self._save_scan_file_locked("fm", stations)
+
+    def _scan_fmhd_combined_locked(self) -> List[Dict[str, Any]]:
+        print("FMHD scan: scanning analog FM carriers first.", flush=True)
+        self._scan_fm_clusters_locked(percent_start=1, percent_end=60)
+        candidate_freqs = sorted(
+            {
+                int(station["freq_khz"])
+                for station in (self._stations["fm"] + self._stations["hd"])
+                if int(station.get("freq_khz", 0)) > 0
+            }
+        )
+        print(f"FMHD scan: probing {len(candidate_freqs)} frequency(ies) for HD.", flush=True)
+
+        merged: Dict[int, Dict[str, Any]] = {int(station["freq_khz"]): dict(station) for station in self._stations["fm"]}
+        hd_count = 0
+        total = len(candidate_freqs)
+        self._update_scan_progress_locked(
+            stage="hd_probe",
+            message=f"Probing HD on {len(candidate_freqs)} FM candidate frequency(ies).",
+            current=0,
+            total=total,
+            found=len(merged),
+            hd_found=0,
+            percent=60,
+        )
+        for index, freq_khz in enumerate(candidate_freqs):
+            step = index + 1
+            freq_label = _frequency_label(freq_khz, "fm")
+            percent = 99 if total <= 0 else 60 + round((step / total) * 39)
+            self._update_scan_progress_locked(
+                stage="hd_probe",
+                message=f"Probing HD on {freq_label} ({step}/{len(candidate_freqs)})",
+                current=step,
+                total=total,
+                frequency_khz=freq_khz,
+                band="fm",
+                found=len(merged),
+                hd_found=hd_count,
+                percent=percent,
+            )
+            hd_station = self._probe_analog_station_locked(freq_khz, "fm", require_hd=True)
+            if hd_station is None:
+                continue
+            hd_count += 1
+            base_station = merged.get(int(hd_station["freq_khz"]), hd_station)
+            merged[int(hd_station["freq_khz"])] = self._merge_hd_station(base_station, hd_station, scan_key="fm")
+            self._update_scan_progress_locked(found=len(merged), hd_found=hd_count)
+
+        print(f"FMHD scan: found {len(merged)} FM station(s), {hd_count} with HD.", flush=True)
+        return self._save_scan_file_locked("fm", list(merged.values()))
 
     def _scan_fm_hd_locked(self) -> List[Dict[str, Any]]:
         if not self._stations["fm"]:
@@ -2441,16 +2748,104 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         print(f"HD scan: probing {len(candidate_freqs)} FM candidate frequency(ies).", flush=True)
 
         found: Dict[int, Dict[str, Any]] = {}
-        for freq_khz in candidate_freqs:
+        total = len(candidate_freqs)
+        for index, freq_khz in enumerate(candidate_freqs):
+            step = index + 1
+            freq_label = _frequency_label(freq_khz, "fm")
+            self._update_scan_progress_locked(
+                stage="hd_probe",
+                message=f"Probing HD on {freq_label} ({step}/{total})",
+                current=step,
+                total=total,
+                frequency_khz=freq_khz,
+                band="fm",
+                found=len(found),
+                hd_found=len(found),
+            )
             station = self._probe_analog_station_locked(freq_khz, "fm", require_hd=True)
             if station is None:
                 continue
             existing = found.get(station["freq_khz"])
             if existing is None or int(station.get("score", 0)) > int(existing.get("score", 0)):
                 found[station["freq_khz"]] = station
+            self._update_scan_progress_locked(found=len(found), hd_found=len(found))
 
         print(f"HD scan: found {len(found)} HD-capable frequency(ies).", flush=True)
         return self._save_scan_file_locked("hd", list(found.values()))
+
+    def _scan_amhd_combined_locked(self) -> List[Dict[str, Any]]:
+        print("AMHD scan: scanning analog AM carriers first.", flush=True)
+        self._scan_am_peaks_locked()
+        candidate_freqs = sorted(
+            {
+                int(station["freq_khz"])
+                for station in (self._stations["am"] + self._stations["am_hd"])
+                if int(station.get("freq_khz", 0)) > 0
+            }
+        )
+        print(f"AMHD scan: probing {len(candidate_freqs)} frequency(ies) for AM HD.", flush=True)
+
+        merged: Dict[int, Dict[str, Any]] = {int(station["freq_khz"]): dict(station) for station in self._stations["am"]}
+        hd_count = 0
+        analog_total = len(self._analog_scan_frequencies_locked("am", require_hd=False)) * 2
+        total = analog_total + len(candidate_freqs)
+        self._update_scan_progress_locked(
+            stage="am_hd_probe",
+            message=f"Probing AM HD on {len(candidate_freqs)} candidate frequency(ies).",
+            current=analog_total,
+            total=total,
+            found=len(merged),
+            hd_found=0,
+        )
+        for index, freq_khz in enumerate(candidate_freqs):
+            step = index + 1
+            freq_label = _frequency_label(freq_khz, "am")
+            self._update_scan_progress_locked(
+                stage="am_hd_probe",
+                message=f"Probing AM HD on {freq_label} ({step}/{len(candidate_freqs)})",
+                current=analog_total + step,
+                total=total,
+                frequency_khz=freq_khz,
+                band="am",
+                found=len(merged),
+                hd_found=hd_count,
+            )
+            hd_station = self._probe_analog_station_locked(freq_khz, "am", require_hd=True)
+            if hd_station is None:
+                continue
+            hd_count += 1
+            base_station = merged.get(int(hd_station["freq_khz"]), hd_station)
+            merged[int(hd_station["freq_khz"])] = self._merge_hd_station(base_station, hd_station, scan_key="am")
+            self._update_scan_progress_locked(found=len(merged), hd_found=hd_count)
+
+        print(f"AMHD scan: found {len(merged)} AM station(s), {hd_count} with HD.", flush=True)
+        return self._save_scan_file_locked("am", list(merged.values()))
+
+    def _merge_hd_station(self, base_station: Dict[str, Any], hd_station: Dict[str, Any], *, scan_key: str) -> Dict[str, Any]:
+        merged = dict(base_station)
+        merged["freq_khz"] = int(hd_station.get("freq_khz") or base_station.get("freq_khz") or 0)
+        merged["analog_available"] = bool(base_station.get("analog_available", True) or hd_station.get("analog_available"))
+        merged["hd_available"] = True
+        merged["program_mask"] = int(hd_station.get("program_mask") or base_station.get("program_mask") or 0)
+        merged["program_id"] = int(hd_station.get("program_id") or base_station.get("program_id") or 0)
+        merged["score"] = max(int(base_station.get("score", 0)), int(hd_station.get("score", 0)))
+        merged["label"] = self._hd_station_label(scan_key, merged)
+        return merged
+
+    def _hd_station_label(self, scan_key: str, station: Dict[str, Any]) -> str:
+        label = normalize_broadcast_text(station.get("label") or "")
+        freq_khz = int(station.get("freq_khz") or 0)
+        program_mask = int(station.get("program_mask") or 0)
+        if not label:
+            return self._default_station_label(scan_key, freq_khz, program_mask, True)
+        upper = label.upper()
+        if "HD" in upper:
+            return label
+        if scan_key == "fm" and label.startswith("FM "):
+            return f"HD {label[3:]}"
+        if scan_key == "am" and label.startswith("AM "):
+            return f"AM HD {label[3:]}"
+        return f"{label} HD"
 
     def _analog_scan_frequencies_locked(self, band: str, require_hd: bool) -> List[int]:
         frequencies: List[int] = []
@@ -2752,14 +3147,20 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         self._reset_dab_media_locked(clear_artwork=True)
         self._apply_mute_locked(radio)
         band = station["band"]
-        require_hd = station["mode"] in {"hd", "am_hd"}
+        require_hd = bool(station.get("hd_available"))
         tune_mode = 3 if band == "fm" and require_hd else 2 if band == "am" and require_hd else 0
         if band == "fm":
             radio.fm_tune(int(station["freq_khz"]), antcap=self.config.antcap, tune_mode=tune_mode)
             signal = self._wait_fm_signal_locked(require_hd=require_hd)
+            if signal is None and require_hd:
+                radio.fm_tune(int(station["freq_khz"]), antcap=self.config.antcap, tune_mode=0)
+                signal = self._wait_fm_signal_locked(require_hd=False)
         else:
             radio.am_tune(int(station["freq_khz"]), antcap=self.config.antcap, tune_mode=tune_mode)
             signal = self._wait_am_signal_locked(require_hd=require_hd)
+            if signal is None and require_hd:
+                radio.am_tune(int(station["freq_khz"]), antcap=self.config.antcap, tune_mode=0)
+                signal = self._wait_am_signal_locked(require_hd=False)
         if signal is None:
             raise RuntimeError(f"Failed to tune {station['label']}.")
         self._current_station = dict(station)
