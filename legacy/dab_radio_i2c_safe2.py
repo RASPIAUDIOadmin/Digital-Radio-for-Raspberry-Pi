@@ -75,6 +75,8 @@ CMD_AM_SEEK_START = 0x41
 CMD_AM_RSQ_STATUS = 0x42
 CMD_HD_DIGRAD_STATUS = 0x92
 CMD_HD_GET_EVENT_STATUS = 0x93
+CMD_HD_GET_STATION_INFO = 0x94
+CMD_HD_GET_PSD_DECODE = 0x95
 
 # Property IDs
 PROP_PIN_CONFIG_ENABLE = 0x0800
@@ -90,6 +92,9 @@ PROP_AM_VALID_RSSI_THRESHOLD = 0x4202
 PROP_AM_VALID_SNR_TIME = 0x4203
 PROP_AM_VALID_SNR_THRESHOLD = 0x4204
 PROP_AM_VALID_HDLEVEL_THRESHOLD = 0x4205
+PROP_HD_EVENT_INTERRUPT_SOURCE = 0x9300
+PROP_HD_PSD_ENABLE = 0x9500
+PROP_HD_PSD_FIELD_MASK = 0x9501
 PROP_FM_SEEK_BAND_BOTTOM = 0x3100
 PROP_FM_SEEK_BAND_TOP = 0x3101
 PROP_FM_SEEK_FREQUENCY_SPACING = 0x3102
@@ -958,6 +963,10 @@ class Si468xDabRadio:
         self.set_property(PROP_FM_TUNE_FE_VARM, 0xFD12)
         self.set_property(PROP_FM_TUNE_FE_VARB, 0x009B)
         self.set_property(PROP_FM_TUNE_FE_CFG, 0x0000)
+        # Enable HD SIS/service-list interrupts and PSD title/artist/album/genre.
+        self.set_property(PROP_HD_EVENT_INTERRUPT_SOURCE, 0x001F)
+        self.set_property(PROP_HD_PSD_ENABLE, 0x00FF)
+        self.set_property(PROP_HD_PSD_FIELD_MASK, 0x000F)
         self.set_property(PROP_FM_SEEK_BAND_BOTTOM, 8750)
         self.set_property(PROP_FM_SEEK_BAND_TOP, 10800)
         self.set_property(PROP_FM_SEEK_FREQUENCY_SPACING, 10)
@@ -970,6 +979,9 @@ class Si468xDabRadio:
 
     def configure_amhd_frontend(self) -> None:
         # Use the EU medium-wave band plan and the SDK-validity defaults.
+        self.set_property(PROP_HD_EVENT_INTERRUPT_SOURCE, 0x001F)
+        self.set_property(PROP_HD_PSD_ENABLE, 0x00FF)
+        self.set_property(PROP_HD_PSD_FIELD_MASK, 0x000F)
         self.set_property(PROP_AM_SEEK_BAND_BOTTOM, AM_BAND_DEFAULT_MIN_KHZ)
         self.set_property(PROP_AM_SEEK_BAND_TOP, AM_BAND_DEFAULT_MAX_KHZ)
         self.set_property(PROP_AM_SEEK_FREQUENCY_SPACING, AM_BAND_DEFAULT_STEP_KHZ)
@@ -1140,6 +1152,75 @@ class Si468xDabRadio:
             "audio_program_available": reply[9] if len(reply) > 9 else 0,
             "audio_program_playing": reply[10] if len(reply) > 10 else 0,
             "audio_ca": reply[11] if len(reply) > 11 else 0,
+        }
+
+    def hd_get_event_status(self, ack: bool = True) -> Dict[str, object]:
+        self._write_command([CMD_HD_GET_EVENT_STATUS, 0x01 if ack else 0x00])
+        reply = self._read_reply(18)
+        raw = bytes(reply)
+        return {
+            "raw": raw,
+            "alertint": bool(reply[4] & 0x10) if len(reply) > 4 else False,
+            "psdint": bool(reply[4] & 0x08) if len(reply) > 4 else False,
+            "sisint": bool(reply[4] & 0x04) if len(reply) > 4 else False,
+            "dsrvlistint": bool(reply[4] & 0x02) if len(reply) > 4 else False,
+            "asrvlistint": bool(reply[4] & 0x01) if len(reply) > 4 else False,
+            "psd": bool(reply[5] & 0x08) if len(reply) > 5 else False,
+            "sis": bool(reply[5] & 0x04) if len(reply) > 5 else False,
+            "dsrvlist": bool(reply[5] & 0x02) if len(reply) > 5 else False,
+            "asrvlist": bool(reply[5] & 0x01) if len(reply) > 5 else False,
+            "asrvlistver": int.from_bytes(raw[6:8], "little") if len(raw) >= 8 else 0,
+            "dsrvlistver": int.from_bytes(raw[8:10], "little") if len(raw) >= 10 else 0,
+            "sis_location": bool(reply[10] & 0x10) if len(reply) > 10 else False,
+            "sis_long_name": bool(reply[10] & 0x04) if len(reply) > 10 else False,
+            "sis_short_name": bool(reply[10] & 0x02) if len(reply) > 10 else False,
+            "sis_id": bool(reply[10] & 0x01) if len(reply) > 10 else False,
+            "sis_slogan": bool(reply[11] & 0x20) if len(reply) > 11 else False,
+            "sis_basic": bool(reply[11] & 0x10) if len(reply) > 11 else False,
+            "sis_universal_short_name": bool(reply[11] & 0x08) if len(reply) > 11 else False,
+            "sis_message": bool(reply[11] & 0x01) if len(reply) > 11 else False,
+            "text": bool(reply[12] & 0x40) if len(reply) > 12 else False,
+            "short": bool(reply[12] & 0x20) if len(reply) > 12 else False,
+            "lang": bool(reply[12] & 0x10) if len(reply) > 12 else False,
+            "genre": bool(reply[12] & 0x08) if len(reply) > 12 else False,
+            "album": bool(reply[12] & 0x04) if len(reply) > 12 else False,
+            "artist": bool(reply[12] & 0x02) if len(reply) > 12 else False,
+            "title": bool(reply[12] & 0x01) if len(reply) > 12 else False,
+        }
+
+    def hd_get_station_info(self, info_select: int) -> Dict[str, object]:
+        self._write_command([CMD_HD_GET_STATION_INFO, int(info_select) & 0xFF])
+        header = self._read_reply(6)
+        length = int.from_bytes(bytes(header[4:6]), "little") if len(header) >= 6 else 0
+        if length <= 0:
+            return {"info_select": int(info_select), "length": 0, "payload": b""}
+        full = self._read_reply(6 + length)
+        return {
+            "info_select": int(info_select),
+            "length": length,
+            "payload": bytes(full[6 : 6 + length]),
+        }
+
+    def hd_get_psd_decode(self, program: int = 0xFF, field: int = 0) -> Dict[str, object]:
+        self._write_command([CMD_HD_GET_PSD_DECODE, int(program) & 0xFF, int(field) & 0xFF])
+        header = self._read_reply(8)
+        datatype = int(header[6]) if len(header) > 6 else 0
+        length = int(header[7]) if len(header) > 7 else 0
+        if length <= 0:
+            return {
+                "program": int(program),
+                "field": int(field),
+                "datatype": datatype,
+                "length": 0,
+                "payload": b"",
+            }
+        full = self._read_reply(8 + length)
+        return {
+            "program": int(program),
+            "field": int(field),
+            "datatype": datatype,
+            "length": length,
+            "payload": bytes(full[8 : 8 + length]),
         }
 
     def _get_service_list_payload(self) -> bytes:

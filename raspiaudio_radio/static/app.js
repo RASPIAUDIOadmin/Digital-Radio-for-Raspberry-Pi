@@ -307,28 +307,43 @@ function formatTimestamp(value) {
 
 function updateDabMedia(status) {
   const media = status.dab_media || {};
-  const isDab = status.mode === "dab";
   const current = status.current_station || {};
-  const hasText = Boolean(media.text || media.artist || media.title);
+  const source = media.source || (status.mode === "dab" ? "dab" : current.hd_available ? "hd" : "none");
+  const isDab = source === "dab";
+  const isHd = source === "hd";
+  const isActive = isDab || isHd;
+  const sourceLabel = isHd ? "HD Radio" : isDab ? "DAB" : "Radio";
+  const hasText = Boolean(media.text || media.artist || media.title || media.station_name);
   const hasArtwork = Boolean(media.artwork_url);
   const mediaTimestamp = media.artwork_updated_at || media.updated_at;
 
-  document.getElementById("mediaArtist").textContent = media.artist || (isDab ? "No artist yet" : "DAB only");
-  document.getElementById("mediaTitle").textContent = media.title || (isDab ? "No title yet" : "DAB only");
-  document.getElementById("mediaText").textContent = isDab
-    ? media.text || "No DAB text received yet."
-    : "Switch to DAB and tune a station to read metadata.";
+  document.getElementById("mediaArtist").textContent =
+    media.artist || media.station_name || (isActive ? "No artist yet" : "Metadata inactive");
+  document.getElementById("mediaTitle").textContent = media.title || (isActive ? "No title yet" : "Metadata inactive");
+  document.getElementById("mediaText").textContent = isActive
+    ? media.text || media.station_name || `No ${sourceLabel} text received yet.`
+    : "Tune a DAB or HD Radio station to read metadata.";
   document.getElementById("mediaUpdated").textContent = mediaTimestamp
     ? `Updated: ${formatTimestamp(mediaTimestamp)}`
-    : (isDab ? "No metadata received yet." : "DAB metadata is inactive.");
-  document.getElementById("mediaHint").textContent = isDab
+    : (isActive ? "No metadata received yet." : "Radio metadata is inactive.");
+  document.getElementById("mediaHint").textContent = isActive
     ? hasArtwork
-      ? "Slideshow image received from the current DAB station."
-      : "Waiting for slideshow image from the current DAB station."
-    : "Artwork and DLS text are only available in DAB mode.";
+      ? `${sourceLabel} artwork received from the current station.`
+      : isHd
+        ? "Waiting for HD Radio image data if this station broadcasts it."
+        : "Waiting for slideshow image from the current DAB station."
+    : "Artwork and text are available on DAB and HD Radio when broadcast.";
 
   const statusPill = document.getElementById("mediaStatus");
-  statusPill.textContent = !isDab ? "DAB only" : hasArtwork && hasText ? "Artwork + text" : hasArtwork ? "Artwork" : hasText ? "Live text" : "Waiting";
+  statusPill.textContent = !isActive
+    ? "Inactive"
+    : hasArtwork && hasText
+      ? `${sourceLabel} art + text`
+      : hasArtwork
+        ? `${sourceLabel} art`
+        : hasText
+          ? `${sourceLabel} text`
+          : "Waiting";
 
   const artwork = document.getElementById("mediaArtwork");
   const fallback = document.getElementById("mediaArtworkFallback");
@@ -340,7 +355,7 @@ function updateDabMedia(status) {
     artwork.hidden = true;
     artwork.removeAttribute("src");
     fallback.hidden = false;
-    fallback.textContent = (current.label || "DAB").slice(0, 3).toUpperCase();
+    fallback.textContent = (media.program || (isHd ? "HD" : current.label || "DAB")).slice(0, 4).toUpperCase();
   }
 }
 
@@ -629,6 +644,11 @@ function updateStatus(status, { preserveError = false } = {}) {
   if (!preserveError) {
     setError(state.browserOutputMessage || status.last_error || "");
   }
+  if (current.station_id) {
+    state.stations = state.stations.map((station) =>
+      station.station_id === current.station_id ? { ...station, ...current } : station
+    );
+  }
   updateDabMedia(status);
   renderModes();
   renderStations();
@@ -684,7 +704,7 @@ function renderStationName(target, station) {
   if (!station.hd_available) return;
   const badge = document.createElement("span");
   badge.className = "station-badge station-badge-hd";
-  badge.textContent = "HD";
+  badge.textContent = station.program_label || "HD";
   target.appendChild(badge);
 }
 

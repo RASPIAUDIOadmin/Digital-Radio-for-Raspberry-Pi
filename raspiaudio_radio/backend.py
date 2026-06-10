@@ -94,6 +94,20 @@ DAB_DATA_SRC_PAD_DATA = 0x01
 DAB_DSCTY_MOT = 60
 DAB_MOT_HEADER_PACKET = 0x73
 DAB_MOT_BODY_PACKET = 0x74
+HD_INFO_STATION_MESSAGE = 0x01
+HD_INFO_UNIVERSAL_SHORT_NAME = 0x04
+HD_INFO_BASIC_SIS = 0x05
+HD_INFO_SLOGAN = 0x06
+HD_PSD_FIELDS = {
+    "title": 0x00,
+    "artist": 0x01,
+    "album": 0x02,
+    "genre": 0x03,
+}
+HD_ENCODING_ISO_8859_1 = 0x00
+HD_ENCODING_UCS2_LE = 0x04
+HD_BASIC_SIS_STATION_NAME_SHORT = 0x01
+HD_BASIC_SIS_STATION_NAME_LONG = 0x02
 MAX_DAB_MOT_OBJECTS = 8
 MAX_DAB_MOT_AGE_S = 45.0
 _MOT_IMAGE_NAME_RE = re.compile(rb"([A-Za-z0-9_.-]+\.(?:jpe?g|png|gif|bmp))", re.IGNORECASE)
@@ -203,9 +217,15 @@ def _marquee_text(value: Any, width: int, tick: int) -> str:
 
 def _empty_dab_media() -> Dict[str, Any]:
     return {
+        "source": None,
         "text": "",
         "title": None,
         "artist": None,
+        "album": None,
+        "genre": None,
+        "station_name": None,
+        "program": None,
+        "programs": [],
         "encoding": None,
         "toggle": None,
         "updated_at": None,
@@ -254,6 +274,75 @@ def _extract_image_payload(payload: bytes, filename: Optional[str]) -> tuple[Opt
         if guessed and blob:
             return blob, guessed
     return None, None
+
+
+def _hd_program_label(program_id: Any) -> str:
+    try:
+        value = int(program_id)
+    except (TypeError, ValueError):
+        value = 0
+    return f"HD{max(0, value) + 1}"
+
+
+def _hd_program_ids_from_mask(mask: Any) -> List[int]:
+    try:
+        value = int(mask)
+    except (TypeError, ValueError):
+        value = 0
+    programs = [index for index in range(8) if value & (1 << index)]
+    return programs or [0]
+
+
+def _decode_hd_text(payload: bytes, encoding: Optional[int]) -> str:
+    raw = bytes(payload or b"")
+    if encoding in {1, HD_ENCODING_UCS2_LE}:
+        while raw.endswith(b"\x00\x00"):
+            raw = raw[:-2]
+    else:
+        raw = raw.rstrip(b"\x00")
+    if not raw:
+        return ""
+    codecs: List[str]
+    if encoding in {1, HD_ENCODING_UCS2_LE}:
+        codecs = ["utf-16-le", "utf-16-be", "utf-8"]
+    elif encoding == HD_ENCODING_ISO_8859_1:
+        codecs = ["latin-1", "utf-8", "cp1252"]
+    else:
+        codecs = ["utf-8", "latin-1", "utf-16-le"]
+    for codec in codecs:
+        try:
+            return normalize_broadcast_text(raw.decode(codec, errors="strict"))
+        except UnicodeDecodeError:
+            continue
+    return normalize_broadcast_text(raw.decode(codecs[-1], errors="replace"))
+
+
+def _parse_hd_basic_sis(payload: bytes) -> Dict[str, str]:
+    raw = bytes(payload or b"")
+    if len(raw) < 12:
+        return {}
+    result: Dict[str, str] = {}
+    count = raw[10]
+    offset = 11
+    for _ in range(count):
+        if offset + 3 > len(raw):
+            break
+        item_type = raw[offset]
+        status = raw[offset + 1]
+        length = raw[offset + 2]
+        data_start = offset + 3
+        data_end = data_start + length
+        if data_end > len(raw):
+            break
+        data = raw[data_start:data_end]
+        if status in {1, 2, 3} and data:
+            text = _decode_hd_text(data, HD_ENCODING_ISO_8859_1)
+            if item_type == HD_BASIC_SIS_STATION_NAME_SHORT:
+                result["station_name_short"] = text
+            elif item_type == HD_BASIC_SIS_STATION_NAME_LONG:
+                result["station_name_long"] = text
+        offset = data_end
+    return result
 
 
 def _parse_mot_segment(payload: bytes) -> Optional[Dict[str, Any]]:
@@ -1061,8 +1150,7 @@ class RadioBackend:
 
     def get_live_stream_metadata(self) -> Dict[str, Any]:
         with self._lock:
-            if self._booted and self._current_station and self._current_station.get("mode") == "dab":
-                self._poll_dab_media_locked()
+            self._poll_current_media_locked()
             return {
                 "station": self._decorate_station_locked(self._current_station) if self._current_station else None,
                 "dab_media": self._dab_media_payload_locked(),
@@ -1862,8 +1950,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
 
     def _status_payload_locked(self, refresh_signal: bool) -> Dict[str, Any]:
         self._refresh_recording_state_locked()
-        if self._booted and self._current_station is not None and self._current_station.get("mode") == "dab":
-            self._poll_dab_media_locked()
+        self._poll_current_media_locked()
         if refresh_signal and self._booted and self._current_station is not None:
             try:
                 self._last_signal = self._read_current_signal_locked()
@@ -1998,8 +2085,179 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         payload["artwork_name"] = self._dab_artwork_name
         payload["artwork_updated_at"] = _iso_or_none(self._dab_artwork_updated_at)
         payload["artwork_supported"] = bool(payload.get("artwork_supported") or self._dab_artwork_bytes)
-        payload["available"] = bool(payload.get("text") or payload.get("artwork_url"))
+        payload["available"] = bool(
+            payload.get("text")
+            or payload.get("title")
+            or payload.get("artist")
+            or payload.get("station_name")
+            or payload.get("artwork_url")
+        )
         return payload
+
+    def _poll_current_media_locked(self) -> None:
+        if not self._booted or self._current_station is None:
+            return
+        if self._current_station.get("mode") == "dab":
+            self._poll_dab_media_locked()
+            return
+        if self._current_station.get("hd_available"):
+            self._poll_hd_media_locked()
+
+    def _poll_hd_media_locked(self, max_packets: int = 4) -> None:
+        station = self._current_station
+        if station is None or not station.get("hd_available"):
+            return
+        radio = self._require_radio_locked()
+        try:
+            radio.hd_get_event_status(ack=True)
+        except Exception:
+            pass
+
+        program_id = _clamp_int(int(station.get("program_id") or 0), 0, 7)
+        program_mask = int(station.get("program_mask") or 0) or (1 << program_id)
+        programs = [_hd_program_label(item) for item in _hd_program_ids_from_mask(program_mask)]
+        program_label = _hd_program_label(program_id)
+        old = dict(self._dab_media)
+        media = dict(self._dab_media if self._dab_media.get("source") == "hd" else _empty_dab_media())
+        media.update(
+            {
+                "source": "hd",
+                "program": program_label,
+                "programs": programs,
+                "encoding": None,
+                "toggle": None,
+                "artwork_url": None,
+                "artwork_supported": bool(media.get("artwork_supported") or self._dab_artwork_bytes),
+            }
+        )
+
+        changed = False
+        psd = self._read_hd_psd_locked(radio, program_id)
+        for key in ("title", "artist", "album", "genre"):
+            value = psd.get(key)
+            if value and value != media.get(key):
+                media[key] = value
+                changed = True
+
+        sis = self._read_hd_sis_locked(radio)
+        station_name = (
+            sis.get("station_name")
+            or sis.get("station_name_short")
+            or sis.get("station_name_long")
+        )
+        if station_name and station_name != media.get("station_name"):
+            media["station_name"] = station_name
+            self._apply_hd_station_name_locked(station_name)
+            changed = True
+
+        text = psd.get("title") or sis.get("station_message") or sis.get("slogan") or station_name
+        if text and text != media.get("text"):
+            media["text"] = text
+            changed = True
+        if changed:
+            media["updated_at"] = time.time()
+        self._dab_media = media
+        self._log_hd_media_update_locked(old, media)
+        self._consume_hd_service_data_locked(radio, max_packets=max_packets)
+
+    def _read_hd_psd_locked(self, radio: Si468xDabRadio, program_id: int) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for name, field in HD_PSD_FIELDS.items():
+            for program in (0xFF, program_id):
+                try:
+                    packet = radio.hd_get_psd_decode(program=program, field=field)
+                except Exception:
+                    continue
+                text = _decode_hd_text(
+                    bytes(packet.get("payload") or b""),
+                    int(packet.get("datatype") or 0),
+                )
+                if text:
+                    result[name] = text
+                    break
+        return result
+
+    def _read_hd_sis_locked(self, radio: Si468xDabRadio) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        selects = (
+            HD_INFO_UNIVERSAL_SHORT_NAME,
+            HD_INFO_BASIC_SIS,
+            HD_INFO_SLOGAN,
+            HD_INFO_STATION_MESSAGE,
+        )
+        for info_select in selects:
+            try:
+                packet = radio.hd_get_station_info(info_select)
+            except Exception:
+                continue
+            payload = bytes(packet.get("payload") or b"")
+            if not payload:
+                continue
+            if info_select == HD_INFO_UNIVERSAL_SHORT_NAME and len(payload) > 3:
+                text = _decode_hd_text(payload[3:], payload[1])
+                if text:
+                    result["station_name"] = text
+            elif info_select == HD_INFO_BASIC_SIS:
+                result.update(_parse_hd_basic_sis(payload))
+            elif info_select == HD_INFO_SLOGAN and len(payload) > 2:
+                text = _decode_hd_text(payload[2:], payload[1])
+                if text:
+                    result["slogan"] = text
+            elif info_select == HD_INFO_STATION_MESSAGE and len(payload) > 3:
+                text = _decode_hd_text(payload[3:], payload[1])
+                if text:
+                    result["station_message"] = text
+        return result
+
+    def _apply_hd_station_name_locked(self, station_name: str) -> None:
+        station = self._current_station
+        if station is None or not station.get("hd_available"):
+            return
+        name = normalize_broadcast_text(station_name)
+        if not name:
+            return
+        program_label = str(station.get("program_label") or _hd_program_label(station.get("program_id", 0)))
+        label = f"{name} {program_label}"
+        station["station_name"] = name
+        station["label"] = label
+        station_id = str(station.get("station_id") or "")
+        for candidate in self._stations.get(self._scan_key(), []):
+            if candidate.get("station_id") == station_id:
+                candidate["station_name"] = name
+                candidate["label"] = label
+                break
+
+    def _log_hd_media_update_locked(self, old: Dict[str, Any], media: Dict[str, Any]) -> None:
+        for key in ("title", "artist", "album", "genre", "station_name"):
+            value = media.get(key)
+            if value and value != old.get(key):
+                print(f"HD update: {key}={value}", flush=True)
+        programs = media.get("programs") or []
+        program = media.get("program")
+        if programs and (programs != old.get("programs") or program != old.get("program")):
+            program_text = " ".join(f"{item}*" if item == program else str(item) for item in programs)
+            print(f"HD update: programs={program_text}", flush=True)
+
+    def _consume_hd_service_data_locked(self, radio: Si468xDabRadio, max_packets: int = 4) -> None:
+        try:
+            status = radio.get_digital_service_data(status_only=True, ack=False)
+        except Exception:
+            return
+        packets = int(status.get("buffer_count") or 0)
+        if not status.get("packet_ready") and packets <= 0:
+            return
+        packets = max(1 if status.get("packet_ready") else 0, min(max_packets, packets))
+        for _ in range(packets):
+            try:
+                packet = radio.get_digital_service_data(status_only=False, ack=True)
+            except Exception:
+                return
+            payload = bytes(packet.get("payload") or b"")
+            if not payload:
+                continue
+            image_bytes, content_type = _extract_image_payload(payload, None)
+            if image_bytes:
+                self._set_dab_artwork_locked(image_bytes, content_type, "hd-radio-artwork")
 
     def _poll_dab_media_locked(self, max_packets: int = 16) -> None:
         station = self._current_station
@@ -2049,9 +2307,15 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             text = _decode_dab_text(payload[2:], encoding)
             artist, title = _infer_artist_title(text)
             self._dab_media = {
+                "source": "dab",
                 "text": text,
                 "title": title,
                 "artist": artist,
+                "album": None,
+                "genre": None,
+                "station_name": None,
+                "program": None,
+                "programs": [],
                 "encoding": encoding,
                 "toggle": 1 if (prefix0 & 0x80) else 0,
                 "updated_at": time.time(),
@@ -2174,32 +2438,54 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             station["station_id"] = f"dab:{station['service_id']:08x}:{station['component_id']:08x}:{station['freq_khz']}"
         else:
             station["freq_khz"] = int(station.get("freq_khz", 0))
-            station["service_id"] = int(station.get("service_id", station["freq_khz"]))
-            station["component_id"] = int(station.get("component_id", 0))
             station["analog_available"] = bool(station.get("analog_available", scan_key in {"fm", "am"}))
             station["hd_available"] = bool(station.get("hd_available", scan_key in {"hd", "am_hd"}))
             station["program_mask"] = int(station.get("program_mask", 0))
-            station["program_id"] = int(station.get("program_id", 0))
-            station["station_id"] = f"{scan_key}:{station['freq_khz']}"
+            station["program_id"] = _clamp_int(int(station.get("program_id", 0)), 0, 7)
+            if station["hd_available"]:
+                station["service_id"] = int(station.get("service_id", 0))
+                station["component_id"] = int(station.get("component_id", station["program_id"]))
+                station["program_label"] = _hd_program_label(station["program_id"])
+                station["programs"] = [_hd_program_label(item) for item in _hd_program_ids_from_mask(station["program_mask"])]
+                station["station_id"] = f"{scan_key}:{station['freq_khz']}:p{station['program_id']}"
+            else:
+                station["service_id"] = int(station.get("service_id", station["freq_khz"]))
+                station["component_id"] = int(station.get("component_id", 0))
+                station.pop("program_label", None)
+                station["programs"] = []
+                station["station_id"] = f"{scan_key}:{station['freq_khz']}"
         label = normalize_broadcast_text(station.get("label") or "")
         if not label:
-            label = self._default_station_label(scan_key, station["freq_khz"], station.get("program_mask", 0), station.get("hd_available", False))
+            label = self._default_station_label(
+                scan_key,
+                station["freq_khz"],
+                station.get("program_mask", 0),
+                station.get("hd_available", False),
+                station.get("program_id"),
+            )
         station["label"] = label
         return station
 
-    def _default_station_label(self, scan_key: str, freq_khz: int, program_mask: int, hd_available: bool) -> str:
+    def _default_station_label(
+        self,
+        scan_key: str,
+        freq_khz: int,
+        program_mask: int,
+        hd_available: bool,
+        program_id: Optional[int] = None,
+    ) -> str:
         if scan_key == "dab":
             return f"DAB {freq_khz} kHz"
         if scan_key in {"fm", "hd"}:
             mhz = freq_khz / 1000.0
-            prefix = "HD" if scan_key == "hd" or hd_available else "FM"
+            prefix = _hd_program_label(program_id) if (scan_key == "hd" or hd_available) else "FM"
             suffix = ""
-            if (scan_key == "hd" or hd_available) and program_mask:
+            if (scan_key == "hd" or hd_available) and program_id is None and program_mask:
                 count = bin(program_mask).count("1")
                 if count > 1:
                     suffix = f" ({count})"
             return f"{prefix} {mhz:.1f}{suffix}"
-        prefix = "AM HD" if scan_key == "am_hd" or hd_available else "AM"
+        prefix = f"AM {_hd_program_label(program_id)}" if (scan_key == "am_hd" or hd_available) else "AM"
         return f"{prefix} {freq_khz} kHz"
 
     def _boot_locked(self, force: bool) -> Dict[str, Any]:
@@ -2788,7 +3074,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         )
         print(f"FMHD scan: probing {len(candidate_freqs)} frequency(ies) for HD.", flush=True)
 
-        merged: Dict[int, Dict[str, Any]] = {int(station["freq_khz"]): dict(station) for station in self._stations["fm"]}
+        merged: Dict[str, Dict[str, Any]] = {str(station["station_id"]): dict(station) for station in self._stations["fm"]}
         hd_count = 0
         total = len(candidate_freqs)
         self._update_scan_progress_locked(
@@ -2818,12 +3104,12 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             hd_station = self._probe_analog_station_locked(freq_khz, "fm", require_hd=True)
             if hd_station is None:
                 continue
-            hd_count += 1
-            base_station = merged.get(int(hd_station["freq_khz"]), hd_station)
-            merged[int(hd_station["freq_khz"])] = self._merge_hd_station(base_station, hd_station, scan_key="fm")
+            for program_station in self._expand_hd_station_locked(hd_station, scan_key="fm"):
+                merged[str(program_station["station_id"])] = program_station
+                hd_count += 1
             self._update_scan_progress_locked(found=len(merged), hd_found=hd_count)
 
-        print(f"FMHD scan: found {len(merged)} FM station(s), {hd_count} with HD.", flush=True)
+        print(f"FMHD scan: found {len(merged)} FM station(s), {hd_count} HD program(s).", flush=True)
         return self._save_scan_file_locked("fm", list(merged.values()))
 
     def _scan_fm_hd_locked(self) -> List[Dict[str, Any]]:
@@ -2840,7 +3126,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         )
         print(f"HD scan: probing {len(candidate_freqs)} FM candidate frequency(ies).", flush=True)
 
-        found: Dict[int, Dict[str, Any]] = {}
+        found: Dict[str, Dict[str, Any]] = {}
         total = len(candidate_freqs)
         for index, freq_khz in enumerate(candidate_freqs):
             step = index + 1
@@ -2858,12 +3144,11 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             station = self._probe_analog_station_locked(freq_khz, "fm", require_hd=True)
             if station is None:
                 continue
-            existing = found.get(station["freq_khz"])
-            if existing is None or int(station.get("score", 0)) > int(existing.get("score", 0)):
-                found[station["freq_khz"]] = station
+            for program_station in self._expand_hd_station_locked(station, scan_key="hd"):
+                found[str(program_station["station_id"])] = program_station
             self._update_scan_progress_locked(found=len(found), hd_found=len(found))
 
-        print(f"HD scan: found {len(found)} HD-capable frequency(ies).", flush=True)
+        print(f"HD scan: found {len(found)} HD program(s).", flush=True)
         return self._save_scan_file_locked("hd", list(found.values()))
 
     def _scan_amhd_combined_locked(self) -> List[Dict[str, Any]]:
@@ -2878,7 +3163,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         )
         print(f"AMHD scan: probing {len(candidate_freqs)} frequency(ies) for AM HD.", flush=True)
 
-        merged: Dict[int, Dict[str, Any]] = {int(station["freq_khz"]): dict(station) for station in self._stations["am"]}
+        merged: Dict[str, Dict[str, Any]] = {str(station["station_id"]): dict(station) for station in self._stations["am"]}
         hd_count = 0
         analog_total = len(self._analog_scan_frequencies_locked("am", require_hd=False)) * 2
         total = analog_total + len(candidate_freqs)
@@ -2906,39 +3191,36 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             hd_station = self._probe_analog_station_locked(freq_khz, "am", require_hd=True)
             if hd_station is None:
                 continue
-            hd_count += 1
-            base_station = merged.get(int(hd_station["freq_khz"]), hd_station)
-            merged[int(hd_station["freq_khz"])] = self._merge_hd_station(base_station, hd_station, scan_key="am")
+            for program_station in self._expand_hd_station_locked(hd_station, scan_key="am"):
+                merged[str(program_station["station_id"])] = program_station
+                hd_count += 1
             self._update_scan_progress_locked(found=len(merged), hd_found=hd_count)
 
-        print(f"AMHD scan: found {len(merged)} AM station(s), {hd_count} with HD.", flush=True)
+        print(f"AMHD scan: found {len(merged)} AM station(s), {hd_count} HD program(s).", flush=True)
         return self._save_scan_file_locked("am", list(merged.values()))
 
-    def _merge_hd_station(self, base_station: Dict[str, Any], hd_station: Dict[str, Any], *, scan_key: str) -> Dict[str, Any]:
-        merged = dict(base_station)
-        merged["freq_khz"] = int(hd_station.get("freq_khz") or base_station.get("freq_khz") or 0)
-        merged["analog_available"] = bool(base_station.get("analog_available", True) or hd_station.get("analog_available"))
-        merged["hd_available"] = True
-        merged["program_mask"] = int(hd_station.get("program_mask") or base_station.get("program_mask") or 0)
-        merged["program_id"] = int(hd_station.get("program_id") or base_station.get("program_id") or 0)
-        merged["score"] = max(int(base_station.get("score", 0)), int(hd_station.get("score", 0)))
-        merged["label"] = self._hd_station_label(scan_key, merged)
-        return merged
-
-    def _hd_station_label(self, scan_key: str, station: Dict[str, Any]) -> str:
-        label = normalize_broadcast_text(station.get("label") or "")
-        freq_khz = int(station.get("freq_khz") or 0)
-        program_mask = int(station.get("program_mask") or 0)
-        if not label:
-            return self._default_station_label(scan_key, freq_khz, program_mask, True)
-        upper = label.upper()
-        if "HD" in upper:
-            return label
-        if scan_key == "fm" and label.startswith("FM "):
-            return f"HD {label[3:]}"
-        if scan_key == "am" and label.startswith("AM "):
-            return f"AM HD {label[3:]}"
-        return f"{label} HD"
+    def _expand_hd_station_locked(self, station: Dict[str, Any], *, scan_key: str) -> List[Dict[str, Any]]:
+        mask = int(station.get("program_mask") or 0)
+        programs = _hd_program_ids_from_mask(mask)
+        expanded: List[Dict[str, Any]] = []
+        for program_id in programs:
+            item = dict(station)
+            item["hd_available"] = True
+            item["analog_available"] = False
+            item["service_id"] = 0
+            item["component_id"] = program_id
+            item["program_id"] = program_id
+            item["program_mask"] = mask or (1 << program_id)
+            item["program_label"] = _hd_program_label(program_id)
+            item["label"] = self._default_station_label(
+                scan_key,
+                int(item.get("freq_khz") or 0),
+                int(item.get("program_mask") or 0),
+                True,
+                program_id,
+            )
+            expanded.append(self._normalize_station(scan_key, item))
+        return expanded
 
     def _analog_scan_frequencies_locked(self, band: str, require_hd: bool) -> List[int]:
         frequencies: List[int] = []
@@ -2999,7 +3281,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             scan_key,
             {
                 "freq_khz": measured_freq,
-                "label": self._default_station_label(scan_key, measured_freq, program_mask, hd_ready),
+                "label": self._default_station_label(scan_key, measured_freq, program_mask, hd_ready, program_id),
                 "analog_available": analog_ready,
                 "hd_available": hd_ready,
                 "program_mask": program_mask,
@@ -3237,6 +3519,11 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
 
     def _play_analog_locked(self, station: Dict[str, Any]) -> None:
         radio = self._require_radio_locked()
+        if self._current_station and self._current_station.get("hd_available"):
+            try:
+                radio.stop_digital_service(0, int(self._current_station.get("program_id") or 0))
+            except Exception:
+                pass
         self._reset_dab_media_locked(clear_artwork=True)
         self._apply_mute_locked(radio)
         band = station["band"]
@@ -3256,9 +3543,23 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
                 signal = self._wait_am_signal_locked(require_hd=False)
         if signal is None:
             raise RuntimeError(f"Failed to tune {station['label']}.")
+        if require_hd and self._is_hd_digital_ready(signal):
+            program_id = _clamp_int(int(station.get("program_id", self._normalized_hd_program_id(signal))), 0, 7)
+            radio.start_digital_service(0, program_id)
+            time.sleep(0.2)
+            if band == "fm":
+                signal = self._merge_fmhd_status(radio.fm_rsq_status(attune=True), radio.hd_digrad_status())
+            else:
+                signal = self._merge_fmhd_status(radio.am_rsq_status(attune=True), radio.hd_digrad_status())
+            station["program_id"] = program_id
+            station["component_id"] = program_id
+            station["service_id"] = 0
+            station["program_label"] = _hd_program_label(program_id)
         self._current_station = dict(station)
         self._last_signal = dict(signal)
         self._apply_mute_locked(radio)
+        if require_hd and self._is_hd_digital_ready(signal):
+            self._poll_hd_media_locked()
 
     def _read_current_signal_locked(self) -> Dict[str, Any]:
         radio = self._require_radio_locked()

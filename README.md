@@ -30,11 +30,15 @@ The whole project is open source:
 - Product: [Raspiaudio Digital Radio Shield for Raspberry Pi](https://raspiaudio.com/product/digital-radio/)
 <li><a href="https://raspiaudio.com/product/digital-radio/" target="_blank" rel="noopener">Store </a></li>
 
-## Software release v1.5.1
+## Software release v1.5.2
 
-This release updates the Web UI source modes to `DAB`, `FM / HD`, and `AM / HD`, and adds a guided SPI setup prompt.
+This release adds the first HD Radio metadata and subchannel support on top of the `DAB`, `FM / HD`, and `AM / HD` source modes.
 
-For HD Radio testing in the United States, `FM / HD` now scans analog FM carriers first and then probes the detected FM frequencies for HD Radio. During long scans the Web UI shows backend-driven progress such as `FM 144/206 | 31 found` and `HD probe 20/45 | FM 45 found | HD 0`, so the scan should no longer look stuck while HD probing continues.
+For HD Radio testing in the United States, `FM / HD` scans analog FM carriers first and then probes the detected FM frequencies for HD Radio. During long scans the Web UI shows backend-driven progress such as `FM 144/206 | 31 found` and `HD probe 20/45 | FM 45 found | HD 0`, so the scan should no longer look stuck while HD probing continues.
+
+When the broadcaster provides the data, the backend now reads HD Radio station info and PSD metadata such as station name, title, artist, album, genre, and available programs. HD subchannels are exposed as selectable entries like `HD1`, `HD2`, and `HD3`, and the UI labels the active HD program instead of treating the whole frequency as a single station.
+
+Media artwork support has also started: the backend now reuses the existing DAB artwork path when the SI4689 returns recognizable image payloads for HD Radio. This is best effort for now and depends on what each station broadcasts.
 
 If SPI is not enabled, the Web UI can now propose to add `dtparam=spi=on` to `/boot/firmware/config.txt` after confirmation. Reboot the Raspberry Pi after using this helper so `/dev/spidev0.*` appears.
 
