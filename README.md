@@ -30,19 +30,23 @@ The whole project is open source:
 - Product: [Raspiaudio Digital Radio Shield for Raspberry Pi](https://raspiaudio.com/product/digital-radio/)
 <li><a href="https://raspiaudio.com/product/digital-radio/" target="_blank" rel="noopener">Store </a></li>
 
-## Software release v1.5.2
+## Software release v1.5.3
 
-This release adds the first HD Radio metadata and subchannel support on top of the `DAB`, `FM / HD`, and `AM / HD` source modes.
+This release improves HD Radio subchannel discovery after field feedback from US testing.
 
-For HD Radio testing in the United States, `FM / HD` scans analog FM carriers first and then probes the detected FM frequencies for HD Radio. During long scans the Web UI shows backend-driven progress such as `FM 144/206 | 31 found` and `HD probe 20/45 | FM 45 found | HD 0`, so the scan should no longer look stuck while HD probing continues.
+`FM / HD` still scans analog FM carriers first and then probes the detected FM frequencies for HD Radio. During long scans the Web UI shows backend-driven progress such as `FM 144/206 | 31 found` and `HD probe 20/45 | FM 45 found | HD 0`, so the scan should not look stuck while HD probing continues.
 
-When the broadcaster provides the data, the backend now reads HD Radio station info and PSD metadata such as station name, title, artist, album, genre, and available programs. HD subchannels are exposed as selectable entries like `HD1`, `HD2`, and `HD3`, and the UI labels the active HD program instead of treating the whole frequency as a single station.
+New in `v1.5.3`: the scan no longer relies only on the SI4689 `audio_program_available` mask to discover subchannels. For every HD carrier that locks, the backend explicitly probes `HD1`, `HD2`, `HD3`, and `HD4` with `START_DIGITAL_SERVICE(0, program_id)`. This should expose extra entries such as `HD2` and `HD3` even when the first status reply only advertises `HD1`.
+
+Selecting a subchannel also verifies that the SI4689 reports the requested program as playing before accepting the tune. This avoids showing an `HD2` entry while the chip is still playing `HD1`.
+
+When the broadcaster provides the data, the backend reads HD Radio station info and PSD metadata such as station name, title, artist, album, genre, and available programs. HD subchannels are exposed as selectable entries like `HD1`, `HD2`, and `HD3`, and the UI labels the active HD program instead of treating the whole frequency as a single station.
 
 Media artwork support has also started: the backend now reuses the existing DAB artwork path when the SI4689 returns recognizable image payloads for HD Radio. This is best effort for now and depends on what each station broadcasts.
 
 If SPI is not enabled, the Web UI can now propose to add `dtparam=spi=on` to `/boot/firmware/config.txt` after confirmation. Reboot the Raspberry Pi after using this helper so `/dev/spidev0.*` appears.
 
-If HD Radio still does not lock in your area, run the server with logs and share the scan output so we can compare the SI4689 status during each HD probe.
+If HD Radio subchannels still do not appear in your area, run the server with logs and share the scan output so we can compare the SI4689 status during each HD program probe.
 
 ## Quickstart
 
