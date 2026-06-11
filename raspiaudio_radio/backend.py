@@ -626,6 +626,8 @@ class RadioConfig:
     fm_rssi_min: int = 18
     fm_snr_min: int = 6
     fm_hd_timeout_ms: int = 5000
+    hd_program_probe_count: int = 4
+    hd_program_probe_timeout_ms: int = 1200
     am_min_khz: int = 531
     am_max_khz: int = 1710
     am_step_khz: int = 9
@@ -3104,7 +3106,10 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             hd_station = self._probe_analog_station_locked(freq_khz, "fm", require_hd=True)
             if hd_station is None:
                 continue
-            for program_station in self._expand_hd_station_locked(hd_station, scan_key="fm"):
+            program_stations = self._probe_hd_programs_locked(hd_station, scan_key="fm", band="fm")
+            if not program_stations:
+                program_stations = self._expand_hd_station_locked(hd_station, scan_key="fm")
+            for program_station in program_stations:
                 merged[str(program_station["station_id"])] = program_station
                 hd_count += 1
             self._update_scan_progress_locked(found=len(merged), hd_found=hd_count)
@@ -3144,7 +3149,10 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             station = self._probe_analog_station_locked(freq_khz, "fm", require_hd=True)
             if station is None:
                 continue
-            for program_station in self._expand_hd_station_locked(station, scan_key="hd"):
+            program_stations = self._probe_hd_programs_locked(station, scan_key="hd", band="fm")
+            if not program_stations:
+                program_stations = self._expand_hd_station_locked(station, scan_key="hd")
+            for program_station in program_stations:
                 found[str(program_station["station_id"])] = program_station
             self._update_scan_progress_locked(found=len(found), hd_found=len(found))
 
@@ -3191,7 +3199,10 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             hd_station = self._probe_analog_station_locked(freq_khz, "am", require_hd=True)
             if hd_station is None:
                 continue
-            for program_station in self._expand_hd_station_locked(hd_station, scan_key="am"):
+            program_stations = self._probe_hd_programs_locked(hd_station, scan_key="am", band="am")
+            if not program_stations:
+                program_stations = self._expand_hd_station_locked(hd_station, scan_key="am")
+            for program_station in program_stations:
                 merged[str(program_station["station_id"])] = program_station
                 hd_count += 1
             self._update_scan_progress_locked(found=len(merged), hd_found=hd_count)
@@ -3221,6 +3232,157 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             )
             expanded.append(self._normalize_station(scan_key, item))
         return expanded
+
+    def _probe_hd_programs_locked(
+        self,
+        station: Dict[str, Any],
+        *,
+        scan_key: str,
+        band: str,
+    ) -> List[Dict[str, Any]]:
+        radio = self._require_radio_locked()
+        max_programs = _clamp_int(int(self.config.hd_program_probe_count), 1, 8)
+        base_mask = int(station.get("program_mask") or 0)
+        program_ids = set(range(max_programs))
+        if base_mask:
+            program_ids.update(_hd_program_ids_from_mask(base_mask))
+
+        found: List[Dict[str, Any]] = []
+        freq_khz = int(station.get("freq_khz") or 0)
+        freq_label = _frequency_label(freq_khz, band) or f"{freq_khz} kHz"
+        previous_program: Optional[int] = None
+        for program_id in sorted(program_ids):
+            if program_id < 0 or program_id > 7:
+                continue
+            program_label = _hd_program_label(program_id)
+            self._update_scan_progress_locked(
+                stage="hd_program_probe",
+                message=f"Probing {program_label} on {freq_label}",
+                frequency_khz=freq_khz,
+                band=band,
+            )
+            if previous_program is not None and previous_program != program_id:
+                try:
+                    radio.stop_digital_service(0, previous_program)
+                except Exception:
+                    pass
+            try:
+                radio.start_digital_service(0, program_id)
+            except Exception as exc:
+                print(f"HD scan: {freq_label} {program_label} start failed: {exc}", flush=True)
+                previous_program = None
+                continue
+            previous_program = program_id
+            signal = self._wait_hd_program_signal_locked(band, program_id, accept_available_mask=True)
+            if signal is None:
+                print(f"HD scan: {freq_label} {program_label} not available.", flush=True)
+                continue
+            program_mask = 1 << program_id
+            item = dict(station)
+            item.update(
+                {
+                    "freq_khz": int(signal.get("freq_khz") or freq_khz),
+                    "label": self._default_station_label(
+                        scan_key,
+                        int(signal.get("freq_khz") or freq_khz),
+                        0,
+                        True,
+                        program_id,
+                    ),
+                    "analog_available": False,
+                    "hd_available": True,
+                    "service_id": 0,
+                    "component_id": program_id,
+                    "program_id": program_id,
+                    "program_mask": program_mask,
+                    "program_label": program_label,
+                    "score": _analog_score(signal),
+                }
+            )
+            found.append(item)
+            print(
+                (
+                    f"HD scan: found {freq_label} {program_label} "
+                    f"playing={int(signal.get('audio_program_playing', 0))} "
+                    f"prog=0x{int(signal.get('audio_program_available', 0)):02X}"
+                ),
+                flush=True,
+            )
+
+        if previous_program is not None:
+            try:
+                radio.stop_digital_service(0, previous_program)
+            except Exception:
+                pass
+        if not found:
+            return []
+
+        full_mask = 0
+        for item in found:
+            full_mask |= 1 << _clamp_int(int(item.get("program_id") or 0), 0, 7)
+        normalized: List[Dict[str, Any]] = []
+        for item in found:
+            program_id = _clamp_int(int(item.get("program_id") or 0), 0, 7)
+            item["program_mask"] = full_mask
+            item["programs"] = [
+                _hd_program_label(value)
+                for value in _hd_program_ids_from_mask(full_mask)
+            ]
+            item["label"] = self._default_station_label(
+                scan_key,
+                int(item.get("freq_khz") or 0),
+                full_mask,
+                True,
+                program_id,
+            )
+            normalized.append(self._normalize_station(scan_key, item))
+        return normalized
+
+    def _wait_hd_program_signal_locked(
+        self,
+        band: str,
+        program_id: int,
+        *,
+        accept_available_mask: bool,
+    ) -> Optional[Dict[str, Any]]:
+        deadline = time.time() + (self.config.hd_program_probe_timeout_ms / 1000.0)
+        best: Optional[Dict[str, Any]] = None
+        while time.time() < deadline:
+            signal = self._read_analog_signal_locked(band)
+            if best is None or int(signal.get("score", 0)) > int(best.get("score", 0)):
+                best = signal
+            if self._is_hd_program_ready(signal, program_id, accept_available_mask=accept_available_mask):
+                return signal
+            time.sleep(0.08)
+        return (
+            best
+            if best and self._is_hd_program_ready(best, program_id, accept_available_mask=accept_available_mask)
+            else None
+        )
+
+    def _read_analog_signal_locked(self, band: str) -> Dict[str, Any]:
+        radio = self._require_radio_locked()
+        if band == "fm":
+            return self._merge_fmhd_status(radio.fm_rsq_status(attune=True), radio.hd_digrad_status())
+        return self._merge_fmhd_status(radio.am_rsq_status(attune=True), radio.hd_digrad_status())
+
+    def _is_hd_program_ready(
+        self,
+        signal: Dict[str, Any],
+        program_id: int,
+        *,
+        accept_available_mask: bool,
+    ) -> bool:
+        if not self._is_hd_digital_ready(signal):
+            return False
+        requested = _clamp_int(int(program_id), 0, 7)
+        playing = self._normalized_hd_program_id(signal)
+        if playing == requested:
+            return True
+        mask = self._normalized_hd_program_mask(signal) if accept_available_mask else 0
+        if accept_available_mask and mask & (1 << requested):
+            return True
+        return requested == 0 and int(signal.get("audio_program_playing", 0) or 0) in {0, 0xFF}
 
     def _analog_scan_frequencies_locked(self, band: str, require_hd: bool) -> List[int]:
         frequencies: List[int] = []
@@ -3429,7 +3591,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         )
 
     def _is_am_hd_ready(self, signal: Dict[str, Any]) -> bool:
-        return (
+        return self._is_hd_digital_ready(signal) or (
             (bool(signal.get("hd_detected")) or bool(signal.get("digital_source")))
             and bool(signal.get("acq"))
             and int(signal.get("audio_program_available", 0)) > 0
@@ -3546,11 +3708,14 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         if require_hd and self._is_hd_digital_ready(signal):
             program_id = _clamp_int(int(station.get("program_id", self._normalized_hd_program_id(signal))), 0, 7)
             radio.start_digital_service(0, program_id)
-            time.sleep(0.2)
-            if band == "fm":
-                signal = self._merge_fmhd_status(radio.fm_rsq_status(attune=True), radio.hd_digrad_status())
-            else:
-                signal = self._merge_fmhd_status(radio.am_rsq_status(attune=True), radio.hd_digrad_status())
+            program_signal = self._wait_hd_program_signal_locked(
+                band,
+                program_id,
+                accept_available_mask=program_id == 0,
+            )
+            if program_signal is None and program_id > 0:
+                raise RuntimeError(f"Failed to start {_hd_program_label(program_id)} on {station['label']}.")
+            signal = program_signal or self._read_analog_signal_locked(band)
             station["program_id"] = program_id
             station["component_id"] = program_id
             station["service_id"] = 0
