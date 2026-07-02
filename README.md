@@ -240,6 +240,11 @@ This helper requires the server to be started with `sudo`:
 sudo python3 radio.py serve --port 8686
 ```
 
+The `Start with the system` toggle can create `/etc/systemd/system/raspiaudio-radio.service`
+automatically if it is missing, then enable it for the next boot. This also requires
+the server to be running with `sudo`, because writing to `/etc/systemd/system` and
+running `systemctl daemon-reload` need administrator privileges.
+
 Stream URLs require the SI4689 I2S audio capture device to be installed on the Raspberry Pi.
 The Web UI browser output uses direct PCM WAV from `si4689_i2s` through ALSA, with no MP3 compression.
 MP3 endpoints remain available for external players that need compressed audio or ICY metadata.

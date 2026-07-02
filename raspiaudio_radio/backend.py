@@ -6,6 +6,7 @@ import mimetypes
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import wave
@@ -644,6 +645,40 @@ class RadioConfig:
     system_service_name: str = "raspiaudio-radio.service"
 
 
+def _systemd_quote(value: str) -> str:
+    if value and not re.search(r"[\s\"'\\#;]", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _current_service_unit_text() -> str:
+    argv = list(sys.argv)
+    script = Path(argv[0] if argv else "radio.py")
+    if not script.is_absolute():
+        script = (Path.cwd() / script).resolve()
+    command = [sys.executable or "/usr/bin/python3", str(script)]
+    command.extend(argv[1:] if len(argv) > 1 else ["serve", "--port", "8686"])
+    exec_start = " ".join(_systemd_quote(str(part)) for part in command)
+    working_dir = _systemd_quote(str(Path.cwd().resolve()))
+    return (
+        "[Unit]\n"
+        "Description=Raspiaudio Digital Radio web service\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"WorkingDirectory={working_dir}\n"
+        f"ExecStart={exec_start}\n"
+        "Restart=on-failure\n"
+        "RestartSec=3\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
 class AmplifierGate:
     def __init__(self, pin: Optional[int], active_high: bool) -> None:
         self.pin = pin
@@ -1275,6 +1310,12 @@ class RadioBackend:
             service_name = str(self.config.system_service_name or "").strip()
             if not service_name:
                 raise RuntimeError("No systemd service is configured for autostart.")
+        if enabled:
+            install_result = self._install_system_service_if_missing(service_name)
+            if install_result.get("error"):
+                raise RuntimeError(
+                    f"Unable to install {service_name}: {install_result['error']}"
+                )
         command = ["sudo", "-n", "systemctl", "enable" if enabled else "disable", service_name]
         try:
             result = subprocess.run(
@@ -1677,16 +1718,90 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             label="SPI",
         )
 
+    def _system_service_exists(self, service_name: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["systemctl", "cat", service_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+
+    def _install_system_service_if_missing(self, service_name: str) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "service": service_name,
+            "path": None,
+            "installed": False,
+            "created": False,
+            "error": None,
+        }
+        if not service_name:
+            payload["error"] = "No systemd service is configured for autostart."
+            return payload
+        if "/" in service_name or service_name != Path(service_name).name or not service_name.endswith(".service"):
+            payload["error"] = f"Invalid systemd service name: {service_name}"
+            return payload
+        payload["path"] = f"/etc/systemd/system/{service_name}"
+        if self._system_service_exists(service_name):
+            payload["installed"] = True
+            return payload
+
+        unit_text = _current_service_unit_text()
+        try:
+            write_result = subprocess.run(
+                ["sudo", "-n", "tee", str(payload["path"])],
+                input=unit_text,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            payload["error"] = str(exc)
+            return payload
+        if write_result.returncode != 0:
+            payload["error"] = (write_result.stderr or write_result.stdout or f"tee exited with {write_result.returncode}").strip()
+            return payload
+
+        try:
+            reload_result = subprocess.run(
+                ["sudo", "-n", "systemctl", "daemon-reload"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            payload["error"] = str(exc)
+            return payload
+        if reload_result.returncode != 0:
+            payload["error"] = (reload_result.stderr or reload_result.stdout or f"daemon-reload exited with {reload_result.returncode}").strip()
+            return payload
+
+        payload["installed"] = True
+        payload["created"] = True
+        return payload
+
     def _enable_system_autostart_best_effort(self) -> Dict[str, Any]:
         service_name = str(self.config.system_service_name or "").strip()
         payload: Dict[str, Any] = {
             "requested": True,
             "service": service_name,
             "enabled": None,
+            "install": None,
             "error": None,
         }
         if not service_name:
             payload["error"] = "No systemd service is configured for autostart."
+            return payload
+        install_result = self._install_system_service_if_missing(service_name)
+        payload["install"] = install_result
+        if install_result.get("error"):
+            payload["error"] = install_result["error"]
             return payload
         try:
             result = subprocess.run(
