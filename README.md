@@ -223,7 +223,7 @@ stack a separate radio capture overlay and a separate DAC overlay on the same
 I2S pins.
 
 See [README_AUDIO_PLUS_MIC_PLUS_I2S.md](README_AUDIO_PLUS_MIC_PLUS_I2S.md) for
-the full setup and the `tools/i2s_route.py --gain` software volume control.
+the full setup using the native ALSA `alsaloop` route.
 
 ## Stream URLs and Music Assistant integration
 

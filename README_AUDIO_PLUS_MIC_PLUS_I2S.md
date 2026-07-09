@@ -35,13 +35,8 @@ dtoverlay=raspiaudio-digital-radio-i2s-output
 ```
 
 If the Raspberry Pi already has an old MIC+ / XVF profile installed, disable it
-for this test so it does not create another ALSA card on the same I2S pins:
-
-```bash
-systemctl --user disable --now pi-ai-mic-vocalfusion-pipewire-16k.service 2>/dev/null || true
-systemctl --user disable --now pi-ai-mic-vocalfusion-pipewire-48k.service 2>/dev/null || true
-sudo systemctl disable --now pi-ai-mic-rpi-48k-doa-spi-boot.service 2>/dev/null || true
-```
+before rebooting. The important rule is to keep only one active I2S audio
+profile for these pins.
 
 Reboot:
 
@@ -80,30 +75,34 @@ Open the web UI and select a station.
 ## Route I2S to the audio HAT
 
 In another terminal, route the live radio I2S capture to the I2S playback
-device:
+device with the native ALSA loopback tool:
 
 ```bash
 cd ~/Digital-Radio-for-Raspberry-Pi
-python3 tools/i2s_route.py --gain 0.5
+alsaloop \
+  -C hw:CARD=radioi2soutput,DEV=0 \
+  -P hw:CARD=radioi2soutput,DEV=1 \
+  -f S16_LE \
+  -r 48000 \
+  -c 2
 ```
 
-Use `--gain` as the I2S software volume. The SI4689 analog volume does not
-change the raw I2S level.
-
-If the output saturates, use a lower gain:
+The SI4689 analog volume does not change the raw I2S level. `alsaloop` is a
+native ALSA loopback and does not attenuate the PCM stream itself. If the output
+level is too high, use the mixer controls exposed by the playback audio HAT or
+your external amplifier:
 
 ```bash
-python3 tools/i2s_route.py --gain 0.1
+amixer scontrols
+amixer sset "Master" 10%
 ```
 
-If ALSA shows different device numbers, pass them explicitly:
+The mixer control name depends on the playback HAT. If there is no `Master`
+control, list the available controls with `amixer scontrols` and adjust the
+playback control provided by your card.
 
-```bash
-python3 tools/i2s_route.py \
-  --capture hw:CARD=radioi2soutput,DEV=0 \
-  --playback hw:CARD=radioi2soutput,DEV=1 \
-  --gain 0.5
-```
+If ALSA shows different device numbers, change `-C` to the capture device shown
+by `arecord -l`, and `-P` to the playback device shown by `aplay -l`.
 
 ## Stop the route
 
@@ -112,7 +111,7 @@ Press `Ctrl+C` in the route terminal.
 If the route was started in the background:
 
 ```bash
-pkill -f "tools/i2s_route.py"
+pkill -f "alsaloop .*radioi2soutput"
 ```
 
 ## Troubleshooting
