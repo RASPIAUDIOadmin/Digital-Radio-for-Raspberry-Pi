@@ -87,19 +87,39 @@ alsaloop \
   -c 2
 ```
 
-The SI4689 analog volume does not change the raw I2S level. `alsaloop` is a
-native ALSA loopback and does not attenuate the PCM stream itself. If the output
-level is too high, use the mixer controls exposed by the playback audio HAT or
-your external amplifier:
+The SI4689 analog volume does not change the raw I2S level. The direct
+`alsaloop` command above routes full-scale PCM.
+
+If the output level is too high and the playback HAT does not expose an ALSA
+mixer control, use an ALSA `route` PCM for native software attenuation. This
+example creates a 10% playback route:
 
 ```bash
-amixer scontrols
-amixer sset "Master" 10%
+cat > ~/radio-i2s-asound.conf <<'EOF'
+</usr/share/alsa/alsa.conf>
+
+pcm.radio_i2s_10pct {
+    type route
+    slave.pcm "hw:CARD=radioi2soutput,DEV=1"
+    slave.channels 2
+    ttable.0.0 0.1
+    ttable.1.1 0.1
+}
+EOF
+
+ALSA_CONFIG_PATH=~/radio-i2s-asound.conf alsaloop \
+  -C hw:CARD=radioi2soutput,DEV=0 \
+  -P radio_i2s_10pct \
+  -f S16_LE \
+  -r 48000 \
+  -c 2
 ```
 
-The mixer control name depends on the playback HAT. If there is no `Master`
-control, list the available controls with `amixer scontrols` and adjust the
-playback control provided by your card.
+Change `ttable.0.0` and `ttable.1.1` to another value if you need a different
+level, for example `0.5` for 50%.
+
+If your playback HAT exposes a hardware mixer control, you can use that instead
+with `amixer scontrols` and `amixer sset`.
 
 If ALSA shows different device numbers, change `-C` to the capture device shown
 by `arecord -l`, and `-P` to the playback device shown by `aplay -l`.
