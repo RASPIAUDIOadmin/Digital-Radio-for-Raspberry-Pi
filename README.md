@@ -215,6 +215,16 @@ If you want to keep the full raw capture without trimming the first seconds:
 sudo python3 radio.py serve --port 8686 --record-trim-seconds 0
 ```
 
+## Play through an Audio+ or MIC+ I2S output
+
+For stereo output through another Raspberry Pi I2S audio HAT such as Audio+ or
+MIC+, use the combined `raspiaudio-digital-radio-i2s-output` profile. Do not
+stack a separate radio capture overlay and a separate DAC overlay on the same
+I2S pins.
+
+See [README_AUDIO_PLUS_MIC_PLUS_I2S.md](README_AUDIO_PLUS_MIC_PLUS_I2S.md) for
+the full setup and the `tools/i2s_route.py --gain` software volume control.
+
 ## Stream URLs and Music Assistant integration
 
 The server can expose the shield as a live radio source for Music Assistant, VLC, a browser, or any player that can open an HTTP audio stream.

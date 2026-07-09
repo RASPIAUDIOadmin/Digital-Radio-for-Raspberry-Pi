@@ -8,6 +8,17 @@ The target overlay is `raspiaudio-digital-radio`. It enables:
 - Raspberry Pi I2S clock producer mode
 - an ALSA capture card named `si4689_i2s` for recording and local streaming
 
+The optional `raspiaudio-digital-radio-i2s-output-overlay.dts` profile is for
+Audio+ / MIC+ style builds. It creates one combined ALSA card named
+`radio_i2s_output` with:
+
+- SI4689 I2S capture from the radio shield
+- Raspberry Pi I2S playback to an external I2S DAC or speaker HAT
+
+Use that profile instead of stacking separate radio capture and DAC overlays.
+Two independent overlays that both target the Raspberry Pi sound card can hide
+one another.
+
 ## Recommended development path
 
 For immediate plug-and-play testing, use the legacy HAT v1 profile because it embeds the compiled `.dtbo` into the EEPROM image:

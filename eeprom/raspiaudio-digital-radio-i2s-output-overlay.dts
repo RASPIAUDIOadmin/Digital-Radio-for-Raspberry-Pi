@@ -1,0 +1,118 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	/*
+	 * SPI0 CE0 controls the SI4689 command interface.
+	 * This mirrors the Raspberry Pi spi0-1cs overlay for the pins used by
+	 * the Digital Radio Shield.
+	 */
+	fragment@0 {
+		target = <&spi0_cs_pins>;
+		__overlay__ {
+			brcm,pins = <8>;
+		};
+	};
+
+	fragment@1 {
+		target = <&spi0>;
+		__overlay__ {
+			cs-gpios = <&gpio 8 1>;
+			status = "okay";
+		};
+	};
+
+	/*
+	 * Combined I2S profile for:
+	 * - SI4689 radio audio into the Raspberry Pi on GPIO20
+	 * - Raspberry Pi audio out to an I2S DAC/speaker HAT on GPIO21
+	 *
+	 * The Raspberry Pi is the I2S clock producer. Do not load another
+	 * dtoverlay that also owns the Raspberry Pi sound card at the same time.
+	 */
+	fragment@2 {
+		target = <&i2s_clk_producer>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target-path = "/";
+		__overlay__ {
+			radio_i2s_playback_codec: radio-i2s-playback-codec {
+				#sound-dai-cells = <0>;
+				compatible = "linux,spdif-dit";
+				status = "okay";
+			};
+
+			si4689_i2s_capture_codec: si4689-i2s-capture-codec {
+				#sound-dai-cells = <0>;
+				compatible = "adi,adau7002";
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@4 {
+		target = <&sound>;
+		sound_overlay: __overlay__ {
+			compatible = "simple-audio-card";
+			simple-audio-card,name = "radio_i2s_output";
+			status = "okay";
+
+			simple-audio-card,dai-link@0 {
+				format = "i2s";
+				bitclock-master = <&radio_i2s_playback_cpu>;
+				frame-master = <&radio_i2s_playback_cpu>;
+
+				radio_i2s_playback_cpu: cpu {
+					sound-dai = <&i2s_clk_producer>;
+					dai-tdm-slot-num = <2>;
+					dai-tdm-slot-width = <32>;
+				};
+
+				codec {
+					sound-dai = <&radio_i2s_playback_codec>;
+				};
+			};
+
+			simple-audio-card,dai-link@1 {
+				format = "i2s";
+				bitclock-master = <&radio_i2s_capture_cpu>;
+				frame-master = <&radio_i2s_capture_cpu>;
+
+				radio_i2s_capture_cpu: cpu {
+					sound-dai = <&i2s_clk_producer>;
+					dai-tdm-slot-num = <2>;
+					dai-tdm-slot-width = <32>;
+				};
+
+				codec {
+					sound-dai = <&si4689_i2s_capture_codec>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * Non-kernel-controlled GPIOs are marked here for documentation and
+	 * default pin state. Userspace still drives reset/amplifier through GPIO.
+	 */
+	fragment@5 {
+		target = <&gpio>;
+		__overlay__ {
+			raspiaudio_radio_pins: raspiaudio_radio_pins {
+				brcm,pins = <5 6 13 17 23 25>;
+				brcm,function = <0 0 0 1 0 1>;
+				brcm,pull = <2 2 2 0 0 0>;
+			};
+		};
+	};
+
+	__overrides__ {
+		card-name = <&sound_overlay>,"simple-audio-card,name";
+	};
+};
