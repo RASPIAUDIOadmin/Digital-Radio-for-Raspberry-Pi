@@ -90,33 +90,43 @@ alsaloop \
 The SI4689 analog volume does not change the raw I2S level. The direct
 `alsaloop` command above routes full-scale PCM.
 
-If the output level is too high and the playback HAT does not expose an ALSA
-mixer control, use an ALSA `route` PCM for native software attenuation. This
-example creates a 10% playback route:
+For adjustable software volume, use an ALSA `softvol` playback device. This is
+cleaner than hard-coding a fixed gain because ALSA exposes a normal mixer
+control named `Radio`.
 
 ```bash
 cat > ~/radio-i2s-asound.conf <<'EOF'
 </usr/share/alsa/alsa.conf>
 
-pcm.radio_i2s_10pct {
-    type route
+pcm.radio_i2s_softvol {
+    type softvol
     slave.pcm "hw:CARD=radioi2soutput,DEV=1"
-    slave.channels 2
-    ttable.0.0 0.1
-    ttable.1.1 0.1
+    control {
+        name "Radio Playback Volume"
+        card "radioi2soutput"
+    }
+    min_dB -50.0
+    max_dB 0.0
+    resolution 101
 }
 EOF
 
-ALSA_CONFIG_PATH=~/radio-i2s-asound.conf alsaloop \
+sudo env ALSA_CONFIG_PATH="$HOME/radio-i2s-asound.conf" alsaloop \
   -C hw:CARD=radioi2soutput,DEV=0 \
-  -P radio_i2s_10pct \
+  -P radio_i2s_softvol \
   -f S16_LE \
   -r 48000 \
   -c 2
 ```
 
-Change `ttable.0.0` and `ttable.1.1` to another value if you need a different
-level, for example `0.5` for 50%.
+Run the loopback with `sudo` so the software mixer control can be updated
+reliably. Once `alsaloop` is running, change the playback volume from another
+terminal:
+
+```bash
+sudo amixer -c radioi2soutput sset Radio 10%
+sudo amixer -c radioi2soutput sget Radio
+```
 
 If your playback HAT exposes a hardware mixer control, you can use that instead
 with `amixer scontrols` and `amixer sset`.
