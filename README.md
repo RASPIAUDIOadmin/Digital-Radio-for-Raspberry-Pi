@@ -547,26 +547,34 @@ It is also a base to:
 
 ## Inputs / Outputs
 
-- Power input:
-  - `5V` on Raspberry Pi header pins `2` and `4`
-  - `GND` on pins `6, 9, 14, 20, 25, 30, 34, 39`
-- SPI radio interface:
-  - `MOSI` on `GPIO10` / pin `19`
-  - `MISO` on `GPIO9` / pin `21`
-  - `SPICLK` on `GPIO11` / pin `23`
-  - `SSBSI` on `GPIO8` / pin `24`
-- Radio control:
-  - `INT` on `GPIO23` / pin `16`
-  - `SI4689 RST` on `GPIO25` / pin `22`
-  - `ENABLE_AMPLI` on `GPIO17` / pin `11`
-- I2S digital audio:
-  - `I2S BCK` on `GPIO18` / pin `12`
-  - `I2S LRCK` on `GPIO19` / pin `35`
-  - `I2S DOUT` on `GPIO20` / pin `38`
-- Navigation button:
-  - `Switch CW` on `GPIO5` / pin `29`
-  - `Switch PUSH` on `GPIO6` / pin `31`
-  - `Switch CCW` on `GPIO13` / pin `33`
+### Raspberry Pi header pinout
+
+The default software controls the SI4689 radio chip over `SPI0`. The `SDA` and
+`SCL` pins are present on the Raspberry Pi header, but they are not used by the
+default SPI radio control path.
+
+| Function | Raspberry Pi signal | Header pin | Direction / notes |
+| --- | --- | --- | --- |
+| `5V` power | `5V` | `2`, `4` | Raspberry Pi to shield |
+| `GND` | `GND` | `6`, `9`, `14`, `20`, `25`, `30`, `34`, `39` | Ground |
+| SPI MOSI | `GPIO10` / `MOSI` | `19` | Raspberry Pi to SI4689 |
+| SPI MISO | `GPIO9` / `MISO` | `21` | SI4689 to Raspberry Pi |
+| SPI clock | `GPIO11` / `SCLK` | `23` | Raspberry Pi to SI4689 |
+| SPI chip select | `GPIO8` / `CE0` / `SSBSI` | `24` | Raspberry Pi to SI4689 |
+| Radio interrupt | `GPIO23` / `INT` | `16` | SI4689 to Raspberry Pi |
+| Radio reset | `GPIO25` / `RST` | `22` | Raspberry Pi to SI4689 |
+| Amplifier enable | `GPIO17` / `ENABLE_AMPLI` | `11` | Raspberry Pi to onboard amplifier |
+| I2S bit clock | `GPIO18` / `BCK` | `12` | Raspberry Pi to SI4689 in the default I2S master setup |
+| I2S frame clock | `GPIO19` / `LRCK` | `35` | Raspberry Pi to SI4689 in the default I2S master setup |
+| I2S audio data | `GPIO20` / `DOUT` | `38` | SI4689 digital audio to Raspberry Pi |
+| Navigation clockwise | `GPIO5` / `CW` | `29` | Onboard navigation switch |
+| Navigation push | `GPIO6` / `PUSH` | `31` | Onboard navigation switch |
+| Navigation counter-clockwise | `GPIO13` / `CCW` | `33` | Onboard navigation switch |
+| Optional I2C SDA | `GPIO2` / `SDA` | `3` | Routed on the header, not used for default SPI control |
+| Optional I2C SCL | `GPIO3` / `SCL` | `5` | Routed on the header, not used for default SPI control |
+| HAT EEPROM data | `GPIO0` / `ID_SD` / `EEDATA` | `27` | Reserved for HAT identification EEPROM |
+| HAT EEPROM clock | `GPIO1` / `ID_SC` / `EECLK` | `28` | Reserved for HAT identification EEPROM |
+
 - RF and audio connections on the shield:
   - `SMA` antenna connector
   - AM loop antenna input
