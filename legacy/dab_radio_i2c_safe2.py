@@ -70,6 +70,7 @@ CMD_READ_OFFSET = 0x10
 CMD_FM_TUNE_FREQ = 0x30
 CMD_FM_SEEK_START = 0x31
 CMD_FM_RSQ_STATUS = 0x32
+CMD_FM_RDS_STATUS = 0x34
 CMD_AM_TUNE_FREQ = 0x40
 CMD_AM_SEEK_START = 0x41
 CMD_AM_RSQ_STATUS = 0x42
@@ -102,6 +103,10 @@ PROP_FM_VALID_RSSI_THRESHOLD = 0x3202
 PROP_FM_VALID_SNR_THRESHOLD = 0x3204
 PROP_FM_VALID_SNR_TIME = 0x3205
 PROP_FM_VALID_HDLEVEL_THRESHOLD = 0x3206
+PROP_FM_RDS_INTERRUPT_SOURCE = 0x3C00
+PROP_FM_RDS_INTERRUPT_FIFO_COUNT = 0x3C01
+PROP_FM_RDS_CONFIG = 0x3C02
+PROP_FM_RDS_CONFIDENCE = 0x3C03
 PROP_FM_TUNE_FE_VARM = 0x1710
 PROP_FM_TUNE_FE_VARB = 0x1711
 PROP_FM_TUNE_FE_CFG = 0x1712
@@ -976,6 +981,12 @@ class Si468xDabRadio:
         self.set_property(PROP_FM_VALID_SNR_THRESHOLD, 6)
         self.set_property(PROP_FM_VALID_SNR_TIME, 127)
         self.set_property(PROP_FM_VALID_HDLEVEL_THRESHOLD, 20)
+        # Enable RDS/RBDS reception. Accept corrected 1-2 bit errors for Block B
+        # and Blocks C/D, while rejecting uncorrectable groups in software.
+        self.set_property(PROP_FM_RDS_INTERRUPT_SOURCE, 0x0001)
+        self.set_property(PROP_FM_RDS_INTERRUPT_FIFO_COUNT, 0x0001)
+        self.set_property(PROP_FM_RDS_CONFIG, 0x0051)
+        self.set_property(PROP_FM_RDS_CONFIDENCE, 0x1111)
 
     def configure_amhd_frontend(self) -> None:
         # Use the EU medium-wave band plan and the SDK-validity defaults.
@@ -1092,6 +1103,42 @@ class Si468xDabRadio:
             "mult": reply[11] if len(reply) > 11 else 0,
             "hdlevel": reply[15] if len(reply) > 15 else 0,
             "filtered_hdlevel": reply[16] if len(reply) > 16 else 0,
+        }
+
+    def fm_rds_status(
+        self,
+        status_only: bool = False,
+        clear_fifo: bool = False,
+        intack: bool = True,
+    ) -> Dict[str, object]:
+        flags = (
+            (0x04 if status_only else 0x00)
+            | (0x02 if clear_fifo else 0x00)
+            | (0x01 if intack else 0x00)
+        )
+        self._write_command([CMD_FM_RDS_STATUS, flags])
+        reply = self._read_reply(20)
+        ble_byte = reply[11]
+        return {
+            "rds_interrupt": bool(reply[0] & 0x04),
+            "tp_pty_valid": bool(reply[5] & 0x10),
+            "pi_valid": bool(reply[5] & 0x08),
+            "rds_sync": bool(reply[5] & 0x02),
+            "fifo_lost": bool(reply[5] & 0x01),
+            "traffic_program": bool(reply[6] & 0x20),
+            "program_type_code": reply[6] & 0x1F,
+            "program_identification": int.from_bytes(reply[8:10], "little"),
+            "fifo_used": reply[10],
+            "ble": (
+                (ble_byte >> 6) & 0x03,
+                (ble_byte >> 4) & 0x03,
+                (ble_byte >> 2) & 0x03,
+                ble_byte & 0x03,
+            ),
+            "block_a": int.from_bytes(reply[12:14], "little"),
+            "block_b": int.from_bytes(reply[14:16], "little"),
+            "block_c": int.from_bytes(reply[16:18], "little"),
+            "block_d": int.from_bytes(reply[18:20], "little"),
         }
 
     def am_tune(

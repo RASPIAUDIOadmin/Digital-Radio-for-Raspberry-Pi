@@ -26,6 +26,7 @@ from legacy.dab_radio_i2c_safe2 import (
     load_scan_file,
     normalize_broadcast_text,
 )
+from raspiaudio_radio.rds import RdsDecoder
 
 try:
     import RPi.GPIO as GPIO  # type: ignore
@@ -1086,6 +1087,9 @@ class RadioBackend:
         self._resume_timer: Optional[threading.Timer] = None
         self._resume_attempts = 0
         self._dab_media: Dict[str, Any] = _empty_dab_media()
+        self._rds_decoder = RdsDecoder()
+        self._rds_poll_stop = threading.Event()
+        self._rds_poll_thread: Optional[threading.Thread] = None
         self._dab_artwork_bytes: Optional[bytes] = None
         self._dab_artwork_content_type: Optional[str] = None
         self._dab_artwork_name: Optional[str] = None
@@ -1139,6 +1143,8 @@ class RadioBackend:
         atexit.register(self.close)
         with self._lock:
             self._schedule_runtime_resume_locked(delay_s=2.0)
+        self._rds_poll_thread = threading.Thread(target=self._rds_poll_loop, name="fm-rds-poll", daemon=True)
+        self._rds_poll_thread.start()
 
     def boot(self, mode: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
         with self._lock:
@@ -1188,9 +1194,11 @@ class RadioBackend:
     def get_live_stream_metadata(self) -> Dict[str, Any]:
         with self._lock:
             self._poll_current_media_locked()
+            media = self._dab_media_payload_locked()
             return {
                 "station": self._decorate_station_locked(self._current_station) if self._current_station else None,
-                "dab_media": self._dab_media_payload_locked(),
+                "radio_media": media,
+                "dab_media": media,
             }
 
     def scan(self, force: bool = True) -> Dict[str, Any]:
@@ -1448,6 +1456,8 @@ class RadioBackend:
     def close(self) -> None:
         button_nav = self._button_nav
         oled = self._oled
+        rds_poll_thread = self._rds_poll_thread
+        self._rds_poll_stop.set()
         with self._lock:
             self._closing = True
             self._cancel_nav_push_timer_locked()
@@ -1458,6 +1468,9 @@ class RadioBackend:
             self._shutdown_locked(close_amp=True)
         button_nav.close()
         oled.close()
+        if rds_poll_thread is not None and rds_poll_thread.is_alive():
+            rds_poll_thread.join(timeout=1.0)
+        self._rds_poll_thread = None
 
     @staticmethod
     def _empty_scan_progress() -> Dict[str, Any]:
@@ -2078,6 +2091,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         service_status = self._refresh_system_service_status_locked()
         spi_setup = self._spi_setup_status_locked()
         i2s_setup = self._i2s_capture_setup_status_locked()
+        media = self._dab_media_payload_locked()
         return {
             "booted": self._booted,
             "transport": "spi",
@@ -2112,7 +2126,8 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
             },
             "system_service": service_status,
             "current_station": self._decorate_station_locked(self._current_station) if self._current_station else None,
-            "dab_media": self._dab_media_payload_locked(),
+            "radio_media": media,
+            "dab_media": media,
             "signal": dict(self._last_signal or {}),
             "station_count": len(self._stations[scan_key]),
             "favorite_count": len(self._favorites),
@@ -2217,8 +2232,108 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
         if self._current_station.get("mode") == "dab":
             self._poll_dab_media_locked()
             return
+        if self._current_station.get("band") == "fm" and not self._current_station.get("hd_available"):
+            self._poll_fm_rds_locked()
+            return
         if self._current_station.get("hd_available"):
             self._poll_hd_media_locked()
+
+    def _rds_poll_loop(self) -> None:
+        while not self._rds_poll_stop.wait(0.4):
+            with self._lock:
+                if self._closing:
+                    return
+                station = self._current_station
+                if (
+                    self._booted
+                    and station is not None
+                    and station.get("band") == "fm"
+                    and not station.get("hd_available")
+                ):
+                    self._poll_fm_rds_locked(max_groups=16)
+
+    def _poll_fm_rds_locked(self, max_groups: int = 12) -> None:
+        station = self._current_station
+        if station is None or station.get("band") != "fm" or station.get("hd_available"):
+            return
+        radio = self._require_radio_locked()
+        try:
+            status = radio.fm_rds_status(status_only=True, intack=True)
+        except Exception:
+            return
+
+        fifo_lost = bool(status.get("fifo_lost"))
+        if fifo_lost:
+            self._rds_decoder.reset()
+        fifo_used = min(max_groups, max(0, int(status.get("fifo_used") or 0)))
+        for _ in range(fifo_used):
+            try:
+                group = radio.fm_rds_status(status_only=False, intack=True)
+            except Exception:
+                break
+            fifo_lost = fifo_lost or bool(group.get("fifo_lost"))
+            self._rds_decoder.consume(group)
+
+        decoded = self._rds_decoder.snapshot()
+        old = dict(self._dab_media)
+        media = dict(self._dab_media if self._dab_media.get("source") == "rds" else _empty_dab_media())
+        station_name = decoded.get("station_name")
+        text = str(decoded.get("text") or "")
+        inferred_artist, inferred_title = _infer_artist_title(text)
+        artist = decoded.get("artist") or inferred_artist
+        title = decoded.get("title") or inferred_title
+        media.update(
+            {
+                "source": "rds",
+                "text": text,
+                "title": title,
+                "artist": artist,
+                "album": decoded.get("album"),
+                "genre": decoded.get("genre"),
+                "station_name": station_name,
+                "program": decoded.get("program_type"),
+                "programs": [],
+                "encoding": "RDS/RBDS",
+                "toggle": decoded.get("text_ab"),
+                "program_identification": decoded.get("program_identification"),
+                "program_identification_hex": decoded.get("program_identification_hex"),
+                "program_type_code": decoded.get("program_type_code"),
+                "program_type": decoded.get("program_type"),
+                "traffic_program": decoded.get("traffic_program"),
+                "traffic_announcement": decoded.get("traffic_announcement"),
+                "rds_sync": bool(status.get("rds_sync")),
+                "fifo_lost": fifo_lost,
+                "groups_decoded": decoded.get("groups_decoded"),
+                "group_type_counts": decoded.get("group_type_counts"),
+                "rt_plus": decoded.get("rt_plus"),
+                "rt_plus_group_type": decoded.get("rt_plus_group_type"),
+                "rt_plus_item_toggle": decoded.get("rt_plus_item_toggle"),
+                "rt_plus_item_running": decoded.get("rt_plus_item_running"),
+                "artwork_url": None,
+                "artwork_supported": False,
+            }
+        )
+        changed_keys = (
+            "text",
+            "title",
+            "artist",
+            "album",
+            "genre",
+            "station_name",
+            "program_identification",
+            "program_type_code",
+            "traffic_announcement",
+            "rds_sync",
+        )
+        if any(media.get(key) != old.get(key) for key in changed_keys):
+            media["updated_at"] = time.time()
+        self._dab_media = media
+        if station_name:
+            self._apply_rds_station_name_locked(str(station_name))
+        for key in ("station_name", "text", "program_identification_hex", "program_type"):
+            value = media.get(key)
+            if value and value != old.get(key):
+                print(f"RDS update: {key}={value}", flush=True)
 
     def _poll_hd_media_locked(self, max_packets: int = 4) -> None:
         station = self._current_station
@@ -2344,6 +2459,29 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
                 candidate["label"] = label
                 break
 
+    def _apply_rds_station_name_locked(self, station_name: str) -> None:
+        station = self._current_station
+        if station is None or station.get("band") != "fm" or station.get("hd_available"):
+            return
+        name = normalize_broadcast_text(station_name)
+        if not name:
+            return
+        station["station_name"] = name
+        station["label"] = name
+        station_id = str(station.get("station_id") or "")
+        scan_key = self._scan_key()
+        station_cache = self._stations.get(scan_key, [])
+        cache_changed = False
+        for candidate in station_cache:
+            if candidate.get("station_id") == station_id:
+                if candidate.get("station_name") != name or candidate.get("label") != name:
+                    candidate["station_name"] = name
+                    candidate["label"] = name
+                    cache_changed = True
+                break
+        if cache_changed:
+            self._save_scan_file_locked(scan_key, station_cache)
+
     def _log_hd_media_update_locked(self, old: Dict[str, Any], media: Dict[str, Any]) -> None:
         for key in ("title", "artist", "album", "genre", "station_name"):
             value = media.get(key)
@@ -2446,6 +2584,7 @@ print(json.dumps({"changed": changed, "missing_added": missing, "backup": backup
 
     def _reset_dab_media_locked(self, clear_artwork: bool) -> None:
         self._dab_media = _empty_dab_media()
+        self._rds_decoder.reset()
         if clear_artwork:
             self._dab_artwork_bytes = None
             self._dab_artwork_content_type = None

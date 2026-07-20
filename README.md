@@ -104,6 +104,7 @@ You should see `/dev/spidev0.0` and `/dev/spidev0.1`.
 
 - DAB / DAB+
 - FM
+- FM RDS/RBDS station name, RadioText, RadioText Plus artist/title, PI, PTY, TP and TA decoding
 - HD Radio
 - AM
 - AM HD
@@ -241,6 +242,14 @@ The Web UI has two listening modes at the top of the page:
 Browser Output uses `/audio/live.wav`, a direct PCM WAV stream captured from the SI4689 I2S output through the Raspberry Pi ALSA capture device. It avoids MP3 compression, so it is the recommended mode for best quality on a local network.
 
 The blue volume slider is shared by both outputs. It controls the SI4689 analog volume and the browser player volume, so there is only one volume control in the Web UI.
+
+On analog FM stations, the backend enables the SI4689 RDS/RBDS decoder and
+continuously drains the hardware FIFO to assemble the Program Service name,
+RadioText and RadioText Plus artist/title tags. Learned Program Service names
+are saved in the FM station cache, so they survive a firmware or mode change.
+The decoded PI, PTY, TP, TA, RT+ and group diagnostic fields are available in
+`radio_media` from `/api/status`. The legacy `dab_media` key remains as a
+compatibility alias.
 
 Browser Output requires the I2S capture overlay described in [I2S recording on Raspberry Pi](#i2s-recording-on-raspberry-pi). If the Web UI does not detect the `si4689_i2s` capture device, it shows an installation prompt. After confirmation, the server can add the required lines to `/boot/firmware/config.txt`, enable the system service at boot, and ask you to reboot.
 

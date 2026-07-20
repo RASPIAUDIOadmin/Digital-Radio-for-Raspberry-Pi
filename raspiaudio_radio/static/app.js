@@ -306,23 +306,24 @@ function formatTimestamp(value) {
 }
 
 function updateDabMedia(status) {
-  const media = status.dab_media || {};
+  const media = status.radio_media || status.dab_media || {};
   const current = status.current_station || {};
   const source = media.source || (status.mode === "dab" ? "dab" : current.hd_available ? "hd" : "none");
   const isDab = source === "dab";
   const isHd = source === "hd";
-  const isActive = isDab || isHd;
-  const sourceLabel = isHd ? "HD Radio" : isDab ? "DAB" : "Radio";
+  const isRds = source === "rds";
+  const isActive = isDab || isHd || isRds;
+  const sourceLabel = isHd ? "HD Radio" : isDab ? "DAB" : isRds ? "FM RDS" : "Radio";
   const hasText = Boolean(media.text || media.artist || media.title || media.station_name);
   const hasArtwork = Boolean(media.artwork_url);
   const mediaTimestamp = media.artwork_updated_at || media.updated_at;
 
   document.getElementById("mediaArtist").textContent =
-    media.artist || media.station_name || (isActive ? "No artist yet" : "Metadata inactive");
+    media.artist || (!isRds && media.station_name) || (isRds ? "No artist in RDS data" : isActive ? "No artist yet" : "Metadata inactive");
   document.getElementById("mediaTitle").textContent = media.title || (isActive ? "No title yet" : "Metadata inactive");
   document.getElementById("mediaText").textContent = isActive
     ? media.text || media.station_name || `No ${sourceLabel} text received yet.`
-    : "Tune a DAB or HD Radio station to read metadata.";
+    : "Tune a DAB, FM RDS or HD Radio station to read metadata.";
   document.getElementById("mediaUpdated").textContent = mediaTimestamp
     ? `Updated: ${formatTimestamp(mediaTimestamp)}`
     : (isActive ? "No metadata received yet." : "Radio metadata is inactive.");
@@ -331,8 +332,10 @@ function updateDabMedia(status) {
       ? `${sourceLabel} artwork received from the current station.`
       : isHd
         ? "Waiting for HD Radio image data if this station broadcasts it."
-        : "Waiting for slideshow image from the current DAB station."
-    : "Artwork and text are available on DAB and HD Radio when broadcast.";
+        : isRds
+          ? "FM RDS carries text metadata but no artwork."
+          : "Waiting for slideshow image from the current DAB station."
+    : "Text metadata is available on FM RDS, DAB and HD Radio when broadcast.";
 
   const statusPill = document.getElementById("mediaStatus");
   statusPill.textContent = !isActive
@@ -355,7 +358,7 @@ function updateDabMedia(status) {
     artwork.hidden = true;
     artwork.removeAttribute("src");
     fallback.hidden = false;
-    fallback.textContent = (media.program || (isHd ? "HD" : current.label || "DAB")).slice(0, 4).toUpperCase();
+    fallback.textContent = (media.program || (isRds ? "RDS" : isHd ? "HD" : current.label || "DAB")).slice(0, 4).toUpperCase();
   }
 }
 
