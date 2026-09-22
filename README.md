@@ -42,6 +42,11 @@ The ESP32-S3 project also includes a [lite local web interface](esp32/zerocore_s
 for control from a phone or computer. It can join a saved Wi-Fi network and
 falls back to its own hotspot if the connection fails.
 
+For a ZeroCore S3 with this shield, the [CoreZero Digital Radio web installer](https://apps.raspiaudio.com/#device=ZeroCoreS3&application=DigitalRadio)
+publishes a factory firmware image. Installing it replaces the existing ESP32
+firmware and settings; the [source and manual flash instructions](esp32/zerocore_s3_digital_radio/README.md)
+remain available here.
+
 ## Software release v1.5.3
 
 This release improves HD Radio subchannel discovery after field feedback from US testing.

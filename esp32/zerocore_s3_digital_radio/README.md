@@ -26,6 +26,11 @@ the device's own hotspot.
 This is a focused radio bring-up application. The Raspberry Pi Python backend
 and web UI in the root of this repository are separate software.
 
+The [CoreZero Digital Radio browser installer](https://apps.raspiaudio.com/#device=ZeroCoreS3&application=DigitalRadio)
+offers a factory image for the ZeroCore S3. It replaces existing ESP32 firmware
+and settings. Use the manual flash steps below when preserving another
+application in `app0` matters.
+
 ## Wiring the 40-pin shield header
 
 Header numbers below are **physical positions on the shield's Raspberry Pi
