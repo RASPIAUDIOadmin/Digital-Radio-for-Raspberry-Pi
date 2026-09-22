@@ -9,6 +9,8 @@ the USB serial port at 115200 baud; an optional
 [local web version](WEB.md) adds a page for a phone or computer over Wi-Fi or
 the device's own hotspot.
 
+![ZeroCore S3 local web interface showing DAB+ playback, tuning, reception metrics and Wi-Fi status](images/local-web-interface.png)
+
 ## Current status
 
 - **FM works on the assembled hardware.** The SI4689 firmware loads, the FM

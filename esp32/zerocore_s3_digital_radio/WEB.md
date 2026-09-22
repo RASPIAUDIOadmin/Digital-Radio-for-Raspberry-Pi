@@ -7,6 +7,8 @@ UI remain the full-featured application; this ESP32-S3 page needs no Internet
 connection or external assets. It can use a local Wi-Fi network or its own
 hotspot.
 
+![Local Digital Radio web interface in DAB+ mode on a ZeroCore S3](images/local-web-interface.png)
+
 ## Connect
 
 1. Build with `pio run -e zerocore_s3_web` and flash the resulting firmware.
