@@ -4,15 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "firmware_images.h"
+#include "radio_pins.h"
 
-// CoreZero S3 H8 header mapping, checked against the local native PCB snapshot.
-// The radio shield uses physical header pins 11, 19, 21, 22, 23 and 24.
-constexpr uint8_t PIN_AMP = 1;    // H8.11 / ENABLE_AMPLI, active high
-constexpr uint8_t PIN_MOSI = 11;  // H8.19
-constexpr uint8_t PIN_MISO = 13;  // H8.21
-constexpr uint8_t PIN_RESET = 39; // H8.22 / RSTB, active low
-constexpr uint8_t PIN_SCK = 12;   // H8.23
-constexpr uint8_t PIN_CS = 10;    // H8.24
+constexpr uint8_t PIN_AMP = RADIO_PIN_AMP;
+constexpr uint8_t PIN_MOSI = RADIO_PIN_MOSI;
+constexpr uint8_t PIN_MISO = RADIO_PIN_MISO;
+constexpr uint8_t PIN_RESET = RADIO_PIN_RESET;
+constexpr uint8_t PIN_SCK = RADIO_PIN_SCK;
+constexpr uint8_t PIN_CS = RADIO_PIN_CS;
 
 constexpr uint32_t XTAL_HZ = 19200000;
 constexpr uint8_t CMD_POWER_UP = 0x01;
@@ -253,7 +252,23 @@ bool printDabStatus() {
 }
 
 void printHelp() {
-  Serial.println("Commands: f <MHz>, scan, s, mode fm|dab, d <channel>, v <0-63>, amp on|off, help");
+  Serial.println("Commands (115200 baud, newline terminated):");
+  Serial.println("  set mode fm|dab       Load FM or DAB firmware");
+  Serial.println("  set fm <MHz>          Tune FM, e.g. set fm 101.10");
+  Serial.println("  set dab <channel>     Tune DAB Band III, e.g. set dab 8C");
+  Serial.println("  set volume <0..63>    Set analog volume");
+  Serial.println("  set amp on|off        Control speaker amplifier");
+  Serial.println("  status | scan | pins | help");
+  Serial.println("  Legacy aliases: mode, f, d, v, amp, s");
+}
+
+void printPins() {
+  Serial.printf("Shield 40-pin header: 19 MOSI <- GPIO%u, 21 MISO -> GPIO%u, "
+      "23 SCK <- GPIO%u, 24 CS <- GPIO%u\n", PIN_MOSI, PIN_MISO, PIN_SCK, PIN_CS);
+  Serial.printf("Shield 40-pin header: 22 RESET <- GPIO%u, 11 AMP <- GPIO%u\n",
+      PIN_RESET, PIN_AMP);
+  Serial.println("Also connect shield pin 2 or 4 to 5V and a shield GND pin to ESP32 GND.");
+  Serial.println("Pin 16 INT is unused; analog audio comes from the shield jack/amplifier.");
 }
 
 void handleCommand(String line) {
@@ -262,38 +277,57 @@ void handleCommand(String line) {
   String lower = line;
   lower.toLowerCase();
   if (lower == "help" || lower == "?") { printHelp(); return; }
+  if (lower == "pins") { printPins(); return; }
+  if (lower.startsWith("set ")) {
+    lower.remove(0, 4);
+    lower.trim();
+  }
+  if (lower.startsWith("f ")) lower = "fm " + lower.substring(2);
+  if (lower.startsWith("d ")) lower = "dab " + lower.substring(2);
+  if (lower.startsWith("v ")) lower = "volume " + lower.substring(2);
   if (lower == "mode fm" || lower == "mode dab") {
     Serial.println(bootRadio(lower.endsWith("fm") ? Mode::FM : Mode::DAB) ? "Mode ready" : "Mode boot failed");
     return;
   }
   if (lower.startsWith("amp ")) {
-    ampEnabled = lower.endsWith("on");
+    const String value = lower.substring(4);
+    if (value != "on" && value != "off") { Serial.println("Use set amp on|off"); return; }
+    ampEnabled = value == "on";
     digitalWrite(PIN_AMP, ampEnabled ? HIGH : LOW);
     Serial.printf("Amplifier %s\n", ampEnabled ? "on" : "off");
     return;
   }
-  if (lower.startsWith("v ")) {
-    const int requested = lower.substring(2).toInt();
-    if (requested < 0 || requested > 63) { Serial.println("Volume must be 0..63"); return; }
-    volume = requested;
+  if (lower.startsWith("volume ")) {
+    const String value = lower.substring(7);
+    char *end = nullptr;
+    const long requested = strtol(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0' || requested < 0 || requested > 63) {
+      Serial.println("Volume must be an integer from 0 to 63"); return;
+    }
+    volume = static_cast<uint8_t>(requested);
     Serial.println(radioReady && setProperty(PROP_AUDIO_ANALOG_VOLUME, volume) ? "Volume set" : "Volume failed");
     return;
   }
   if (!radioReady) { Serial.println("Radio not ready"); return; }
-  if (lower == "s") {
+  if (lower == "s" || lower == "status" || lower == "get status") {
     Serial.println((currentMode == Mode::FM ? printFmStatus() : printDabStatus()) ? "Status OK" : "Status failed");
     return;
   }
-  if (lower.startsWith("f ")) {
-    const float mhz = lower.substring(2).toFloat();
+  if (lower.startsWith("fm ")) {
+    const String value = lower.substring(3);
+    char *end = nullptr;
+    const float mhz = strtof(value.c_str(), &end);
+    if (end == value.c_str() || *end != '\0' || !isfinite(mhz) || mhz < 87.5f || mhz > 108.0f) {
+      Serial.println("FM frequency must be 87.5..108.0 MHz"); return;
+    }
     const uint16_t freq10kHz = static_cast<uint16_t>(lroundf(mhz * 100));
     if (!tuneFm(freq10kHz)) { Serial.println("FM tune failed"); return; }
     delay(500);
     printFmStatus();
     return;
   }
-  if (lower.startsWith("d ")) {
-    String channel = line.substring(2);
+  if (lower.startsWith("dab ")) {
+    String channel = lower.substring(4);
     channel.trim(); channel.toUpperCase();
     for (size_t i = 0; i < DAB_CHANNEL_COUNT; ++i) {
       if (channel == DAB_CHANNELS[i].name) {

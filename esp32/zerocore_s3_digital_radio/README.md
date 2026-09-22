@@ -1,8 +1,9 @@
-# ZeroCore S3 digital radio prototype
+# ESP32-S3 digital radio prototype
 
 This PlatformIO application controls the RASPIAUDIO Digital Radio shield's
-SI4689 from a ZeroCore S3 through the 40-pin header. It ports the radio boot
-and tune sequence from the [earlier ESP32 prototype](https://github.com/RASPIAUDIOadmin/RM_Digital_Radio)
+SI4689 from a ZeroCore S3 through the 40-pin header, or from a wired ESP32-S3
+development board. It ports the radio boot and tune sequence from the
+[earlier ESP32 prototype](https://github.com/RASPIAUDIOadmin/RM_Digital_Radio)
 and drives the shield's analog jack and speaker amplifier. Control is through
 the USB serial port at 115200 baud.
 
@@ -12,6 +13,8 @@ the USB serial port at 115200 baud.
   scan finds stations, and tuning 101.10 MHz reported `valid=1`, RSSI 46 and
   SNR 16 dB on the test board. Audio through the shield was confirmed by
   listening.
+- The generic ESP32-S3 build compiles, but its wiring and serial controls have
+  not been tested on a separate development board.
 - The DAB firmware loads and the tuner responds to Band III tune commands.
   No multiplex locked in the test location. DAB service listing and playback
   are not yet exposed by this serial application.
@@ -20,24 +23,61 @@ the USB serial port at 115200 baud.
 This is a focused radio bring-up application. The Raspberry Pi Python backend
 and web UI in the root of this repository are separate software.
 
-## Hardware connections
+## Wiring the 40-pin shield header
 
-The numbers in the first column are physical 40-pin header positions. These
-ESP32 GPIO assignments come from the [ZeroCore S3 pinout](https://github.com/RASPIAUDIO/ZeroCore-S3/blob/main/docs/pinout.md);
-the shield signals come from this repository's [header pinout](../../README.md#raspberry-pi-header-pinout).
+Header numbers below are **physical positions on the shield's Raspberry Pi
+connector**, counted from its pin 1 marker. GPIO numbers are **ESP32-S3 GPIO
+numbers**, not Raspberry Pi BCM numbers. The default GPIO assignments follow
+the [ZeroCore S3 pinout](https://github.com/RASPIAUDIO/ZeroCore-S3/blob/main/docs/pinout.md).
+The shield signals are listed in this repository's
+[complete header pinout](../../README.md#raspberry-pi-header-pinout).
 
-| Header pin | Shield function | ZeroCore S3 GPIO |
-| ---: | --- | ---: |
-| 11 | Amplifier enable | 1 |
-| 19 | SPI MOSI | 11 |
-| 21 | SPI MISO | 13 |
-| 22 | SI4689 reset | 39 |
-| 23 | SPI clock | 12 |
-| 24 | SPI CS0 | 10 |
-| 16 | Radio interrupt, unused by this app | 41 |
+| Shield physical pin | Shield signal | Default ESP32-S3 GPIO | Build flag | Direction |
+| ---: | --- | ---: | --- | --- |
+| 19 | SPI MOSI | 11 | `RADIO_PIN_MOSI` | ESP32-S3 to shield |
+| 21 | SPI MISO | 13 | `RADIO_PIN_MISO` | Shield to ESP32-S3 |
+| 23 | SPI clock | 12 | `RADIO_PIN_SCK` | ESP32-S3 to shield |
+| 24 | SPI CS0 / `SSBSI` | 10 | `RADIO_PIN_CS` | ESP32-S3 to shield, active low |
+| 22 | SI4689 reset / `RST` | 39 | `RADIO_PIN_RESET` | ESP32-S3 to shield, active low |
+| 11 | Amplifier enable / `ENABLE_AMPLI` | 1 | `RADIO_PIN_AMP` | ESP32-S3 to shield, active high |
+| 2 **or** 4 | 5 V supply | 5 V supply, **not a GPIO** | — | Supply to shield |
+| 6, 9, 14, 20, 25, 30, 34 **or** 39 | Ground | ESP32-S3 GND | — | Common ground |
+
+The six signal wires, one 5 V connection and one common ground are the minimum
+for this application. Use a suitable 5 V supply for the shield and amplifier.
+Keep all GPIO at **3.3 V logic**; never connect the shield's 5 V header pin to
+an ESP32-S3 GPIO. When powering a generic board and shield separately, connect
+their grounds and check the power path before connecting two 5 V sources.
+
+Shield pin **16** carries the SI4689 interrupt (GPIO41 on ZeroCore S3), but
+this application polls the radio, so no interrupt wire is needed. Pins 12, 35
+and 38 carry I2S audio, and pins 29, 31 and 33 carry navigation controls; this
+application does not use them. Audio comes from the shield's analog jack or
+speaker amplifier, so no I2S wiring is needed for playback.
 
 The application enables analog audio on the SI4689. Its amplifier GPIO is
-active high and starts off. USB-C provides power and the serial connection.
+active high and starts off. On ZeroCore S3, USB-C provides power and the serial
+connection. For a generic board, check that its power path can supply the
+shield before using its USB connection as the sole power source.
+
+### Changing GPIOs for a generic ESP32-S3
+
+The defaults are in [`src/radio_pins.h`](src/radio_pins.h). They can be
+overridden in `platformio.ini` without changing the source. For example, if
+you wire the shield's amplifier enable (physical pin 11) to GPIO4 instead of
+GPIO1, add these lines under `[env:generic_s3]`:
+
+```ini
+build_flags =
+    ${env:zerocore_s3.build_flags}
+    -DRADIO_PIN_AMP=4
+```
+
+The other five signals retain the defaults from the table. To move any of
+them, add its build flag with the actual GPIO number. Choose GPIOs exposed and
+free on your specific ESP32-S3 board; avoid pins reserved for onboard
+flash/PSRAM, USB or boot strapping. The `pins` serial command prints the
+mapping compiled into the firmware; it cannot discover the physical wiring.
 
 ## Build
 
@@ -49,7 +89,13 @@ pio run -e zerocore_s3
 
 `embed_firmware.py` generates `src/firmware_images.cpp` from the four SI4689
 images in `data/` before compilation. That generated file and `.pio/` are
-ignored by Git. The target is an ESP32-S3 with 16 MB flash and 8 MB PSRAM.
+ignored by Git. `zerocore_s3` targets the tested ZeroCore S3 partition layout
+with 16 MB flash. For an 8 MB generic ESP32-S3 development board, use
+`pio run -e generic_s3`; this environment uses PlatformIO's `default_8MB.csv`
+partition table and does not require PSRAM. Adjust its flash size, partitions
+and upload settings to match your actual board. On a generic board, PlatformIO
+can flash the complete firmware with `pio run -e generic_s3 -t upload`; this
+overwrites the board's current application and partition table.
 
 ## Flash while preserving the existing application
 
@@ -72,16 +118,33 @@ To select the preserved application again, use the same ESP-IDF tool with
 
 ## Serial commands
 
+Send one command per line at **115200 baud**. `set` is the primary command
+for changing a setting. FM is loaded at power-up; select a mode before tuning
+in the other mode.
+
 | Command | Action |
 | --- | --- |
 | `help` | List commands |
-| `f 101.1` | Tune FM to 101.10 MHz |
+| `pins` | Print the GPIO numbers compiled into this firmware and shield header destinations |
+| `set mode fm` / `set mode dab` | Load FM or DAB firmware; resets the amplifier to off |
+| `set fm 101.10` | Tune FM to 101.10 MHz (87.5–108.0 MHz) |
+| `set dab 8C` | Tune a DAB Band III multiplex; does not select an audio service |
+| `set volume 40` | Set SI4689 analog volume (integer 0–63) |
+| `set amp on` / `set amp off` | Enable or disable the shield's speaker amplifier |
+| `status` | Show current FM or DAB tuner status |
 | `scan` | Scan FM from 87.5 to 108 MHz |
-| `s` | Show current FM or DAB tuner status |
-| `amp on`, `amp off` | Control the shield amplifier |
-| `v 40` | Set SI4689 analog volume, range 0–63 |
-| `mode dab`, `mode fm` | Load the selected SI4689 firmware |
-| `d 8C` | Tune a DAB Band III multiplex |
+| `mode fm`, `mode dab`, `f 101.10`, `d 8C`, `v 40`, `amp on`, `amp off`, `s` | Earlier short forms, still supported |
 
-FM is loaded at power-up. For speaker playback, tune a valid FM station and
-send `amp on`. The jack uses the SI4689 analog output.
+Example FM speaker session:
+
+```text
+pins
+set fm 101.10
+status
+set volume 40
+set amp on
+```
+
+Tune a valid local FM station; `101.10` was only the frequency used on the
+test board. The jack uses the SI4689 analog output and does not need the
+amplifier GPIO.

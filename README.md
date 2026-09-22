@@ -32,9 +32,9 @@ The whole project is open source:
 
 ## ZeroCore S3 / ESP32 prototype
 
-The [ZeroCore S3 serial application](esp32/zerocore_s3_digital_radio/README.md)
-controls this shield through the 40-pin header. FM tuning and analog audio were
-validated on an assembled ESP32-S3 + shield. The DAB firmware loads, but DAB
+The [ZeroCore S3 / generic ESP32-S3 serial application](esp32/zerocore_s3_digital_radio/README.md)
+documents its `set` commands and the GPIO-to-40-pin wiring for this shield.
+FM tuning and analog audio were validated on an assembled ESP32-S3 + shield. The DAB firmware loads, but DAB
 reception and service playback remain unverified in this prototype.
 
 ## Software release v1.5.3
