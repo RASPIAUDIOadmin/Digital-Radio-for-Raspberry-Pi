@@ -5,7 +5,9 @@ SI4689 from a ZeroCore S3 through the 40-pin header, or from a wired ESP32-S3
 development board. It ports the radio boot and tune sequence from the
 [earlier ESP32 prototype](https://github.com/RASPIAUDIOadmin/RM_Digital_Radio)
 and drives the shield's analog jack and speaker amplifier. Control is through
-the USB serial port at 115200 baud.
+the USB serial port at 115200 baud; an optional
+[local web version](WEB.md) adds a page for a phone or computer over Wi-Fi or
+the device's own hotspot.
 
 ## Current status
 
@@ -88,6 +90,11 @@ Install [PlatformIO](https://platformio.org/) and run from this directory:
 pio run -e zerocore_s3
 ```
 
+Use `pio run -e zerocore_s3_web` for the hotspot web version, or
+`pio run -e generic_s3_web` for the generic 8 MB ESP32-S3 starting point.
+See [web controls](WEB.md) for connection instructions and features. All web
+builds retain the USB serial commands below.
+
 `embed_firmware.py` generates `src/firmware_images.cpp` from the four SI4689
 images in `data/` before compilation. That generated file and `.pio/` are
 ignored by Git. `zerocore_s3` targets the tested ZeroCore S3 partition layout
@@ -100,19 +107,28 @@ overwrites the board's current application and partition table.
 
 ## Flash while preserving the existing application
 
-The tested board had this partition table: `app0` at `0x10000` and `app1` at
-`0x7D0000`, each `0x7C0000` bytes. Verify the board's partition table before
-using these addresses. The existing application was preserved in `app0` and
-this radio application was written to `app1`:
+The tested board originally had `app0` at `0x10000` and `app1` at `0x7D0000`,
+each `0x7C0000` bytes. The last 64 KB of `app0` were verified empty, then
+reserved as `radio_cfg` at `0x7C0000`, reducing `app0` to `0x7B0000` bytes
+without moving either application. Verify the board's partition table and
+that this region is empty before using these addresses on another board. The
+existing application remains in `app0`; flash the revised
+partition table once, then the radio application in `app1`:
 
 ```sh
-esptool --port COM8 --baud 921600 write_flash 0x7D0000 .pio/build/zerocore_s3/firmware.bin
+esptool --port COM8 --baud 921600 write_flash 0x8000 .pio/build/zerocore_s3_web/partitions.bin
+esptool --port COM8 --baud 921600 write_flash 0x7D0000 .pio/build/zerocore_s3_web/firmware.bin
 python <ESP_IDF_PATH>/components/app_update/otatool.py --port COM8 switch_ota_partition --slot 1
 ```
 
-Replace `COM8` with the actual port. Power cycle the ZeroCore S3 after
-flashing. On the tested board, the RTS reset issued by `esptool` left the
-ESP32-S3 in download mode, while a USB power cycle started the application.
+For the serial build, replace `zerocore_s3_web` in the firmware path with
+`zerocore_s3`. Do not write either image at `0x7D0000` on a generic board
+unless its actual partition table has the same `app1` address and size.
+
+Replace `COM8` with the actual port. If the firmware does not start after
+flashing, power cycle the ZeroCore S3. During early tests, the RTS reset from
+`esptool` occasionally left the board in download mode; later flashes restarted
+normally.
 
 To select the preserved application again, use the same ESP-IDF tool with
 `switch_ota_partition --slot 0`, then power cycle.
@@ -126,6 +142,11 @@ in the other mode.
 | Command | Action |
 | --- | --- |
 | `help` | List commands |
+| `wifi` (web build) | Show the current Wi-Fi mode, local address and network details |
+| `wifi set <ssid> <password>` (web build) | Save local network credentials in device flash and connect |
+| `wifi retry` (web build) | Retry the saved local network without entering its password again |
+| `wifi reboot` (web build) | Restart the ESP32-S3 without cycling USB power |
+| `wifi clear` (web build) | Erase saved local network credentials and start the hotspot |
 | `pins` | Print the GPIO numbers compiled into this firmware and shield header destinations |
 | `set mode fm` / `set mode dab` | Load FM or DAB firmware; resets the amplifier to off |
 | `set fm 101.10` | Tune FM to 101.10 MHz (87.5–108.0 MHz) |

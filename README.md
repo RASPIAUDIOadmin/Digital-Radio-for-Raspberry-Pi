@@ -38,6 +38,10 @@ FM tuning and analog audio were validated on an assembled ESP32-S3 + shield. The
 reception, service listing and analog audio playback have also been tested on
 the 11B multiplex.
 
+The ESP32-S3 project also includes a [lite local web interface](esp32/zerocore_s3_digital_radio/WEB.md)
+for control from a phone or computer. It can join a saved Wi-Fi network and
+falls back to its own hotspot if the connection fails.
+
 ## Software release v1.5.3
 
 This release improves HD Radio subchannel discovery after field feedback from US testing.

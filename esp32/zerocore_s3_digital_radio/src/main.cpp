@@ -6,6 +6,20 @@
 #include <vector>
 #include "firmware_images.h"
 #include "radio_pins.h"
+#ifdef RADIO_WEB_UI
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
+#ifdef RADIO_FLASH_WIFI_STORE
+#include <esp_partition.h>
+#include <esp_spi_flash.h>
+#endif
+#include "web_page.h"
+#ifndef RADIO_AP_PASSWORD
+#define RADIO_AP_PASSWORD "raspiaudio"
+#endif
+#endif
 
 constexpr uint8_t PIN_AMP = RADIO_PIN_AMP;
 constexpr uint8_t PIN_MOSI = RADIO_PIN_MOSI;
@@ -62,6 +76,8 @@ uint8_t volume = 40;
 String commandLine;
 std::vector<DabService> dabServices;
 int selectedService = -1;
+uint16_t currentFmFreq = 0;
+int currentDabIndex = -1;
 SPISettings commandSpi(2000000, MSBFIRST, SPI_MODE0);
 SPISettings loadSpi(4000000, MSBFIRST, SPI_MODE0);
 
@@ -150,6 +166,8 @@ bool bootRadio(Mode mode) {
   radioReady = false;
   dabServices.clear();
   selectedService = -1;
+  currentFmFreq = 0;
+  currentDabIndex = -1;
   digitalWrite(PIN_AMP, LOW);
   ampEnabled = false;
   digitalWrite(PIN_RESET, LOW);
@@ -224,6 +242,7 @@ bool tuneFm(uint16_t freq10kHz) {
   const uint8_t cmd[] = {CMD_FM_TUNE_FREQ, 0,
       static_cast<uint8_t>(freq10kHz), static_cast<uint8_t>(freq10kHz >> 8), 0, 0, 0};
   if (!sendCommand(cmd, sizeof(cmd))) return false;
+  currentFmFreq = freq10kHz;
   Serial.printf("FM tuned %u.%02u MHz\n", freq10kHz / 100, freq10kHz % 100);
   return true;
 }
@@ -246,6 +265,7 @@ bool tuneDab(size_t index) {
   selectedService = -1;
   const uint8_t cmd[] = {CMD_DAB_TUNE_FREQ, 0, static_cast<uint8_t>(index), 0, 0, 0};
   if (!sendCommand(cmd, sizeof(cmd))) return false;
+  currentDabIndex = static_cast<int>(index);
   Serial.printf("DAB tuned %s (%lu kHz)\n", DAB_CHANNELS[index].name,
       static_cast<unsigned long>(DAB_CHANNELS[index].khz));
   return true;
@@ -386,6 +406,9 @@ void printHelp() {
   Serial.println("  set amp on|off        Control speaker amplifier");
   Serial.println("  services | play <n>   List and play a DAB audio service");
   Serial.println("  status | scan | pins | help");
+#ifdef RADIO_WEB_UI
+  Serial.println("  wifi | wifi retry | wifi set <ssid> <password> | wifi clear | wifi reboot");
+#endif
   Serial.println("  Legacy aliases: mode, f, d, v, amp, s");
 }
 
@@ -398,6 +421,13 @@ void printPins() {
   Serial.println("Pin 16 INT is unused; analog audio comes from the shield jack/amplifier.");
 }
 
+#ifdef RADIO_WEB_UI
+void printWebNetworkStatus();
+bool saveWebWifiCredentials(const String &ssid, const String &password);
+bool clearWebWifiCredentials();
+void scheduleWebWifiSwitch(bool useSaved);
+#endif
+
 void handleCommand(String line) {
   line.trim();
   if (!line.length()) return;
@@ -405,6 +435,42 @@ void handleCommand(String line) {
   lower.toLowerCase();
   if (lower == "help" || lower == "?") { printHelp(); return; }
   if (lower == "pins") { printPins(); return; }
+#ifdef RADIO_WEB_UI
+  if (lower == "wifi") {
+    printWebNetworkStatus();
+    return;
+  }
+  if (lower == "wifi retry") {
+    Serial.println("Retrying saved WiFi credentials");
+    scheduleWebWifiSwitch(true);
+    return;
+  }
+  if (lower == "wifi reboot") {
+    Serial.println("Rebooting");
+    Serial.flush();
+    ESP.restart();
+    return;
+  }
+  if (lower.startsWith("wifi set ")) {
+    const int separator = line.indexOf(' ', 9);
+    if (separator < 0) { Serial.println("Use wifi set <ssid> <password>"); return; }
+    const String ssid = line.substring(9, separator);
+    String password = line.substring(separator + 1);
+    password.trim();
+    if (!saveWebWifiCredentials(ssid, password)) {
+      Serial.println("WiFi credentials rejected or device storage failed"); return;
+    }
+    Serial.println("WiFi credentials saved on device; connecting (password hidden)");
+    scheduleWebWifiSwitch(true);
+    return;
+  }
+  if (lower == "wifi clear") {
+    if (!clearWebWifiCredentials()) { Serial.println("WiFi storage erase failed"); return; }
+    Serial.println("WiFi credentials erased; starting hotspot");
+    scheduleWebWifiSwitch(false);
+    return;
+  }
+#endif
   if (lower.startsWith("set ")) {
     lower.remove(0, 4);
     lower.trim();
@@ -503,6 +569,613 @@ void handleCommand(String line) {
   printHelp();
 }
 
+#ifdef RADIO_WEB_UI
+struct WebMetrics {
+  bool ok = false;
+  bool valid = false;
+  bool acquired = false;
+  int rssi = 0;
+  int snr = 0;
+  int ficQuality = 0;
+};
+struct FmScanResult { uint16_t frequency; int8_t rssi; int8_t snr; };
+struct DabScanResult { uint8_t index; int8_t rssi; uint8_t ficQuality; };
+enum class WebScanMode { None, FM, DAB };
+
+WebServer webServer(80);
+String hotspotName;
+String mdnsName;
+String savedWifiSsid;
+String savedWifiPassword;
+enum class NetworkMode { None, Connecting, Station, Hotspot };
+NetworkMode networkMode = NetworkMode::None;
+bool webServerStarted = false;
+bool wifiSwitchPending = false;
+bool wifiSwitchUseSaved = false;
+uint32_t wifiSwitchAt = 0;
+uint32_t wifiConnectAt = 0;
+uint32_t wifiLostAt = 0;
+std::vector<FmScanResult> fmScanResults;
+std::vector<DabScanResult> dabScanResults;
+WebScanMode webScanMode = WebScanMode::None;
+size_t webScanIndex = 0;
+size_t webScanTotal = 0;
+bool webScanWaiting = false;
+uint32_t webScanTuneAt = 0;
+uint32_t webScanLastCheck = 0;
+
+#ifdef RADIO_FLASH_WIFI_STORE
+// The tested ZeroCore S3 NVS partition loses new entries across restarts.
+// A dedicated radio_cfg data partition stores device-local Wi-Fi settings.
+struct FlashWifiSettings {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t ssidLength;
+  uint8_t passwordLength;
+  uint8_t reserved;
+  char ssid[33];
+  char password[64];
+  uint32_t checksum;
+};
+constexpr uint32_t WIFI_SETTINGS_MAGIC = 0x52445746;
+constexpr size_t WIFI_SETTINGS_SECTOR_SIZE = 4096;
+static_assert(sizeof(FlashWifiSettings) < WIFI_SETTINGS_SECTOR_SIZE, "WiFi settings exceed flash sector");
+
+const esp_partition_t *wifiSettingsPartition() {
+  const esp_partition_t *partition = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "radio_cfg");
+  return partition && partition->size >= WIFI_SETTINGS_SECTOR_SIZE ? partition : nullptr;
+}
+
+uint32_t wifiSettingsChecksum(const FlashWifiSettings &settings) {
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&settings);
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < sizeof(settings) - sizeof(settings.checksum); ++i)
+    hash = (hash ^ bytes[i]) * 16777619u;
+  return hash;
+}
+
+bool readFlashWifiSettings(const esp_partition_t *partition, FlashWifiSettings &settings);
+
+bool loadWebWifiCredentials() {
+  const esp_partition_t *partition = wifiSettingsPartition();
+  if (!partition) return false;
+  FlashWifiSettings settings{};
+  if (!readFlashWifiSettings(partition, settings)) return false;
+  if (settings.magic != WIFI_SETTINGS_MAGIC || settings.version != 1 ||
+      settings.ssidLength < 1 || settings.ssidLength > 32 ||
+      settings.passwordLength < 8 || settings.passwordLength > 63 ||
+      settings.ssid[settings.ssidLength] != '\0' ||
+      settings.password[settings.passwordLength] != '\0' ||
+      settings.checksum != wifiSettingsChecksum(settings)) return false;
+  savedWifiSsid = settings.ssid;
+  savedWifiPassword = settings.password;
+  return true;
+}
+
+bool readFlashWifiSettings(const esp_partition_t *partition, FlashWifiSettings &settings) {
+  const void *mapped = nullptr;
+  spi_flash_mmap_handle_t mapping = 0;
+  const esp_err_t error = esp_partition_mmap(partition, 0, sizeof(settings),
+      SPI_FLASH_MMAP_DATA, &mapped, &mapping);
+  if (error != ESP_OK) return false;
+  memcpy(&settings, mapped, sizeof(settings));
+  spi_flash_munmap(mapping);
+  return true;
+}
+
+bool saveFlashWebWifiCredentials(const String &ssid, const String &password) {
+  const esp_partition_t *partition = wifiSettingsPartition();
+  if (!partition) { Serial.println("radio_cfg partition not found"); return false; }
+  FlashWifiSettings settings{};
+  settings.magic = WIFI_SETTINGS_MAGIC;
+  settings.version = 1;
+  settings.ssidLength = ssid.length();
+  settings.passwordLength = password.length();
+  memcpy(settings.ssid, ssid.c_str(), ssid.length());
+  memcpy(settings.password, password.c_str(), password.length());
+  settings.checksum = wifiSettingsChecksum(settings);
+  const size_t offset = 0;
+  esp_err_t error = esp_partition_erase_range(partition, offset, WIFI_SETTINGS_SECTOR_SIZE);
+  if (error != ESP_OK) { Serial.printf("radio_cfg erase failed: %s\n", esp_err_to_name(error)); return false; }
+  error = esp_partition_write(partition, offset, &settings, sizeof(settings));
+  if (error != ESP_OK) { Serial.printf("radio_cfg write failed: %s\n", esp_err_to_name(error)); return false; }
+  FlashWifiSettings verification{};
+  if (!readFlashWifiSettings(partition, verification)) {
+    Serial.println("radio_cfg mapped read failed"); return false;
+  }
+  if (verification.checksum != settings.checksum ||
+      memcmp(&verification, &settings, sizeof(settings)) != 0) {
+    const uint8_t *actual = reinterpret_cast<const uint8_t *>(&verification);
+    const uint8_t *expected = reinterpret_cast<const uint8_t *>(&settings);
+    size_t mismatch = 0;
+    while (mismatch < sizeof(settings) && actual[mismatch] == expected[mismatch]) ++mismatch;
+    Serial.printf("radio_cfg verification failed at byte %u, checksum %s\n",
+        static_cast<unsigned>(mismatch),
+        verification.checksum == settings.checksum ? "matches" : "differs");
+    return false;
+  }
+  return true;
+}
+
+bool clearFlashWebWifiCredentials() {
+  const esp_partition_t *partition = wifiSettingsPartition();
+  return partition && esp_partition_erase_range(partition, 0,
+      WIFI_SETTINGS_SECTOR_SIZE) == ESP_OK;
+}
+#endif
+
+bool saveWebWifiCredentials(const String &ssid, const String &password) {
+  if (ssid.length() < 1 || ssid.length() > 32 ||
+      password.length() < 8 || password.length() > 63) return false;
+#ifdef RADIO_FLASH_WIFI_STORE
+  if (!saveFlashWebWifiCredentials(ssid, password)) return false;
+#else
+  Preferences prefs;
+  if (!prefs.begin("radio_wifi", false)) return false;
+  const bool written = prefs.putString("ssid", ssid) == ssid.length() &&
+      prefs.putString("pass", password) == password.length();
+  if (!written) prefs.clear();
+  prefs.end();
+  if (!written) return false;
+#endif
+  savedWifiSsid = ssid;
+  savedWifiPassword = password;
+  return true;
+}
+
+bool clearWebWifiCredentials() {
+#ifdef RADIO_FLASH_WIFI_STORE
+  if (!clearFlashWebWifiCredentials()) return false;
+#else
+  Preferences prefs;
+  if (!prefs.begin("radio_wifi", false)) return false;
+  const bool cleared = prefs.clear();
+  prefs.end();
+  if (!cleared) return false;
+#endif
+  savedWifiSsid = "";
+  savedWifiPassword = "";
+  return true;
+}
+
+void scheduleWebWifiSwitch(bool useSaved) {
+  wifiSwitchPending = true;
+  wifiSwitchUseSaved = useSaved;
+  wifiSwitchAt = millis() + 800;
+}
+
+void stopWebNetwork() {
+  if (webServerStarted) {
+    webServer.stop();
+    webServerStarted = false;
+  }
+  MDNS.end();
+}
+
+void startWebHotspot() {
+  stopWebNetwork();
+  WiFi.mode(WIFI_AP);
+  const IPAddress address(192, 168, 4, 1);
+  WiFi.softAPConfig(address, address, IPAddress(255, 255, 255, 0));
+  if (!WiFi.softAP(hotspotName.c_str(), RADIO_AP_PASSWORD)) {
+    networkMode = NetworkMode::None;
+    Serial.println("Hotspot start failed");
+    return;
+  }
+  networkMode = NetworkMode::Hotspot;
+  webServer.begin();
+  webServerStarted = true;
+  Serial.printf("Hotspot %s | password %s | http://%s/\n", hotspotName.c_str(),
+      RADIO_AP_PASSWORD, WiFi.softAPIP().toString().c_str());
+}
+
+void startWebStation() {
+  if (!savedWifiSsid.length()) { startWebHotspot(); return; }
+  stopWebNetwork();
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(savedWifiSsid.c_str(), savedWifiPassword.c_str());
+  networkMode = NetworkMode::Connecting;
+  wifiConnectAt = millis();
+  Serial.printf("Connecting to WiFi %s (password hidden)\n", savedWifiSsid.c_str());
+}
+
+void maintainWebNetwork() {
+  if (wifiSwitchPending && static_cast<int32_t>(millis() - wifiSwitchAt) >= 0) {
+    wifiSwitchPending = false;
+    if (wifiSwitchUseSaved) startWebStation();
+    else startWebHotspot();
+  }
+  if (networkMode == NetworkMode::Connecting) {
+    if (WiFi.status() == WL_CONNECTED) {
+      networkMode = NetworkMode::Station;
+      wifiLostAt = 0;
+      webServer.begin();
+      webServerStarted = true;
+      if (!MDNS.begin(mdnsName.c_str())) Serial.println("mDNS start failed; use the IP address");
+      Serial.printf("WiFi connected: %s | http://%s/ | http://%s.local/ | RSSI %d dBm\n",
+          savedWifiSsid.c_str(), WiFi.localIP().toString().c_str(), mdnsName.c_str(),
+          WiFi.RSSI());
+    } else if (millis() - wifiConnectAt >= 30000) {
+      Serial.println("WiFi connection timed out; falling back to hotspot");
+      startWebHotspot();
+    }
+  } else if (networkMode == NetworkMode::Station) {
+    if (WiFi.status() == WL_CONNECTED) wifiLostAt = 0;
+    else if (!wifiLostAt) wifiLostAt = millis();
+    else if (millis() - wifiLostAt >= 10000) {
+      Serial.println("WiFi disconnected; falling back to hotspot");
+      startWebHotspot();
+    }
+  }
+}
+
+void printWebNetworkStatus() {
+  if (networkMode == NetworkMode::Station && WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi STA %s | http://%s/ | http://%s.local/ (password hidden)\n",
+        savedWifiSsid.c_str(), WiFi.localIP().toString().c_str(), mdnsName.c_str());
+  } else if (networkMode == NetworkMode::Connecting) {
+    Serial.printf("Connecting to WiFi %s (password hidden); hotspot returns after timeout\n",
+        savedWifiSsid.c_str());
+  } else if (networkMode == NetworkMode::Hotspot) {
+    Serial.printf("Hotspot %s | password %s | http://%s/ | clients %u\n",
+        hotspotName.c_str(), RADIO_AP_PASSWORD, WiFi.softAPIP().toString().c_str(),
+        WiFi.softAPgetStationNum());
+  } else Serial.println("WiFi is not ready");
+}
+
+WebMetrics readWebMetrics() {
+  WebMetrics result;
+  if (!radioReady) return result;
+  if (currentMode == Mode::FM) {
+    const uint8_t cmd[] = {CMD_FM_RSQ_STATUS, 0x04};
+    uint8_t reply[23];
+    if (!sendCommand(cmd, sizeof(cmd)) || !readReply(reply, sizeof(reply))) return result;
+    result.valid = reply[5] & 1;
+    result.acquired = result.valid;
+    result.rssi = static_cast<int8_t>(reply[9]);
+    result.snr = static_cast<int8_t>(reply[10]);
+  } else {
+    const uint8_t cmd[] = {CMD_DAB_DIGRAD_STATUS, 0};
+    uint8_t reply[40];
+    if (!sendCommand(cmd, sizeof(cmd)) || !readReply(reply, sizeof(reply))) return result;
+    result.acquired = reply[5] & 4;
+    result.valid = reply[5] & 1;
+    result.rssi = static_cast<int8_t>(reply[6]);
+    result.snr = static_cast<int8_t>(reply[7]);
+    result.ficQuality = reply[8];
+  }
+  result.ok = true;
+  return result;
+}
+
+String jsonQuoted(const String &value) {
+  String output = "\"";
+  for (size_t i = 0; i < value.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(value[i]);
+    if (c == '"' || c == '\\') { output += '\\'; output += static_cast<char>(c); }
+    else if (c < 0x20) output += ' ';
+    else if (c >= 0x80) {
+      // SI4689 labels are usually Latin-1; convert their bytes to UTF-8.
+      output += static_cast<char>(0xC0 | (c >> 6));
+      output += static_cast<char>(0x80 | (c & 0x3F));
+    } else output += static_cast<char>(c);
+  }
+  output += '"';
+  return output;
+}
+
+void sendWebError(int code, const char *reason) {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(code, "application/json; charset=utf-8",
+      String("{\"ok\":false,\"error\":") + jsonQuoted(reason) + "}");
+}
+
+void sendWebOk() {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+}
+
+bool parseLongExact(const String &input, long &value) {
+  if (!input.length()) return false;
+  char *end = nullptr;
+  value = strtol(input.c_str(), &end, 10);
+  return end != input.c_str() && *end == '\0';
+}
+
+void startWebScan() {
+  webScanMode = currentMode == Mode::FM ? WebScanMode::FM : WebScanMode::DAB;
+  webScanIndex = 0;
+  webScanTotal = currentMode == Mode::FM ? 206 : DAB_CHANNEL_COUNT;
+  webScanWaiting = false;
+  if (currentMode == Mode::FM) fmScanResults.clear();
+  else dabScanResults.clear();
+}
+
+void processWebScan() {
+  if (webScanMode == WebScanMode::None) return;
+  if (!radioReady || (webScanMode == WebScanMode::FM && currentMode != Mode::FM) ||
+      (webScanMode == WebScanMode::DAB && currentMode != Mode::DAB)) {
+    webScanMode = WebScanMode::None;
+    return;
+  }
+  if (webScanIndex >= webScanTotal) {
+    webScanMode = WebScanMode::None;
+    Serial.println("Web scan complete");
+    return;
+  }
+  if (!webScanWaiting) {
+    const bool tuned = webScanMode == WebScanMode::FM
+        ? tuneFm(static_cast<uint16_t>(8750 + webScanIndex * 10)) : tuneDab(webScanIndex);
+    if (!tuned) { webScanMode = WebScanMode::None; return; }
+    webScanTuneAt = millis();
+    webScanLastCheck = 0;
+    webScanWaiting = true;
+    return;
+  }
+  const uint32_t elapsed = millis() - webScanTuneAt;
+  if (webScanMode == WebScanMode::FM) {
+    if (elapsed < 80) return;
+    const WebMetrics metrics = readWebMetrics();
+    if (metrics.ok && (metrics.valid || (metrics.rssi >= 18 && metrics.snr >= 6))) {
+      fmScanResults.push_back({static_cast<uint16_t>(8750 + webScanIndex * 10),
+          static_cast<int8_t>(metrics.rssi), static_cast<int8_t>(metrics.snr)});
+    }
+    ++webScanIndex;
+    webScanWaiting = false;
+    return;
+  }
+  if (elapsed < 700 || millis() - webScanLastCheck < 250) return;
+  webScanLastCheck = millis();
+  const WebMetrics metrics = readWebMetrics();
+  if (metrics.ok && metrics.valid && metrics.acquired && metrics.ficQuality > 0) {
+    dabScanResults.push_back({static_cast<uint8_t>(webScanIndex),
+        static_cast<int8_t>(metrics.rssi), static_cast<uint8_t>(metrics.ficQuality)});
+    ++webScanIndex;
+    webScanWaiting = false;
+  } else if (elapsed >= 4500) {
+    ++webScanIndex;
+    webScanWaiting = false;
+  }
+}
+
+void sendWebStatus() {
+  const WebMetrics metrics = readWebMetrics();
+  String json;
+  json.reserve(3500);
+  json += "{\"ok\":true,\"ready\":";
+  json += radioReady ? "true" : "false";
+  json += ",\"mode\":\"";
+  json += currentMode == Mode::FM ? "fm" : "dab";
+  json += "\",\"volume\":";
+  json += volume;
+  json += ",\"amp\":";
+  json += ampEnabled ? "true" : "false";
+  json += ",\"valid\":";
+  json += metrics.valid ? "true" : "false";
+  json += ",\"rssi\":";
+  json += metrics.ok ? String(metrics.rssi) : "null";
+  json += ",\"snr\":";
+  json += metrics.ok ? String(metrics.snr) : "null";
+  json += ",\"fic_quality\":";
+  json += metrics.ok && currentMode == Mode::DAB ? String(metrics.ficQuality) : "null";
+  json += ",\"frequency\":";
+  json += currentMode == Mode::FM && currentFmFreq ? String(currentFmFreq / 100.0f, 2) : "null";
+  json += ",\"channel\":";
+  json += currentMode == Mode::DAB && currentDabIndex >= 0
+      ? jsonQuoted(DAB_CHANNELS[currentDabIndex].name) : "null";
+  json += ",\"station\":";
+  json += currentMode == Mode::DAB && selectedService >= 0 &&
+      static_cast<size_t>(selectedService) < dabServices.size()
+      ? jsonQuoted(dabServices[selectedService].label) : "null";
+  json += ",\"scan\":{\"active\":";
+  json += webScanMode != WebScanMode::None ? "true" : "false";
+  json += ",\"current\":";
+  json += static_cast<unsigned>(webScanIndex + (webScanWaiting ? 1 : 0));
+  json += ",\"total\":";
+  json += static_cast<unsigned>(webScanTotal);
+  json += ",\"found\":";
+  json += static_cast<unsigned>(currentMode == Mode::FM ? fmScanResults.size() : dabScanResults.size());
+  json += "},\"wifi\":{\"mode\":";
+  json += jsonQuoted(networkMode == NetworkMode::Station ? "sta" :
+      networkMode == NetworkMode::Hotspot ? "ap" : "connecting");
+  json += ",\"ssid\":";
+  json += jsonQuoted(networkMode == NetworkMode::Hotspot ? hotspotName : savedWifiSsid);
+  json += ",\"configured_ssid\":";
+  json += jsonQuoted(savedWifiSsid);
+  json += ",\"ip\":";
+  json += jsonQuoted(networkMode == NetworkMode::Station ? WiFi.localIP().toString() :
+      networkMode == NetworkMode::Hotspot ? WiFi.softAPIP().toString() : "");
+  json += ",\"clients\":";
+  json += networkMode == NetworkMode::Hotspot ? WiFi.softAPgetStationNum() : 0;
+  json += "},\"fm_stations\":[";
+  for (size_t i = 0; i < fmScanResults.size(); ++i) {
+    if (i) json += ',';
+    const FmScanResult &station = fmScanResults[i];
+    json += "{\"frequency\":" + String(station.frequency / 100.0f, 2) +
+        ",\"rssi\":" + String(station.rssi) + ",\"snr\":" + String(station.snr) + "}";
+  }
+  json += "],\"services\":[";
+  for (size_t i = 0; i < dabServices.size(); ++i) {
+    if (i) json += ',';
+    json += "{\"index\":" + String(static_cast<unsigned>(i)) +
+        ",\"label\":" + jsonQuoted(dabServices[i].label) + "}";
+  }
+  json += "],\"multiplexes\":[";
+  for (size_t i = 0; i < dabScanResults.size(); ++i) {
+    if (i) json += ',';
+    const DabScanResult &mux = dabScanResults[i];
+    json += "{\"channel\":" + jsonQuoted(DAB_CHANNELS[mux.index].name) +
+        ",\"rssi\":" + String(mux.rssi) +
+        ",\"fic_quality\":" + String(mux.ficQuality) + "}";
+  }
+  json += "]}";
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void setupWeb() {
+  if (strlen(RADIO_AP_PASSWORD) < 8) {
+    Serial.println("Hotspot password must be at least 8 characters");
+    return;
+  }
+  char suffix[7];
+  snprintf(suffix, sizeof(suffix), "%06lX",
+      static_cast<unsigned long>(ESP.getEfuseMac() & 0xFFFFFF));
+  hotspotName = String("RASPIAUDIO-Radio-") + suffix;
+  mdnsName = String("raspiaudio-radio-") + suffix;
+  mdnsName.toLowerCase();
+  #ifdef RADIO_FLASH_WIFI_STORE
+  if (loadWebWifiCredentials()) {
+    Serial.printf("Saved WiFi in flash: SSID %s, password length %u\n",
+        savedWifiSsid.c_str(), static_cast<unsigned>(savedWifiPassword.length()));
+  } else {
+    Serial.println("No saved WiFi in flash");
+  }
+  #else
+  Preferences prefs;
+  if (prefs.begin("radio_wifi", true)) {
+    savedWifiSsid = prefs.getString("ssid", "");
+    savedWifiPassword = prefs.getString("pass", "");
+    prefs.end();
+    Serial.printf("Saved WiFi in NVS: SSID %s, password length %u\n",
+        savedWifiSsid.c_str(), static_cast<unsigned>(savedWifiPassword.length()));
+  } else {
+    Serial.println("Saved WiFi NVS open failed");
+  }
+  #endif
+  WiFi.persistent(false);
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED &&
+        networkMode != NetworkMode::Hotspot) {
+      Serial.printf("WiFi disconnected, reason %u\n", info.wifi_sta_disconnected.reason);
+    }
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  webServer.on("/", HTTP_GET, []() {
+    webServer.send_P(200, "text/html; charset=utf-8", RADIO_WEB_PAGE);
+  });
+  webServer.on("/api/channels", HTTP_GET, []() {
+    String json = "{\"ok\":true,\"channels\":[";
+    for (size_t i = 0; i < DAB_CHANNEL_COUNT; ++i) {
+      if (i) json += ',';
+      json += jsonQuoted(DAB_CHANNELS[i].name);
+    }
+    json += "]}";
+    webServer.send(200, "application/json; charset=utf-8", json);
+  });
+  webServer.on("/api/status", HTTP_GET, sendWebStatus);
+  webServer.on("/api/mode", HTTP_POST, []() {
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Attendez la fin du scan"); return; }
+    const String mode = webServer.arg("mode");
+    if (mode != "fm" && mode != "dab") { sendWebError(400, "Mode inconnu"); return; }
+    if (!bootRadio(mode == "fm" ? Mode::FM : Mode::DAB)) {
+      sendWebError(503, "Chargement du firmware radio échoué"); return;
+    }
+    sendWebOk();
+  });
+  webServer.on("/api/tune", HTTP_POST, []() {
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Attendez la fin du scan"); return; }
+    if (!radioReady) { sendWebError(503, "Radio indisponible"); return; }
+    if (currentMode == Mode::FM) {
+      const String input = webServer.arg("frequency");
+      char *end = nullptr;
+      const float mhz = strtof(input.c_str(), &end);
+      if (end == input.c_str() || *end != '\0' || !isfinite(mhz) || mhz < 87.5f || mhz > 108.0f) {
+        sendWebError(400, "Fréquence FM attendue entre 87,5 et 108 MHz"); return;
+      }
+      if (!tuneFm(static_cast<uint16_t>(lroundf(mhz * 100)))) {
+        sendWebError(503, "Réglage FM échoué"); return;
+      }
+    } else {
+      String channel = webServer.arg("channel");
+      channel.toUpperCase();
+      size_t index = 0;
+      while (index < DAB_CHANNEL_COUNT && channel != DAB_CHANNELS[index].name) ++index;
+      if (index == DAB_CHANNEL_COUNT) { sendWebError(400, "Canal DAB inconnu"); return; }
+      if (!tuneDab(index)) { sendWebError(503, "Réglage DAB échoué"); return; }
+    }
+    sendWebOk();
+  });
+  webServer.on("/api/services", HTTP_POST, []() {
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Attendez la fin du scan"); return; }
+    if (!radioReady || currentMode != Mode::DAB || currentDabIndex < 0) {
+      sendWebError(400, "Réglez d'abord un canal DAB"); return;
+    }
+    if (dabServices.empty() && !loadDabServices()) {
+      sendWebError(503, "Liste des services indisponible, réessayez dans quelques secondes"); return;
+    }
+    sendWebOk();
+  });
+  webServer.on("/api/play", HTTP_POST, []() {
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Attendez la fin du scan"); return; }
+    long index = -1;
+    if (!parseLongExact(webServer.arg("index"), index) || index < 0 ||
+        static_cast<size_t>(index) >= dabServices.size()) {
+      sendWebError(400, "Service DAB inconnu"); return;
+    }
+    if (!playDabService(static_cast<size_t>(index))) {
+      sendWebError(503, "Lecture DAB échouée"); return;
+    }
+    sendWebOk();
+  });
+  webServer.on("/api/volume", HTTP_POST, []() {
+    long requested = -1;
+    if (!parseLongExact(webServer.arg("value"), requested) || requested < 0 || requested > 63) {
+      sendWebError(400, "Volume attendu entre 0 et 63"); return;
+    }
+    if (!radioReady || !setProperty(PROP_AUDIO_ANALOG_VOLUME, requested)) {
+      sendWebError(503, "Réglage du volume échoué"); return;
+    }
+    volume = static_cast<uint8_t>(requested);
+    sendWebOk();
+  });
+  webServer.on("/api/amp", HTTP_POST, []() {
+    if (!radioReady) { sendWebError(503, "Radio indisponible"); return; }
+    const String value = webServer.arg("on");
+    if (value != "0" && value != "1") { sendWebError(400, "État ampli inconnu"); return; }
+    ampEnabled = value == "1";
+    digitalWrite(PIN_AMP, ampEnabled ? HIGH : LOW);
+    sendWebOk();
+  });
+  webServer.on("/api/scan", HTTP_POST, []() {
+    if (!radioReady) { sendWebError(503, "Radio indisponible"); return; }
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Scan déjà en cours"); return; }
+    startWebScan();
+    sendWebOk();
+  });
+  webServer.on("/api/wifi", HTTP_POST, []() {
+    if (networkMode != NetworkMode::Hotspot) {
+      sendWebError(403, "Configuration WiFi disponible depuis le hotspot uniquement"); return;
+    }
+    if (!saveWebWifiCredentials(webServer.arg("ssid"), webServer.arg("password"))) {
+      sendWebError(400, "SSID (1-32 caractères) et mot de passe (8-63 caractères) requis"); return;
+    }
+    sendWebOk();
+    scheduleWebWifiSwitch(true);
+  });
+  webServer.on("/api/wifi/clear", HTTP_POST, []() {
+    if (networkMode != NetworkMode::Hotspot) {
+      sendWebError(403, "Configuration WiFi disponible depuis le hotspot uniquement"); return;
+    }
+    if (!clearWebWifiCredentials()) { sendWebError(503, "Effacement des identifiants échoué"); return; }
+    sendWebOk();
+    scheduleWebWifiSwitch(false);
+  });
+  webServer.on("/api/wifi/retry", HTTP_POST, []() {
+    if (networkMode != NetworkMode::Hotspot || !savedWifiSsid.length()) {
+      sendWebError(403, "Aucun réseau enregistré à réessayer depuis le hotspot"); return;
+    }
+    sendWebOk();
+    scheduleWebWifiSwitch(true);
+  });
+  webServer.onNotFound([]() { sendWebError(404, "Page introuvable"); });
+  startWebHotspot();
+  if (savedWifiSsid.length() && savedWifiPassword.length()) scheduleWebWifiSwitch(true);
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
   delay(1500);
@@ -516,6 +1189,9 @@ void setup() {
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
   printHelp();
   Serial.println(bootRadio(Mode::FM) ? "BOOT OK" : "BOOT FAILED");
+#ifdef RADIO_WEB_UI
+  setupWeb();
+#endif
 }
 
 void loop() {
@@ -524,9 +1200,14 @@ void loop() {
     if (c == '\r' || c == '\n') {
       if (commandLine.length()) handleCommand(commandLine);
       commandLine = "";
-    } else if (commandLine.length() < 96) {
+    } else if (commandLine.length() < 128) {
       commandLine += c;
     }
   }
+#ifdef RADIO_WEB_UI
+  maintainWebNetwork();
+  if (webServerStarted) webServer.handleClient();
+  processWebScan();
+#endif
   delay(1);
 }
