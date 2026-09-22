@@ -1067,110 +1067,110 @@ void setupWeb() {
   });
   webServer.on("/api/status", HTTP_GET, sendWebStatus);
   webServer.on("/api/mode", HTTP_POST, []() {
-    if (webScanMode != WebScanMode::None) { sendWebError(409, "Attendez la fin du scan"); return; }
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Wait for the scan to finish"); return; }
     const String mode = webServer.arg("mode");
-    if (mode != "fm" && mode != "dab") { sendWebError(400, "Mode inconnu"); return; }
+    if (mode != "fm" && mode != "dab") { sendWebError(400, "Unknown mode"); return; }
     if (!bootRadio(mode == "fm" ? Mode::FM : Mode::DAB)) {
-      sendWebError(503, "Chargement du firmware radio échoué"); return;
+      sendWebError(503, "Failed to load radio firmware"); return;
     }
     sendWebOk();
   });
   webServer.on("/api/tune", HTTP_POST, []() {
-    if (webScanMode != WebScanMode::None) { sendWebError(409, "Attendez la fin du scan"); return; }
-    if (!radioReady) { sendWebError(503, "Radio indisponible"); return; }
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Wait for the scan to finish"); return; }
+    if (!radioReady) { sendWebError(503, "Radio unavailable"); return; }
     if (currentMode == Mode::FM) {
       const String input = webServer.arg("frequency");
       char *end = nullptr;
       const float mhz = strtof(input.c_str(), &end);
       if (end == input.c_str() || *end != '\0' || !isfinite(mhz) || mhz < 87.5f || mhz > 108.0f) {
-        sendWebError(400, "Fréquence FM attendue entre 87,5 et 108 MHz"); return;
+        sendWebError(400, "FM frequency must be between 87.5 and 108 MHz"); return;
       }
       if (!tuneFm(static_cast<uint16_t>(lroundf(mhz * 100)))) {
-        sendWebError(503, "Réglage FM échoué"); return;
+        sendWebError(503, "Failed to tune FM"); return;
       }
     } else {
       String channel = webServer.arg("channel");
       channel.toUpperCase();
       size_t index = 0;
       while (index < DAB_CHANNEL_COUNT && channel != DAB_CHANNELS[index].name) ++index;
-      if (index == DAB_CHANNEL_COUNT) { sendWebError(400, "Canal DAB inconnu"); return; }
-      if (!tuneDab(index)) { sendWebError(503, "Réglage DAB échoué"); return; }
+      if (index == DAB_CHANNEL_COUNT) { sendWebError(400, "Unknown DAB channel"); return; }
+      if (!tuneDab(index)) { sendWebError(503, "Failed to tune DAB"); return; }
     }
     sendWebOk();
   });
   webServer.on("/api/services", HTTP_POST, []() {
-    if (webScanMode != WebScanMode::None) { sendWebError(409, "Attendez la fin du scan"); return; }
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Wait for the scan to finish"); return; }
     if (!radioReady || currentMode != Mode::DAB || currentDabIndex < 0) {
-      sendWebError(400, "Réglez d'abord un canal DAB"); return;
+      sendWebError(400, "Tune a DAB channel first"); return;
     }
     if (dabServices.empty() && !loadDabServices()) {
-      sendWebError(503, "Liste des services indisponible, réessayez dans quelques secondes"); return;
+      sendWebError(503, "Service list unavailable; try again in a few seconds"); return;
     }
     sendWebOk();
   });
   webServer.on("/api/play", HTTP_POST, []() {
-    if (webScanMode != WebScanMode::None) { sendWebError(409, "Attendez la fin du scan"); return; }
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Wait for the scan to finish"); return; }
     long index = -1;
     if (!parseLongExact(webServer.arg("index"), index) || index < 0 ||
         static_cast<size_t>(index) >= dabServices.size()) {
-      sendWebError(400, "Service DAB inconnu"); return;
+      sendWebError(400, "Unknown DAB service"); return;
     }
     if (!playDabService(static_cast<size_t>(index))) {
-      sendWebError(503, "Lecture DAB échouée"); return;
+      sendWebError(503, "Failed to play DAB service"); return;
     }
     sendWebOk();
   });
   webServer.on("/api/volume", HTTP_POST, []() {
     long requested = -1;
     if (!parseLongExact(webServer.arg("value"), requested) || requested < 0 || requested > 63) {
-      sendWebError(400, "Volume attendu entre 0 et 63"); return;
+      sendWebError(400, "Volume must be between 0 and 63"); return;
     }
     if (!radioReady || !setProperty(PROP_AUDIO_ANALOG_VOLUME, requested)) {
-      sendWebError(503, "Réglage du volume échoué"); return;
+      sendWebError(503, "Failed to set volume"); return;
     }
     volume = static_cast<uint8_t>(requested);
     sendWebOk();
   });
   webServer.on("/api/amp", HTTP_POST, []() {
-    if (!radioReady) { sendWebError(503, "Radio indisponible"); return; }
+    if (!radioReady) { sendWebError(503, "Radio unavailable"); return; }
     const String value = webServer.arg("on");
-    if (value != "0" && value != "1") { sendWebError(400, "État ampli inconnu"); return; }
+    if (value != "0" && value != "1") { sendWebError(400, "Unknown amplifier state"); return; }
     ampEnabled = value == "1";
     digitalWrite(PIN_AMP, ampEnabled ? HIGH : LOW);
     sendWebOk();
   });
   webServer.on("/api/scan", HTTP_POST, []() {
-    if (!radioReady) { sendWebError(503, "Radio indisponible"); return; }
-    if (webScanMode != WebScanMode::None) { sendWebError(409, "Scan déjà en cours"); return; }
+    if (!radioReady) { sendWebError(503, "Radio unavailable"); return; }
+    if (webScanMode != WebScanMode::None) { sendWebError(409, "Scan already in progress"); return; }
     startWebScan();
     sendWebOk();
   });
   webServer.on("/api/wifi", HTTP_POST, []() {
     if (networkMode != NetworkMode::Hotspot) {
-      sendWebError(403, "Configuration WiFi disponible depuis le hotspot uniquement"); return;
+      sendWebError(403, "Wi-Fi configuration is available from the hotspot only"); return;
     }
     if (!saveWebWifiCredentials(webServer.arg("ssid"), webServer.arg("password"))) {
-      sendWebError(400, "SSID (1-32 caractères) et mot de passe (8-63 caractères) requis"); return;
+      sendWebError(400, "SSID (1-32 characters) and password (8-63 characters) required"); return;
     }
     sendWebOk();
     scheduleWebWifiSwitch(true);
   });
   webServer.on("/api/wifi/clear", HTTP_POST, []() {
     if (networkMode != NetworkMode::Hotspot) {
-      sendWebError(403, "Configuration WiFi disponible depuis le hotspot uniquement"); return;
+      sendWebError(403, "Wi-Fi configuration is available from the hotspot only"); return;
     }
-    if (!clearWebWifiCredentials()) { sendWebError(503, "Effacement des identifiants échoué"); return; }
+    if (!clearWebWifiCredentials()) { sendWebError(503, "Failed to erase saved credentials"); return; }
     sendWebOk();
     scheduleWebWifiSwitch(false);
   });
   webServer.on("/api/wifi/retry", HTTP_POST, []() {
     if (networkMode != NetworkMode::Hotspot || !savedWifiSsid.length()) {
-      sendWebError(403, "Aucun réseau enregistré à réessayer depuis le hotspot"); return;
+      sendWebError(403, "No saved network to retry from the hotspot"); return;
     }
     sendWebOk();
     scheduleWebWifiSwitch(true);
   });
-  webServer.onNotFound([]() { sendWebError(404, "Page introuvable"); });
+  webServer.onNotFound([]() { sendWebError(404, "Page not found"); });
   startWebHotspot();
   if (savedWifiSsid.length() && savedWifiPassword.length()) scheduleWebWifiSwitch(true);
 }

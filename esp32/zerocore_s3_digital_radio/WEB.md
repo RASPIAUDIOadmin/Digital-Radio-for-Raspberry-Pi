@@ -16,7 +16,7 @@ hotspot.
    network mode and address.
 3. With no saved network, join the `RASPIAUDIO-Radio-XXXXXX` hotspot. The
    default password is `raspiaudio`. Open **http://192.168.4.1/**.
-4. Optionally, enter a local network SSID and password in the **Connexion**
+4. Optionally, enter a local network SSID and password in the **Connection**
    card. The device stores them in its flash and tries that network on every
    boot. Use its local IP reported by `wifi` (or the displayed mDNS hostname).
    If connection fails after 30 seconds, or an established link stays down for
@@ -44,7 +44,7 @@ outside the workbench. The hotspot exposes radio controls to connected clients.
 - Switch between FM and DAB+. The SI4689 firmware reloads and the speaker
   amplifier turns off during a mode change.
 - Tune an FM frequency or a DAB Band III channel. After tuning DAB, use
-  **Charger les stations** to read the services and select one to play.
+  **Load stations** to read the services and select one to play.
 - Start a nonblocking scan of the current band. FM scan results are frequencies;
   DAB scan results are multiplex channels. A DAB scan can take several minutes.
   Scanning interrupts current audio. Choose a result afterwards to resume.
