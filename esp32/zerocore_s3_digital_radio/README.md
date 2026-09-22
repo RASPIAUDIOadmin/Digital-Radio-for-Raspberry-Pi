@@ -15,9 +15,10 @@ the USB serial port at 115200 baud.
   listening.
 - The generic ESP32-S3 build compiles, but its wiring and serial controls have
   not been tested on a separate development board.
-- The DAB firmware loads and the tuner responds to Band III tune commands.
-  No multiplex locked in the test location. DAB service listing and playback
-  are not yet exposed by this serial application.
+- The DAB firmware loads; a Band III scan found valid multiplexes on 8C and
+  11B. The `services` command listed 13 audio services on 11B, and `play 1`
+  started JAZZ RADIO. Audio from the shield amplifier was captured with a
+  UMIK-1 microphone. Reception and service availability depend on location.
 - HD Radio program selection is not yet exposed by this serial application.
 
 This is a focused radio bring-up application. The Raspberry Pi Python backend
@@ -128,7 +129,9 @@ in the other mode.
 | `pins` | Print the GPIO numbers compiled into this firmware and shield header destinations |
 | `set mode fm` / `set mode dab` | Load FM or DAB firmware; resets the amplifier to off |
 | `set fm 101.10` | Tune FM to 101.10 MHz (87.5–108.0 MHz) |
-| `set dab 8C` | Tune a DAB Band III multiplex; does not select an audio service |
+| `set dab 11B` | Tune a DAB Band III multiplex |
+| `services` | List audio services on the tuned DAB multiplex |
+| `play 1` | Start the listed DAB service numbered 1 |
 | `set volume 40` | Set SI4689 analog volume (integer 0–63) |
 | `set amp on` / `set amp off` | Enable or disable the shield's speaker amplifier |
 | `status` | Show current FM or DAB tuner status |
@@ -148,3 +151,19 @@ set amp on
 Tune a valid local FM station; `101.10` was only the frequency used on the
 test board. The jack uses the SI4689 analog output and does not need the
 amplifier GPIO.
+
+Example DAB speaker session after a scan identifies a valid local multiplex:
+
+```text
+set mode dab
+set dab 11B
+services
+set volume 40
+play 1
+set amp on
+```
+
+Wait a few seconds after tuning before `services` so the service list can
+arrive. The service numbers come from the most recent `services` response and
+are cleared when switching modes or tuning another multiplex. `play` starts
+the selected audio service; it does not turn on the speaker amplifier.

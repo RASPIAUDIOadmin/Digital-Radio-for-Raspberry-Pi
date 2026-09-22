@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 #include "firmware_images.h"
 #include "radio_pins.h"
 
@@ -19,10 +20,14 @@ constexpr uint8_t CMD_HOST_LOAD = 0x04;
 constexpr uint8_t CMD_LOAD_INIT = 0x06;
 constexpr uint8_t CMD_BOOT = 0x07;
 constexpr uint8_t CMD_SET_PROPERTY = 0x13;
+constexpr uint8_t CMD_GET_DIGITAL_SERVICE_LIST = 0x80;
+constexpr uint8_t CMD_START_DIGITAL_SERVICE = 0x81;
+constexpr uint8_t CMD_STOP_DIGITAL_SERVICE = 0x82;
 constexpr uint8_t CMD_FM_TUNE_FREQ = 0x30;
 constexpr uint8_t CMD_FM_RSQ_STATUS = 0x32;
 constexpr uint8_t CMD_DAB_TUNE_FREQ = 0xB0;
 constexpr uint8_t CMD_DAB_DIGRAD_STATUS = 0xB2;
+constexpr uint8_t CMD_DAB_GET_EVENT_STATUS = 0xB3;
 constexpr uint8_t CMD_DAB_SET_FREQ_LIST = 0xB8;
 
 constexpr uint16_t PROP_PIN_CONFIG_ENABLE = 0x0800;
@@ -33,6 +38,7 @@ constexpr uint16_t PROP_FM_TUNE_FE_VARB = 0x1711;
 constexpr uint16_t PROP_FM_TUNE_FE_CFG = 0x1712;
 
 struct DabChannel { const char *name; uint32_t khz; };
+struct DabService { uint32_t serviceId; uint16_t componentId; String label; };
 constexpr DabChannel DAB_CHANNELS[] = {
     {"5A",174928}, {"5B",176640}, {"5C",178352}, {"5D",180064},
     {"6A",181936}, {"6B",183648}, {"6C",185360}, {"6D",187072},
@@ -54,6 +60,8 @@ bool radioReady = false;
 bool ampEnabled = false;
 uint8_t volume = 40;
 String commandLine;
+std::vector<DabService> dabServices;
+int selectedService = -1;
 SPISettings commandSpi(2000000, MSBFIRST, SPI_MODE0);
 SPISettings loadSpi(4000000, MSBFIRST, SPI_MODE0);
 
@@ -140,6 +148,8 @@ bool loadImage(const char *label, const uint8_t *image, uint32_t size) {
 
 bool bootRadio(Mode mode) {
   radioReady = false;
+  dabServices.clear();
+  selectedService = -1;
   digitalWrite(PIN_AMP, LOW);
   ampEnabled = false;
   digitalWrite(PIN_RESET, LOW);
@@ -232,6 +242,8 @@ bool printFmStatus() {
 
 bool tuneDab(size_t index) {
   if (!radioReady || currentMode != Mode::DAB || index >= DAB_CHANNEL_COUNT) return false;
+  dabServices.clear();
+  selectedService = -1;
   const uint8_t cmd[] = {CMD_DAB_TUNE_FREQ, 0, static_cast<uint8_t>(index), 0, 0, 0};
   if (!sendCommand(cmd, sizeof(cmd))) return false;
   Serial.printf("DAB tuned %s (%lu kHz)\n", DAB_CHANNELS[index].name,
@@ -251,6 +263,120 @@ bool printDabStatus() {
   return true;
 }
 
+bool getDabEventStatus(bool acknowledge, uint8_t &events, uint8_t &audioStatus) {
+  const uint8_t cmd[] = {CMD_DAB_GET_EVENT_STATUS, static_cast<uint8_t>(acknowledge ? 1 : 0)};
+  uint8_t reply[9];
+  if (!sendCommand(cmd, sizeof(cmd)) || !readReply(reply, sizeof(reply))) return false;
+  events = reply[5];
+  audioStatus = reply[8];
+  return true;
+}
+
+void printDabServices();
+
+bool loadDabServices() {
+  if (!radioReady || currentMode != Mode::DAB) return false;
+  dabServices.clear();
+  selectedService = -1;
+  uint8_t events = 0, audioStatus = 0;
+  bool listReady = false;
+  const uint32_t start = millis();
+  do {
+    if (!getDabEventStatus(false, events, audioStatus)) return false;
+    if (events & 1) {
+      listReady = true;
+      if (!getDabEventStatus(true, events, audioStatus)) return false;
+      break;
+    }
+    delay(100);
+  } while (millis() - start < 5000);
+  if (!listReady) {
+    Serial.println("DAB service-list event not ready");
+    return false;
+  }
+
+  const uint8_t cmd[] = {CMD_GET_DIGITAL_SERVICE_LIST, 0};
+  uint8_t header[6];
+  if (!sendCommand(cmd, sizeof(cmd)) || !readReply(header, sizeof(header))) return false;
+  const uint16_t totalSize = header[4] | (static_cast<uint16_t>(header[5]) << 8);
+  if (totalSize < 6 || totalSize > 4096) {
+    Serial.printf("Invalid DAB service-list size: %u\n", totalSize);
+    return false;
+  }
+  std::vector<uint8_t> reply(6 + totalSize);
+  if (!readReply(reply.data(), reply.size())) return false;
+  const uint8_t *payload = reply.data() + 6;
+  const uint16_t count = payload[2] | (static_cast<uint16_t>(payload[3]) << 8);
+  size_t offset = 6;
+  for (uint16_t i = 0; i < count; ++i) {
+    if (offset + 24 > totalSize) break;
+    const uint32_t sid = static_cast<uint32_t>(payload[offset]) |
+        (static_cast<uint32_t>(payload[offset + 1]) << 8) |
+        (static_cast<uint32_t>(payload[offset + 2]) << 16) |
+        (static_cast<uint32_t>(payload[offset + 3]) << 24);
+    const uint8_t info1 = payload[offset + 4];
+    const uint8_t components = payload[offset + 5] & 0x0F;
+    char label[17] = {0};
+    memcpy(label, payload + offset + 8, 16);
+    offset += 24;
+    for (uint8_t j = 0; j < components; ++j) {
+      if (offset + 4 > totalSize) {
+        Serial.println("Truncated DAB service list");
+        return false;
+      }
+      const uint16_t componentId = payload[offset] | (static_cast<uint16_t>(payload[offset + 1]) << 8);
+      const uint8_t tmid = (componentId >> 14) & 3;
+      const bool conditionalAccess = payload[offset + 2] & 1;
+      if (tmid == 0 && !conditionalAccess && !(info1 & 1)) {
+        DabService service{sid, componentId, String(label)};
+        service.label.trim();
+        dabServices.push_back(service);
+      }
+      offset += 4;
+    }
+  }
+  printDabServices();
+  return true;
+}
+
+bool sendServiceCommand(uint8_t opcode, const DabService &service) {
+  const uint32_t sid = service.serviceId;
+  const uint32_t component = service.componentId;
+  const uint8_t cmd[] = {opcode, 0, 0, 0,
+      static_cast<uint8_t>(sid), static_cast<uint8_t>(sid >> 8),
+      static_cast<uint8_t>(sid >> 16), static_cast<uint8_t>(sid >> 24),
+      static_cast<uint8_t>(component), static_cast<uint8_t>(component >> 8),
+      static_cast<uint8_t>(component >> 16), static_cast<uint8_t>(component >> 24)};
+  return sendCommand(cmd, sizeof(cmd));
+}
+
+bool playDabService(size_t index) {
+  if (!radioReady || currentMode != Mode::DAB || index >= dabServices.size()) return false;
+  if (selectedService >= 0) {
+    if (!sendServiceCommand(CMD_STOP_DIGITAL_SERVICE, dabServices[selectedService])) return false;
+  }
+  if (!sendServiceCommand(CMD_START_DIGITAL_SERVICE, dabServices[index])) return false;
+  if (!setProperty(PROP_AUDIO_MUTE, 0)) return false;
+  selectedService = static_cast<int>(index);
+  Serial.printf("DAB playing %u: %s\n", static_cast<unsigned>(index), dabServices[index].label.c_str());
+  delay(1500);
+  uint8_t events = 0, audioStatus = 0;
+  if (getDabEventStatus(false, events, audioStatus)) {
+    Serial.printf("DAB audio status=0x%02X mute=%u block_error=%u block_loss=%u\n",
+        audioStatus, (audioStatus >> 3) & 1, (audioStatus >> 1) & 1, audioStatus & 1);
+  }
+  return true;
+}
+
+void printDabServices() {
+  Serial.printf("DAB audio services: %u\n", static_cast<unsigned>(dabServices.size()));
+  for (size_t i = 0; i < dabServices.size(); ++i) {
+    const DabService &service = dabServices[i];
+    Serial.printf("  %u: %s SID=0x%08lX COMP=0x%04X\n", static_cast<unsigned>(i),
+        service.label.c_str(), static_cast<unsigned long>(service.serviceId), service.componentId);
+  }
+}
+
 void printHelp() {
   Serial.println("Commands (115200 baud, newline terminated):");
   Serial.println("  set mode fm|dab       Load FM or DAB firmware");
@@ -258,6 +384,7 @@ void printHelp() {
   Serial.println("  set dab <channel>     Tune DAB Band III, e.g. set dab 8C");
   Serial.println("  set volume <0..63>    Set analog volume");
   Serial.println("  set amp on|off        Control speaker amplifier");
+  Serial.println("  services | play <n>   List and play a DAB audio service");
   Serial.println("  status | scan | pins | help");
   Serial.println("  Legacy aliases: mode, f, d, v, amp, s");
 }
@@ -309,6 +436,22 @@ void handleCommand(String line) {
     return;
   }
   if (!radioReady) { Serial.println("Radio not ready"); return; }
+  if (lower == "services") {
+    if (!dabServices.empty()) printDabServices();
+    else if (!loadDabServices()) Serial.println("DAB service list failed");
+    return;
+  }
+  if (lower.startsWith("play ")) {
+    const String value = lower.substring(5);
+    char *end = nullptr;
+    const long index = strtol(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0' || index < 0 ||
+        static_cast<size_t>(index) >= dabServices.size()) {
+      Serial.println("Invalid service number; use services first"); return;
+    }
+    if (!playDabService(static_cast<size_t>(index))) Serial.println("DAB play failed");
+    return;
+  }
   if (lower == "s" || lower == "status" || lower == "get status") {
     Serial.println((currentMode == Mode::FM ? printFmStatus() : printDabStatus()) ? "Status OK" : "Status failed");
     return;
