@@ -30,6 +30,13 @@ The whole project is open source:
 - Product: [Raspiaudio Digital Radio Shield for Raspberry Pi](https://raspiaudio.com/product/digital-radio/)
 <li><a href="https://raspiaudio.com/product/digital-radio/" target="_blank" rel="noopener">Store </a></li>
 
+## ZeroCore S3 / ESP32 prototype
+
+The [ZeroCore S3 serial application](esp32/zerocore_s3_digital_radio/README.md)
+controls this shield through the 40-pin header. FM tuning and analog audio were
+validated on an assembled ESP32-S3 + shield. The DAB firmware loads, but DAB
+reception and service playback remain unverified in this prototype.
+
 ## Software release v1.5.3
 
 This release improves HD Radio subchannel discovery after field feedback from US testing.

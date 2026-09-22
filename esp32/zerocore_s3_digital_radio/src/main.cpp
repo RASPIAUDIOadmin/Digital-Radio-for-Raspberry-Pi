@@ -1,0 +1,355 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include "firmware_images.h"
+
+// CoreZero S3 H8 header mapping, checked against the local native PCB snapshot.
+// The radio shield uses physical header pins 11, 19, 21, 22, 23 and 24.
+constexpr uint8_t PIN_AMP = 1;    // H8.11 / ENABLE_AMPLI, active high
+constexpr uint8_t PIN_MOSI = 11;  // H8.19
+constexpr uint8_t PIN_MISO = 13;  // H8.21
+constexpr uint8_t PIN_RESET = 39; // H8.22 / RSTB, active low
+constexpr uint8_t PIN_SCK = 12;   // H8.23
+constexpr uint8_t PIN_CS = 10;    // H8.24
+
+constexpr uint32_t XTAL_HZ = 19200000;
+constexpr uint8_t CMD_POWER_UP = 0x01;
+constexpr uint8_t CMD_HOST_LOAD = 0x04;
+constexpr uint8_t CMD_LOAD_INIT = 0x06;
+constexpr uint8_t CMD_BOOT = 0x07;
+constexpr uint8_t CMD_SET_PROPERTY = 0x13;
+constexpr uint8_t CMD_FM_TUNE_FREQ = 0x30;
+constexpr uint8_t CMD_FM_RSQ_STATUS = 0x32;
+constexpr uint8_t CMD_DAB_TUNE_FREQ = 0xB0;
+constexpr uint8_t CMD_DAB_DIGRAD_STATUS = 0xB2;
+constexpr uint8_t CMD_DAB_SET_FREQ_LIST = 0xB8;
+
+constexpr uint16_t PROP_PIN_CONFIG_ENABLE = 0x0800;
+constexpr uint16_t PROP_AUDIO_ANALOG_VOLUME = 0x0300;
+constexpr uint16_t PROP_AUDIO_MUTE = 0x0301;
+constexpr uint16_t PROP_FM_TUNE_FE_VARM = 0x1710;
+constexpr uint16_t PROP_FM_TUNE_FE_VARB = 0x1711;
+constexpr uint16_t PROP_FM_TUNE_FE_CFG = 0x1712;
+
+struct DabChannel { const char *name; uint32_t khz; };
+constexpr DabChannel DAB_CHANNELS[] = {
+    {"5A",174928}, {"5B",176640}, {"5C",178352}, {"5D",180064},
+    {"6A",181936}, {"6B",183648}, {"6C",185360}, {"6D",187072},
+    {"7A",188928}, {"7B",190640}, {"7C",192352}, {"7D",194064},
+    {"8A",195936}, {"8B",197648}, {"8C",199360}, {"8D",201072},
+    {"9A",202928}, {"9B",204640}, {"9C",206352}, {"9D",208064},
+    {"10A",209936}, {"10B",211648}, {"10C",213360}, {"10D",215072},
+    {"10N",210096}, {"11A",216928}, {"11B",218640}, {"11C",220352},
+    {"11D",222064}, {"11N",217088}, {"12A",223936}, {"12B",225648},
+    {"12C",227360}, {"12D",229072}, {"12N",224096}, {"13A",230784},
+    {"13B",232496}, {"13C",234208}, {"13D",235776}, {"13E",237488},
+    {"13F",239200},
+};
+constexpr size_t DAB_CHANNEL_COUNT = sizeof(DAB_CHANNELS) / sizeof(DAB_CHANNELS[0]);
+
+enum class Mode { FM, DAB };
+Mode currentMode = Mode::FM;
+bool radioReady = false;
+bool ampEnabled = false;
+uint8_t volume = 40;
+String commandLine;
+SPISettings commandSpi(2000000, MSBFIRST, SPI_MODE0);
+SPISettings loadSpi(4000000, MSBFIRST, SPI_MODE0);
+
+void selectRadio(bool fast = false) {
+  SPI.beginTransaction(fast ? loadSpi : commandSpi);
+  digitalWrite(PIN_CS, LOW);
+}
+
+void deselectRadio() {
+  digitalWrite(PIN_CS, HIGH);
+  SPI.endTransaction();
+}
+
+uint8_t readStatus() {
+  selectRadio();
+  SPI.transfer(0);
+  uint8_t status = SPI.transfer(0);
+  deselectRadio();
+  return status;
+}
+
+bool waitCts(uint32_t timeoutMs = 1000, bool checkError = true) {
+  const uint32_t start = millis();
+  uint8_t status = 0;
+  do {
+    status = readStatus();
+    if (status & 0x80) {
+      if (checkError && (status & 0x40)) {
+        Serial.printf("SI4689 ERR_CMD status=0x%02X\n", status);
+        return false;
+      }
+      return true;
+    }
+    delay(1);
+  } while (millis() - start < timeoutMs);
+  Serial.printf("SI4689 CTS timeout, last status=0x%02X\n", status);
+  return false;
+}
+
+bool sendCommand(const uint8_t *bytes, size_t size, uint32_t timeoutMs = 1000) {
+  if (!waitCts(timeoutMs, false)) return false;
+  selectRadio();
+  for (size_t i = 0; i < size; ++i) SPI.transfer(bytes[i]);
+  deselectRadio();
+  return waitCts(timeoutMs, true);
+}
+
+bool readReply(uint8_t *result, size_t size) {
+  if (!waitCts()) return false;
+  selectRadio();
+  SPI.transfer(0);
+  for (size_t i = 0; i < size; ++i) result[i] = SPI.transfer(0);
+  deselectRadio();
+  return true;
+}
+
+bool setProperty(uint16_t prop, uint16_t value) {
+  const uint8_t cmd[] = {CMD_SET_PROPERTY, 0,
+      static_cast<uint8_t>(prop), static_cast<uint8_t>(prop >> 8),
+      static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8)};
+  return sendCommand(cmd, sizeof(cmd));
+}
+
+bool loadImage(const char *label, const uint8_t *image, uint32_t size) {
+  Serial.printf("Loading %s: %lu bytes\n", label, static_cast<unsigned long>(size));
+  uint8_t packet[4 + 252] = {CMD_HOST_LOAD, 0, 0, 0};
+  const uint32_t started = millis();
+  for (uint32_t offset = 0; offset < size; offset += 252) {
+    const size_t count = min(static_cast<uint32_t>(252), size - offset);
+    memcpy(packet + 4, image + offset, count);
+    if (!waitCts(1000, false)) return false;
+    selectRadio(true);
+    SPI.transferBytes(packet, nullptr, count + 4);
+    deselectRadio();
+    if (!waitCts()) {
+      Serial.printf("Image failed at byte %lu\n", static_cast<unsigned long>(offset));
+      return false;
+    }
+    if ((offset & 0x3fff) == 0) yield();
+  }
+  Serial.printf("Loaded in %lu ms\n", static_cast<unsigned long>(millis() - started));
+  return true;
+}
+
+bool bootRadio(Mode mode) {
+  radioReady = false;
+  digitalWrite(PIN_AMP, LOW);
+  ampEnabled = false;
+  digitalWrite(PIN_RESET, LOW);
+  delay(10);
+  digitalWrite(PIN_RESET, HIGH);
+  delay(200);
+  Serial.printf("Reset released; SPI status=0x%02X\n", readStatus());
+
+  uint8_t powerUp[16] = {CMD_POWER_UP};
+  powerUp[2] = 0x17; // 19.2 MHz crystal, clock mode 1, tr_size 7
+  powerUp[3] = 0x28;
+  powerUp[4] = static_cast<uint8_t>(XTAL_HZ);
+  powerUp[5] = static_cast<uint8_t>(XTAL_HZ >> 8);
+  powerUp[6] = static_cast<uint8_t>(XTAL_HZ >> 16);
+  powerUp[7] = static_cast<uint8_t>(XTAL_HZ >> 24);
+  powerUp[8] = 0x07;
+  powerUp[9] = 0x10;
+  powerUp[13] = 0x18;
+  if (!sendCommand(powerUp, sizeof(powerUp))) return false;
+
+  const uint8_t loadInit[] = {CMD_LOAD_INIT, 0};
+  if (!sendCommand(loadInit, sizeof(loadInit))) return false;
+  if (mode == Mode::FM) {
+    if (!loadImage("FM patch", fm_patch, fm_patch_size)) return false;
+  } else {
+    if (!loadImage("DAB patch", dab_patch, dab_patch_size)) return false;
+  }
+  delay(4);
+  if (!sendCommand(loadInit, sizeof(loadInit))) return false;
+  if (mode == Mode::FM) {
+    if (!loadImage("FM/HD firmware", fm_firmware, fm_firmware_size)) return false;
+  } else {
+    if (!loadImage("DAB firmware", dab_firmware, dab_firmware_size)) return false;
+  }
+  const uint8_t boot[] = {CMD_BOOT, 0};
+  if (!sendCommand(boot, sizeof(boot))) return false;
+
+  // Analog DAC output goes directly to the shield's jack and onboard amp.
+  if (!setProperty(PROP_PIN_CONFIG_ENABLE, 0x8001)) return false;
+  if (!setProperty(PROP_FM_TUNE_FE_VARM, 0xFD12)) return false;
+  if (!setProperty(PROP_FM_TUNE_FE_VARB, 0x009B)) return false;
+  if (!setProperty(PROP_FM_TUNE_FE_CFG, 0)) return false;
+  if (mode == Mode::FM) {
+    if (!setProperty(0x3100, 8750)) return false;
+    if (!setProperty(0x3101, 10800)) return false;
+    if (!setProperty(0x3102, 10)) return false;
+    if (!setProperty(0x3202, 18)) return false;
+    if (!setProperty(0x3204, 6)) return false;
+    if (!setProperty(0x3205, 127)) return false;
+  } else {
+    if (!setProperty(0xB300, 0x00C1)) return false;
+    if (!setProperty(0xB201, 6)) return false;
+    uint8_t freqList[4 + DAB_CHANNEL_COUNT * 4] = {CMD_DAB_SET_FREQ_LIST,
+        static_cast<uint8_t>(DAB_CHANNEL_COUNT), 0, 0};
+    for (size_t i = 0; i < DAB_CHANNEL_COUNT; ++i) {
+      const uint32_t khz = DAB_CHANNELS[i].khz;
+      for (uint8_t byte = 0; byte < 4; ++byte)
+        freqList[4 + i * 4 + byte] = static_cast<uint8_t>(khz >> (8 * byte));
+    }
+    if (!sendCommand(freqList, sizeof(freqList))) return false;
+  }
+  if (!setProperty(PROP_AUDIO_ANALOG_VOLUME, volume)) return false;
+  if (!setProperty(PROP_AUDIO_MUTE, 0)) return false;
+  currentMode = mode;
+  radioReady = true;
+  Serial.printf("READY %s; analog volume %u; amp off\n", mode == Mode::FM ? "FM/HD" : "DAB", volume);
+  return true;
+}
+
+bool tuneFm(uint16_t freq10kHz) {
+  if (!radioReady || currentMode != Mode::FM || freq10kHz < 8750 || freq10kHz > 10800) return false;
+  const uint8_t cmd[] = {CMD_FM_TUNE_FREQ, 0,
+      static_cast<uint8_t>(freq10kHz), static_cast<uint8_t>(freq10kHz >> 8), 0, 0, 0};
+  if (!sendCommand(cmd, sizeof(cmd))) return false;
+  Serial.printf("FM tuned %u.%02u MHz\n", freq10kHz / 100, freq10kHz % 100);
+  return true;
+}
+
+bool printFmStatus() {
+  const uint8_t cmd[] = {CMD_FM_RSQ_STATUS, 0x04};
+  if (!sendCommand(cmd, sizeof(cmd))) return false;
+  uint8_t reply[23];
+  if (!readReply(reply, sizeof(reply))) return false;
+  const uint16_t freq = reply[6] | (reply[7] << 8);
+  Serial.printf("FM status: valid=%u afc=%u hd=%u freq=%u.%02u MHz rssi=%d snr=%d dB\n",
+      reply[5] & 1, (reply[5] >> 1) & 1, (reply[5] >> 5) & 1,
+      freq / 100, freq % 100, static_cast<int8_t>(reply[9]), static_cast<int8_t>(reply[10]));
+  return true;
+}
+
+bool tuneDab(size_t index) {
+  if (!radioReady || currentMode != Mode::DAB || index >= DAB_CHANNEL_COUNT) return false;
+  const uint8_t cmd[] = {CMD_DAB_TUNE_FREQ, 0, static_cast<uint8_t>(index), 0, 0, 0};
+  if (!sendCommand(cmd, sizeof(cmd))) return false;
+  Serial.printf("DAB tuned %s (%lu kHz)\n", DAB_CHANNELS[index].name,
+      static_cast<unsigned long>(DAB_CHANNELS[index].khz));
+  return true;
+}
+
+bool printDabStatus() {
+  const uint8_t cmd[] = {CMD_DAB_DIGRAD_STATUS, 0};
+  if (!sendCommand(cmd, sizeof(cmd))) return false;
+  uint8_t reply[40];
+  if (!readReply(reply, sizeof(reply))) return false;
+  const uint32_t khz = reply[12] | (reply[13] << 8) | (reply[14] << 16) | (reply[15] << 24);
+  Serial.printf("DAB status: acq=%u valid=%u rssi=%d snr=%u fic_quality=%u freq=%lu kHz\n",
+      (reply[5] >> 2) & 1, reply[5] & 1, static_cast<int8_t>(reply[6]),
+      reply[7], reply[8], static_cast<unsigned long>(khz));
+  return true;
+}
+
+void printHelp() {
+  Serial.println("Commands: f <MHz>, scan, s, mode fm|dab, d <channel>, v <0-63>, amp on|off, help");
+}
+
+void handleCommand(String line) {
+  line.trim();
+  if (!line.length()) return;
+  String lower = line;
+  lower.toLowerCase();
+  if (lower == "help" || lower == "?") { printHelp(); return; }
+  if (lower == "mode fm" || lower == "mode dab") {
+    Serial.println(bootRadio(lower.endsWith("fm") ? Mode::FM : Mode::DAB) ? "Mode ready" : "Mode boot failed");
+    return;
+  }
+  if (lower.startsWith("amp ")) {
+    ampEnabled = lower.endsWith("on");
+    digitalWrite(PIN_AMP, ampEnabled ? HIGH : LOW);
+    Serial.printf("Amplifier %s\n", ampEnabled ? "on" : "off");
+    return;
+  }
+  if (lower.startsWith("v ")) {
+    const int requested = lower.substring(2).toInt();
+    if (requested < 0 || requested > 63) { Serial.println("Volume must be 0..63"); return; }
+    volume = requested;
+    Serial.println(radioReady && setProperty(PROP_AUDIO_ANALOG_VOLUME, volume) ? "Volume set" : "Volume failed");
+    return;
+  }
+  if (!radioReady) { Serial.println("Radio not ready"); return; }
+  if (lower == "s") {
+    Serial.println((currentMode == Mode::FM ? printFmStatus() : printDabStatus()) ? "Status OK" : "Status failed");
+    return;
+  }
+  if (lower.startsWith("f ")) {
+    const float mhz = lower.substring(2).toFloat();
+    const uint16_t freq10kHz = static_cast<uint16_t>(lroundf(mhz * 100));
+    if (!tuneFm(freq10kHz)) { Serial.println("FM tune failed"); return; }
+    delay(500);
+    printFmStatus();
+    return;
+  }
+  if (lower.startsWith("d ")) {
+    String channel = line.substring(2);
+    channel.trim(); channel.toUpperCase();
+    for (size_t i = 0; i < DAB_CHANNEL_COUNT; ++i) {
+      if (channel == DAB_CHANNELS[i].name) {
+        if (!tuneDab(i)) { Serial.println("DAB tune failed"); return; }
+        delay(1200);
+        printDabStatus();
+        return;
+      }
+    }
+    Serial.println("Unknown DAB channel");
+    return;
+  }
+  if (lower == "scan") {
+    if (currentMode != Mode::FM) { Serial.println("Use mode fm first"); return; }
+    for (uint16_t freq = 8750; freq <= 10800; freq += 10) {
+      if (!tuneFm(freq)) break;
+      delay(75);
+      const uint8_t cmd[] = {CMD_FM_RSQ_STATUS, 0x04};
+      uint8_t reply[23];
+      if (sendCommand(cmd, sizeof(cmd)) && readReply(reply, sizeof(reply)) &&
+          ((reply[5] & 1) || (static_cast<int8_t>(reply[9]) >= 18 && static_cast<int8_t>(reply[10]) >= 6))) {
+        Serial.printf("FOUND %u.%02u MHz rssi=%d snr=%d\n", freq / 100, freq % 100,
+            static_cast<int8_t>(reply[9]), static_cast<int8_t>(reply[10]));
+      }
+      yield();
+    }
+    Serial.println("Scan complete");
+    return;
+  }
+  printHelp();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println("\nZeroCore S3 / Raspiaudio Digital Radio bring-up");
+  pinMode(PIN_AMP, OUTPUT);
+  digitalWrite(PIN_AMP, LOW);
+  pinMode(PIN_RESET, OUTPUT);
+  digitalWrite(PIN_RESET, LOW);
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+  printHelp();
+  Serial.println(bootRadio(Mode::FM) ? "BOOT OK" : "BOOT FAILED");
+}
+
+void loop() {
+  while (Serial.available()) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r' || c == '\n') {
+      if (commandLine.length()) handleCommand(commandLine);
+      commandLine = "";
+    } else if (commandLine.length() < 96) {
+      commandLine += c;
+    }
+  }
+  delay(1);
+}
